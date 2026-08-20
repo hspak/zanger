@@ -24,13 +24,13 @@ text_field: vxfw.TextField,
 identities: IdentityCache,
 watcher: Watcher,
 local_time_zone: zeit.TimeZone,
-// Metadata for the settled HERE cursor. It is cleared while cursor movement
-// is waiting on the debounced CHILDREN refresh.
+// Metadata for the last committed CHILDREN target. Cursor movement retains it
+// until the debounced CHILDREN refresh commits.
 cursor_status: ?CursorStatus = null,
 show_hidden: bool = false,
 watch_refresh: WatchRefresh = .none,
-// Cursor movement hides stale CHILDREN content and defers filesystem work
-// until input has been idle for `preview_debounce_ms`.
+// Cursor movement leaves committed CHILDREN content visible and defers its
+// replacement until input has been idle for `preview_debounce_ms`.
 preview_dirty: bool = false,
 preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
@@ -49,7 +49,7 @@ hostname: []const u8 = "localhost",
 const Mode = enum { browse, command, confirm };
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
-const preview_debounce_ms = 50;
+const preview_debounce_ms = 25;
 const wheel_coalesce_ms = 12;
 
 const WheelDirection = enum {
@@ -155,6 +155,8 @@ const FileMetadata = struct {
 const CursorStatus = struct {
     metadata: FileMetadata,
     mode_bits: [10]u8,
+    // Borrowed from HERE's listing, which remains stable during cursor movement.
+    entry_name: []const u8,
     // Borrowed from `identities`; cached identity strings have stable storage.
     user_name: []const u8,
     group_name: []const u8,
@@ -660,14 +662,6 @@ const Pane = struct {
         ctx: vxfw.DrawContext,
     ) Allocator.Error!vxfw.Surface {
         const self: *Pane = @ptrCast(@alignCast(ptr));
-        if (self.role == .children and self.model.preview_dirty) {
-            return .{
-                .size = ctx.max.size(),
-                .widget = self.widget(),
-                .buffer = &.{},
-                .children = &.{},
-            };
-        }
         const list_surface = try self.list_view.widget().draw(ctx);
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         children[0] = .{
@@ -975,13 +969,18 @@ fn centerListing(self: *Model) *file_system.Listing {
     return &self.getPane(.here).listing.?;
 }
 
-fn loadCursorStatus(self: *Model, path: []const u8) ?CursorStatus {
+fn loadCursorStatus(
+    self: *Model,
+    path: []const u8,
+    entry_name: []const u8,
+) ?CursorStatus {
     const metadata = FileMetadata.init(path) catch return null;
     const user_name = self.identities.userName(self.alloc, metadata.uid) catch return null;
     const group_name = self.identities.groupName(self.alloc, metadata.gid) catch return null;
     return .{
         .metadata = metadata,
         .mode_bits = modeBits(metadata.kind, metadata.mode),
+        .entry_name = entry_name,
         .user_name = user_name,
         .group_name = group_name,
     };
@@ -1186,7 +1185,7 @@ fn prepareView(
         const entry = center.entries[center.cursor];
         const cursor_path = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(cursor_path);
-        pending_view.cursor_status = self.loadCursorStatus(cursor_path);
+        pending_view.cursor_status = self.loadCursorStatus(cursor_path, entry.name);
     }
 
     const children_transfer = transferTo(transfers, .children);
@@ -1451,7 +1450,6 @@ fn armPreviewTimer(
 
 fn deferRightSync(self: *Model, ctx: *vxfw.EventContext) Allocator.Error!void {
     self.preview_dirty = true;
-    self.cursor_status = null;
     self.preview_due = Io.Clock.awake.now(self.io).addDuration(
         .fromMilliseconds(preview_debounce_ms),
     );
@@ -1495,7 +1493,7 @@ fn syncRight(self: *Model) !void {
         const entry = center.entries[center.cursor];
         const desired = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(desired);
-        self.cursor_status = self.loadCursorStatus(desired);
+        self.cursor_status = self.loadCursorStatus(desired, entry.name);
         if (entry.is_dir) {
             if (right.listing) |listing| {
                 if (std.mem.eql(u8, listing.path, desired)) {
@@ -2189,7 +2187,7 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         .{ .text = " " },
         .{ .text = modified },
         .{ .text = " " },
-        .{ .text = center.entries[center.cursor].name, .style = name_style },
+        .{ .text = cursor_status.entry_name, .style = name_style },
         .{ .text = "  " },
     });
     const details = try ctx.arena.create(vxfw.RichText);
@@ -2616,6 +2614,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expect(model.preview_dirty);
     try testing.expect(model.preview_tick_pending);
     try testing.expectEqualStrings("Name: a.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
     var pending_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer pending_arena.deinit();
     vxfw.DrawContext.init(.unicode);
@@ -2625,10 +2624,18 @@ test "space toggles consecutive selections and advances the cursor" {
         .max = .{ .width = 30, .height = 10 },
         .cell_size = .{ .width = 8, .height = 16 },
     });
-    try testing.expectEqual(@as(usize, 0), pending_surface.children.len);
+    try testing.expectEqual(@as(usize, 1), pending_surface.children.len);
+    const pending_bottom = try model.drawBottom(.{
+        .arena = pending_arena.allocator(),
+        .min = .{ .width = 160, .height = 1 },
+        .max = .{ .width = 160, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    }, 160);
+    try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
     try testing.expectEqualStrings("Name: b.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
     try testing.expect(!model.preview_dirty);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);

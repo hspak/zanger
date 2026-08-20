@@ -155,8 +155,8 @@ ascend must reread a potentially stale parent snapshot as the new HERE,
 selection is restored by entry name.
 
 Cursor movement is intentionally smaller than a full view transaction. It
-updates HERE immediately, hides the now-stale CHILDREN pane, and schedules
-`syncRight` to replace only CHILDREN after input settles.
+updates HERE immediately, leaves the last committed CHILDREN content visible,
+and schedules `syncRight` to replace only CHILDREN after input settles.
 
 ## Filesystem snapshots and ownership
 
@@ -232,8 +232,9 @@ Filesystem work is kept out of continuous cursor input:
 ```text
 cursor event
     ├─ update HERE cursor
-    ├─ mark CHILDREN stale and hide it
-    ├─ move the preview deadline 50 ms forward
+    ├─ mark CHILDREN stale and retain its committed content
+    ├─ retain the committed bottom-bar metadata and entry name
+    ├─ move the preview deadline 25 ms forward
     └─ request redraw immediately
              │
              └─ timer after input settles
@@ -244,7 +245,8 @@ cursor event
 
 The preview timer is separate from the recurring watcher timer. Continued input
 moves the deadline, so only the final cursor target incurs a directory scan,
-metadata request, or account lookup.
+metadata request, or account lookup. The compact bottom details change with the
+same commit as CHILDREN, while entry and selection counts remain live.
 
 ### Commands and modes
 
