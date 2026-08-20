@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const options = b.addOptions();
+    const version = b.option([]const u8, "version", "Set the build version") orelse "unset";
+    options.addOption([]const u8, "version", version);
+
     const vaxis = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -20,6 +25,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("vaxis", vaxis.module("vaxis"));
     root_module.addImport("zeit", zeit.module("zeit"));
+    root_module.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "zanger",
