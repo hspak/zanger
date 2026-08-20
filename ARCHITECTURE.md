@@ -1,0 +1,545 @@
+# Zanger Architecture
+
+Zanger is written for Zig 0.16 and Linux. It uses libvaxis/vxfw 0.6.0 for the
+terminal UI, Linux inotify for live directory updates, and zeit 0.9.0 for local
+status-bar timestamps.
+
+## System map
+
+The executable is split into a small entry point and five focused modules:
+
+| File | Responsibility |
+|---|---|
+| [`src/main.zig`](src/main.zig) | Creates the terminal app and stable heap-allocated model, then enters the vxfw loop |
+| [`src/Model.zig`](src/Model.zig) | Owns interactive state, panes, navigation transactions, previews, commands, deletion, and rendering |
+| [`src/file_system.zig`](src/file_system.zig) | Builds and owns directory snapshots, entries, selection state, and preformatted rows |
+| [`src/Watcher.zig`](src/Watcher.zig) | Owns the nonblocking inotify descriptor and transactional HERE watch |
+| [`src/command.zig`](src/command.zig) | Resolves unique command prefixes into a closed command enum |
+| [`src/profile.zig`](src/profile.zig) | Runs deterministic filesystem and headless-rendering performance workloads |
+
+At runtime the dependency direction is:
+
+```text
+main
+ ├─ vxfw.App
+ └─ Model
+     ├─ Pane / PendingView / Preview / IdentityCache
+     ├─ file_system.Listing
+     ├─ Watcher
+     ├─ command
+     ├─ zeit.TimeZone
+     └─ vxfw widgets and surfaces
+```
+
+`main` reads the starting working directory, user, and hostname. The `Model` is
+allocated once on the heap because vxfw widget identity includes the address of
+its `userdata`; moving the model after initialization would invalidate focus and
+event-routing identities. `Model.init` creates the watcher, loads the local time
+zone, initializes the three stable panes and command field, and installs the
+first anchored view. `Model.deinit` releases these resources in reverse.
+
+## The anchored three-pane model
+
+In this document, **HERE** or **CWD** means Zanger's current center path. It is
+not necessarily the process working directory after startup.
+
+The center pane is the source of truth. PARENT and CHILDREN are projections of
+its path and cursor:
+
+```text
+                              selected entry
+                                    │
+                                    ▼
+PARENT                         CWD / HERE                      CHILDREN
+dirname(C)                 listing for path C          projection of C/entry
+    │                              │                            │
+    └─ highlight basename(C)       └─ owns cursor               ├─ directory listing
+                                                               ├─ empty placeholder
+                                                               ├─ file metadata
+                                                               └─ nothing for file symlink
+```
+
+The model maintains these invariants after every committed operation:
+
+1. HERE owns a readable absolute directory path `C` and is the only pane that
+   accepts browse interaction.
+2. PARENT is absent at `/`. Otherwise, when readable, it represents
+   `dirname(C)` and its `cwd_index` identifies `basename(C)`.
+3. CHILDREN is derived from HERE's cursor. A directory produces a listing or an
+   empty-directory placeholder, a regular file produces metadata, and a
+   non-directory symbolic link produces no metadata preview.
+4. Every non-empty pane has a valid `ListView` cursor and a row-widget array
+   parallel to its displayed content.
+5. Selection bitsets have one bit per listing entry. Selection follows a
+   directory as its listing moves between pane roles.
+6. The watcher targets HERE, never whichever widget currently has focus.
+7. Drawing performs no filesystem I/O and no persistent allocation.
+
+### Roles are ownership, not focus
+
+`PaneRole` is an enum with `parent`, `here`, and `children` values. It gives
+type-safe indices to the homogeneous pane arrays and identifies the source and
+destination of listing transfers. It does not represent an active pane.
+
+Browse-mode focus always belongs to HERE's `ListView`. Command mode temporarily
+focuses the persistent `TextField`; leaving command or confirmation mode queues
+a focus request back to HERE. Tab and Shift-Tab are consumed as no-ops, PARENT
+and CHILDREN never draw active cursors, and side-pane mouse input is ignored.
+PARENT's `cwd_index` is an independent location marker, not a focus cursor.
+
+## Transactional view replacement
+
+Navigation, reloads, hidden filtering, deletion refreshes, and watcher refreshes
+can require several listings and previews to change together. Installing those
+pieces one at a time would allow allocation or filesystem failures to leave the
+panes describing different paths. `PendingView` provides the transaction.
+
+It stages newly owned content and records borrowed live listings:
+
+| Staged field | Purpose |
+|---|---|
+| `listings[3]` | Prepared directory listings for each pane role |
+| `previews[3]` | Prepared metadata or placeholder content |
+| `cursors[3]` | Cursor to install with each pane |
+| `cwd_indices[3]` | Stable PARENT marker |
+| `preview_error_name` | Non-fatal side-preview error to report after commit |
+| `listing_sources[3]` | Live source role borrowed by each target role |
+| `directory_empty_transfers[3]` | Deferred emptiness updates for borrowed listings |
+
+The replacement flow is:
+
+```text
+navigation / reload / refresh request
+        │
+        ├─ prepare an inotify watch for the candidate HERE path
+        ├─ construct required listings and previews
+        ├─ validate every proposed listing transfer
+        ├─ restore HERE cursor and selections when requested
+        ├─ allocate row widgets and the next status message
+        │
+        └─ no fallible work remains; commit
+                 │
+                 ├─ apply deferred state to transferred listings
+                 ├─ commit the candidate watch
+                 ├─ detach reusable listings from their old panes
+                 ├─ replace all three pane payloads
+                 └─ release unused staged content
+```
+
+Before commit, an error deinitializes the pending view, cancels its prepared
+watch, and leaves the live view untouched. During commit, ownership is moved,
+not copied. A transferred source pane is detached before replacement, and an
+installed staging slot is cleared so deferred cleanup cannot free its new
+owner's listing.
+
+### Listing transfers
+
+Many path changes can reuse a snapshot that the UI already owns:
+
+| Operation | Existing listing | New role |
+|---|---|---|
+| Descend | old HERE | PARENT |
+| Descend | current CHILDREN listing | HERE |
+| Ascend | old HERE | CHILDREN |
+| Watcher refresh | old PARENT | PARENT |
+| Deletion refresh | old PARENT | PARENT |
+
+A descent may perform both transfers in one transaction, avoiding a second
+scan of the directory that was already previewed. Expected path relationships
+are validated before a transfer is accepted. Because CHILDREN is not watched
+recursively, descent performs a cheap, allocation-free emptiness probe before
+trusting that snapshot as the new HERE.
+
+Listings moving from HERE into a side pane retain their selection bits. When an
+ascend must reread a potentially stale parent snapshot as the new HERE,
+selection is restored by entry name.
+
+Cursor movement is intentionally smaller than a full view transaction. It
+updates HERE immediately, hides the now-stale CHILDREN pane, and schedules
+`syncRight` to replace only CHILDREN after input settles.
+
+## Filesystem snapshots and ownership
+
+`file_system.Listing` owns a complete, sorted snapshot of one directory. It does
+not synthesize `.` or `..`; upward navigation is a model operation.
+
+Snapshot construction opens the directory once and consumes its iterator.
+Ordinary entry kinds come from that iterator and do not require a separate
+`stat`. Symbolic links require a relative `readlinkat` for their displayed
+target and a relative Linux `statx` to determine whether the target should be
+navigable as a directory. Overlong or otherwise unresolvable targets remain
+visible as non-navigable links instead of failing the entire scan.
+
+Each listing owns:
+
+- entries sorted with in-place pdqsort;
+- names and link targets stored in one listing-specific arena;
+- a dynamic selection bitset and cached selected count;
+- preformatted display rows held in one contiguous allocation.
+
+The cached selected count keeps status rendering constant-time. Row strings are
+updated in place when selection or known directory emptiness changes. Listing
+teardown performs a constant number of allocator operations rather than one per
+entry.
+
+Directory rows contain names or `link -> target` text. Directories are blue and
+bold, symbolic links are teal, and selection overrides those styles with yellow
+and bold. A grapheme-aware clipped row renderer stops once the pane width is
+filled, so a long off-screen link target does not add work to every frame.
+
+### Metadata previews and identity caching
+
+A regular-file preview performs one `statx` and formats type, Unix mode bits,
+owner/group, size, modification time, writability, and link count. User and
+group names are resolved through `getpwuid_r` and `getgrgid_r` and cached by
+numeric ID because NSS may consult services outside local files.
+
+The detailed preview renders its timestamp in UTC. The compact browse status
+uses the model's cached local `zeit.TimeZone`; `formatStatusTime` converts the
+filesystem nanosecond timestamp with zeit and renders an `ls`-style local time.
+If the local zone cannot be loaded at startup, the model uses UTC; allocation
+failure still aborts initialization.
+
+## Interaction flows
+
+### Navigation and selection
+
+- `j`/`k`, Ctrl-N/Ctrl-P, and arrows move HERE.
+- Ctrl-D/Ctrl-U move by half of the visible HERE rows.
+- `g`/`G` jump directly to the first or last entry.
+- Enter or `l` descends into a non-empty directory.
+- `h` or Backspace ascends and keeps the directory just left under HERE's
+  cursor.
+- `r` rebuilds the anchored view.
+- Space toggles HERE's cursor entry and advances for bulk selection.
+- Ctrl-H toggles hidden entries and performs a full anchored rebuild.
+
+Empty directories remain previews and cannot become HERE. A no-op click or jump
+does not rebuild CHILDREN. Side listings can retain selections for later reuse,
+but selection and deletion operations always target HERE.
+
+Stable `Row` widgets provide click identity because vxfw `ListView` has no
+click-to-select support and its scroll type is private. A HERE row click moves
+the cursor. Pane wrappers capture wheel presses before `ListView` applies its
+own viewport-only scrolling; HERE moves by one item and side panes consume the
+input without changing state. Duplicate same-direction wheel reports from one
+physical notch are coalesced.
+
+### Debounced CHILDREN preview
+
+Filesystem work is kept out of continuous cursor input:
+
+```text
+cursor event
+    ├─ update HERE cursor
+    ├─ mark CHILDREN stale and hide it
+    ├─ move the preview deadline 50 ms forward
+    └─ request redraw immediately
+             │
+             └─ timer after input settles
+                    ├─ build only the final preview
+                    ├─ install it transactionally
+                    └─ request another redraw
+```
+
+The preview timer is separate from the recurring watcher timer. Continued input
+moves the deadline, so only the final cursor target incurs a directory scan,
+metadata request, or account lookup.
+
+### Commands and modes
+
+The model has three modes: `browse`, `command`, and `confirm`. Pressing `:`
+clears and focuses the persistent command `TextField`. Escape returns to browse
+mode. Enter gives the field's temporary owned value to `submitCommand`, after
+which vxfw frees it.
+
+The parser returns one of four closed commands: `help`, `hidden`, `delete`, or
+`quit`. Any unambiguous prefix is accepted, so `d`, `dele`, `he`, `hi`, and `q`
+resolve as expected. `h` is rejected because both `help` and `hidden` match.
+While typing a strict unique prefix, the status row displays the assumed full
+command as a dimmed hint, such as `→ :delete`.
+
+Commands accept no arguments. In particular, `hidden` is a simple toggle.
+Unknown, ambiguous, empty, and extra-argument inputs return to browse mode with
+a status message.
+
+### Deletion
+
+`:delete` enters confirmation mode for HERE's selected entries, or HERE's
+cursor entry when there is no selection. The model copies target paths before
+mutating the filesystem. Real directories are recursively removed; symbolic
+links are unlinked even when they resolve to directories, so their targets are
+never traversed.
+
+Successful partial work is retained. After deletion, the anchored view is
+refreshed and the status reports the number deleted and, if applicable, the
+first failure.
+
+## Live directory watching
+
+`Watcher` is Linux-only and owns one process-lifetime, close-on-exec,
+nonblocking inotify descriptor. At most one watch is current, and it always
+corresponds to HERE. It listens for creation, deletion, moves, self-deletion,
+self-move, unmount, invalidation, and queue overflow.
+
+libvaxis 0.6.0 does not expose its internal poll set through `vxfw.App`, so the
+model schedules a recurring 150 ms vxfw tick. An idle tick performs one
+nonblocking drain and never scans a directory. All queued changes are reduced
+to the strongest required action:
+
+- `none`: no visible change;
+- `content`: refresh the anchored snapshot;
+- `rearm`: refresh and install a replacement watch.
+
+Events from retired watch descriptors are ignored. Hidden-name events are
+drained without dirtying HERE when hidden files are disabled. Event storms are
+coalesced into one refresh, and refresh is postponed while a cursor preview is
+dirty so watcher work does not interrupt active scrolling. Queue overflow or a
+self-invalidating event forces a full refresh and re-arm.
+
+Watcher ownership participates in `PendingView`: navigation first prepares the
+candidate directory watch, pane preparation runs, and only a successful view
+commit makes that watch current and retires the previous descriptor. Rollback
+cancels the candidate.
+
+## libvaxis and vxfw integration
+
+libvaxis has two layers:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│ vxfw widget framework: App, Widget, Surface, ListView  │
+├────────────────────────────────────────────────────────┤
+│ vaxis terminal core: Window, Cell, Style, Key, Mouse   │
+└────────────────────────────────────────────────────────┘
+```
+
+The core layer handles terminal I/O, cell grids, key and mouse decoding, and
+Unicode display width. vxfw builds a value-based widget tree on top. The app
+owns all durable state; widgets are lightweight views over stable userdata.
+
+### Widget identity and surfaces
+
+A `vxfw.Widget` contains a userdata pointer plus optional capture/event handlers
+and a draw function. Identity is the combination of the userdata and draw
+function pointers. A widget without an event handler cannot receive focus.
+
+Every draw returns a fresh `Surface` containing a size, owning widget identity,
+optional cursor, optional cell buffer, and positioned child `SubSurface`s.
+Containers commonly use an empty cell buffer and compose children. A non-empty
+buffer must contain exactly `width * height` cells.
+
+The widgets Zanger relies on are:
+
+| Widget | Use in Zanger |
+|---|---|
+| `Text` / `RichText` | Header, previews, status, styled metadata, and command hints |
+| `TextField` | Persistent command editor and submit callback |
+| `ListView` | Visible-row construction, cursor, and viewport management |
+| `Padding` | Horizontal pane padding |
+| `FlexRow` | Equal-width pane layout and status-row composition |
+
+`ListView.Builder` invokes Zanger's row builder only for visible indices.
+Persistent row strings and stable `Row` userdata are prepared beforehand; the
+builder only wraps them in frame-local surfaces.
+
+### Event propagation and focus
+
+For each event, vxfw rebuilds the path from the root to the focused widget and
+dispatches in three phases:
+
+```text
+root ──capture──▶ focused target ──bubble──▶ root
+```
+
+Propagation stops when a handler consumes the event. HERE's focused `ListView`
+consumes its built-in movement keys at the target phase, so `Model` handles
+movement in its root capture handler when it must also invalidate CHILDREN.
+Unconsumed browse commands bubble to the model.
+
+`requestFocus` queues a command rather than changing focus immediately. vxfw
+sends focus-out/focus-in and applies the new target before the next layout.
+This is why the `TextField` remains alive for the entire model lifetime even
+when command mode is not drawn.
+
+Keys are Unicode codepoints plus modifier bits; special keys use named
+constants. Mouse coordinates are cell-based. All text widths are measured with
+`DrawContext.stringWidth`, never byte length, so grapheme clusters and wide
+characters lay out correctly.
+
+### App loop and frame arena
+
+`vxfw.App.run` owns terminal setup, the event loop, timers, focus and mouse
+handlers, rendering, and one `ArenaAllocator`. On a requested redraw it resets
+that arena with `.free_all`, lays out the root widget, updates focus and hover
+state, renders the resulting surface tree, and retains surface references only
+until the next redraw. The arena is deinitialized when the app exits.
+
+`DrawContext.arena` therefore has exactly frame lifetime. Zanger allocates
+temporary widgets, formatted status strings, segments, cells, and surfaces from
+it without individual frees. Anything referenced across events or redraws must
+instead use the model allocator or a listing-owned arena. vaxis does not expose
+an `App` option for changing this reset policy; the profiling harness controls
+its own headless arena and uses `.retain_capacity` between measured frames.
+
+Nested layout widgets may create short-lived child arenas backed by the frame
+arena. Releasing one returns no memory to the general-purpose allocator; the
+outer frame reset remains the true reclamation boundary.
+
+### Render tree
+
+The root surface uses an empty buffer and positions these children:
+
+```text
+root Surface
+├─ `user@hostname /absolute/here/path` header
+├─ blank spacer row
+├─ FlexRow (terminal height - 3)
+│  ├─ horizontal Padding → PARENT ListView
+│  ├─ horizontal Padding → HERE ListView
+│  └─ horizontal Padding → CHILDREN ListView / preview
+└─ bottom row
+   ├─ browse: compact entry metadata + entry/selection counts
+   ├─ command: `:` + TextField + optional completion hint
+   └─ confirm: deletion prompt
+```
+
+At very small terminal sizes, the model preserves the header and bottom row and
+omits or constrains pane content rather than allowing unsigned size arithmetic
+to underflow.
+
+## Allocation and lifetime rules
+
+The code uses several allocators with deliberately different lifetimes:
+
+| Storage | Lifetime | Typical contents |
+|---|---|---|
+| Process/model allocator | Until explicit model or object teardown | Model, panes, messages, previews, identity cache, text field |
+| Listing arena | Until that directory snapshot is replaced or transferred away | Entry names and link targets |
+| Listing contiguous allocations | Listing lifetime | Entries, selection bits, formatted rows |
+| vxfw frame arena | Until the next redraw | Widgets, surfaces, cells, status strings, segments |
+| Profiling frame arena | One measured draw, capacity retained | Headless surfaces and draw temporaries |
+| TextField submitted value | Only during the submit callback | Command input |
+
+The central rule is that frame data may borrow durable model data, but durable
+state may never retain a pointer into the frame arena. Transactional types use
+`errdefer` and explicit source detachment so every allocation has exactly one
+owner on both success and rollback paths.
+
+## Performance model
+
+Cursor input plus its requested frame should complete within 16 ms. Snapshot
+construction may take longer, but it must not occur for every cursor event
+during continuous scrolling.
+
+The design separates those costs:
+
+- directory iteration and sorting happen when a snapshot is built;
+- CHILDREN work is debounced during movement;
+- visible rows alone are built during layout;
+- status counts are cached;
+- row clipping stops at pane width;
+- transfers reuse snapshots across pane roles;
+- rendering performs no filesystem calls.
+
+For `n` ordinary entries, snapshot storage and iteration are linear and sorting
+is `O(n log n)`. Steady-state frame work is proportional to viewport height,
+not directory size.
+
+### Filesystem-specific costs
+
+- **Many ordinary entries:** every name must be copied and sorted, affecting
+  startup, reload, and first preview but not later drawing.
+- **Many symbolic links:** every link needs `readlinkat` and `statx`; relative
+  syscalls and snapshot reuse limit the overhead that can be avoided.
+- **Slow, remote, FUSE, or automounted directories:** an individual synchronous
+  open or read can block without a useful upper bound. Debouncing protects
+  active scrolling, but the eventual idle load can still pause the event loop.
+- **Metadata and NSS:** `statx` and account lookup can block. Identity caching
+  and debouncing avoid repeating them for intermediate cursor positions.
+- **Filesystem event storms:** events are drained and coalesced before one
+  transactional refresh.
+- **Long names and targets:** snapshot memory scales with byte length, while
+  display work stops at the visible cell width.
+
+### Repeatable profiling
+
+The ReleaseSafe profiling executable creates deterministic fixtures under
+`.zig-cache/profile`, warms every workload twice, reports minimum, median, and
+p95, and removes the fixture afterward:
+
+```sh
+zig build profile
+zig build profile -- --quick
+zig build profile -- --json
+zig build profile-check
+zig build profile-check -- --json
+```
+
+The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
+links, complete model initialization, top and bottom large-directory frames,
+cursor movement and pending-preview frames, combined input plus draw, and a
+viewport of 4,000-byte link targets. `--samples=N` changes the frame sample
+count; scan sample counts are derived from it. Fixture creation and cleanup are
+outside the measured regions.
+
+Regression gates use these p95 budgets:
+
+| Workload | Budget |
+|---|---:|
+| Large-directory scan | 50 ms |
+| Symlink-heavy scan | 50 ms |
+| Full large-model initialization | 100 ms |
+| Cursor movement | 1 ms |
+| Every headless frame workload | 4 ms |
+
+The rendering budget deliberately leaves headroom below the 16 ms interaction
+target; filesystem budgets are looser to tolerate host and CI variance.
+
+Historical local measurements with a 120-by-40-cell headless frame show the
+snapshot/frame split that motivated the architecture:
+
+| Case | Debug | ReleaseSafe |
+|---|---:|---:|
+| Move the cursor onto `/lib` | 10–13 µs | 3 µs |
+| Draw while its preview is pending | 0.26 ms | 0.08 ms |
+| Build the `/lib` preview | 15.9–16.1 ms | 9.3 ms |
+| Draw with `/lib` loaded | 0.52–0.54 ms | 0.13 ms |
+| Load 20,000 ordinary files | 38.3 ms | 7.3 ms |
+| Draw the top of that listing | 1.06 ms | 0.25 ms |
+| Jump to its last entry | 13 µs | 2 µs |
+| Draw its bottom viewport | 0.90 ms | 0.18 ms |
+| Draw 100 links with 4,000-byte targets before clipping | 37.9 ms | — |
+| Draw the same long-target viewport after clipping | 0.75 ms | 0.22 ms |
+
+### Remaining latency boundary
+
+Startup, explicit reload, hidden-filter changes, deletion refresh, navigation to
+content without a reusable preview, and the eventual idle preview remain
+synchronous. A sufficiently large or slow filesystem can still make those
+operations exceed 16 ms.
+
+The next step for a hard bound would be a generation-tagged background loader:
+build snapshots away from the UI thread, discard obsolete cursor generations,
+and deliver completed ownership through a UI event. That would require explicit
+thread allocator, cancellation, watcher-snapshot, and shutdown rules and is not
+needed for the current continuous-scrolling target.
+
+## Verification
+
+`zig build test` runs parser, filesystem, watcher, model, headless rendering,
+navigation, selection, deletion, timestamp, and command-completion coverage.
+`zig build profile-check` guards the performance budgets above. Tests that draw
+widgets directly create and deinitialize their own arenas; multi-frame profile
+workloads reset theirs before each frame to mirror vxfw's production lifetime.
+
+The architecture is built around three boundaries:
+
+1. HERE is the single navigation anchor.
+2. `PendingView` is the failure-atomic ownership boundary for pane and watcher
+   replacement.
+3. The vxfw frame arena is the lifetime boundary for everything produced by
+   drawing.
+
+Keeping those boundaries explicit is what allows pane reuse, live refresh, and
+low-cost rendering without stale pointers or partially updated views.
