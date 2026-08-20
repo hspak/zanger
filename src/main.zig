@@ -4,6 +4,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const options = @import("build_options");
+
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -12,6 +14,19 @@ const Model = @import("Model.zig");
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     const io = init.io;
+
+    const args = try init.minimal.args.toSlice(alloc);
+    defer alloc.free(args);
+    if (args.len > 1) {
+        if (std.mem.eql(u8, args[1], "-v") or std.mem.eql(u8, args[1], "--version")) {
+            const current_version = try std.fmt.allocPrint(alloc, "version: {s}\n", .{options.version});
+            defer alloc.free(current_version);
+            try Io.File.stdout().writeStreamingAll(io, current_version);
+        } else {
+            try Io.File.stdout().writeStreamingAll(io, "usage: zanger [-h/--help/-v/--version]\n");
+        }
+        return;
+    }
 
     var app_buffer: [4096]u8 = undefined;
     var app: vxfw.App = try .init(io, alloc, init.environ_map, &app_buffer);
