@@ -564,14 +564,16 @@ fn prepareView(
                         is_empty,
                     );
                 }
-                switch (outcome.content.?) {
+                // Null content: the entry shows nothing, such as a
+                // non-directory symbolic link.
+                if (outcome.content) |content| switch (content) {
                     .listing => |listing| {
                         pending_view.listings[child_index] = listing;
                         pending_view.cursors[child_index] = @intCast(listing.cursor);
                     },
                     .preview => |preview| pending_view.previews[child_index] = preview,
                     .none => {},
-                }
+                };
             }
         }
     }
@@ -876,11 +878,11 @@ fn syncRight(self: *Model) !void {
             if (outcome.dir_is_empty) |is_empty| {
                 center.setDirectoryEmpty(center.cursor, is_empty);
             }
-            switch (outcome.content.?) {
+            if (outcome.content) |content| switch (content) {
                 .listing => |listing| replacement_listing = listing,
                 .preview => |preview| replacement_preview = preview,
                 .none => {},
-            }
+            };
         }
     }
 
@@ -2509,6 +2511,49 @@ test "watcher refresh preserves cursor selection and parent listing" {
     try testing.expectEqualStrings("gamma.txt", center.entries[center.cursor].name);
     try testing.expectEqual(@as(usize, 0), center.selectedCount());
     try testing.expect(ctx.redraw);
+}
+
+test "init stages children for a directory of only file symlinks" {
+    // Regression: a non-directory symlink produces no content, and the
+    // staging path must tolerate an outcome with neither listing nor preview.
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "target", .data = "t" });
+    try Io.Dir.symLink(temp.dir, testing.io, "target", "link", .{});
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    try testing.expect(model.getPane(.children).listing == null);
+    try testing.expect(model.getPane(.children).preview == null);
+
+    // The debounced sync must tolerate the same entry as well.
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    try model.syncRight();
+    try testing.expect(model.getPane(.children).listing == null);
+    try testing.expect(model.getPane(.children).preview == null);
 }
 
 test "replaced rows stay readable until the next draw" {
