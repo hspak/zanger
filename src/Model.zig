@@ -1160,6 +1160,66 @@ pub fn handleRowClick(
     self.openCenter() catch |err| try self.reportError("open", @errorName(err));
 }
 
+/// Navigates HERE to the parent-pane entry at `index`: a directory becomes
+/// the new HERE, with the clicked name restored as its cursor. Anything else
+/// is refused with a flash.
+pub fn handleParentClick(self: *Model, index: usize) !void {
+    const pane = self.getPane(.parent);
+    const listing = &(pane.listing orelse return);
+    if (index >= listing.entries.len) return;
+    const entry = listing.entries[index];
+    if (!entry.is_dir) {
+        try self.flashError("not a directory: {s}", .{entry.name});
+        return;
+    }
+    const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
+    defer self.alloc.free(target);
+
+    // Clicking the entry that is already HERE is a no-op.
+    if (std.mem.eql(u8, self.centerListing().path, target)) return;
+
+    self.replaceAnchoredView(target, .{
+        .preferred_name = entry.name,
+        .reject_empty_center = true,
+    }) catch |err| switch (err) {
+        error.EmptyDirectory => {
+            listing.setDirectoryEmpty(index, true);
+            try self.flashError("empty directory: {s}", .{entry.name});
+        },
+        else => return err,
+    };
+}
+
+/// Navigates HERE into the children-pane entry at `index`: a directory
+/// becomes the new HERE (the children listing transfers to PARENT, which is
+/// its exact parent directory), and anything else opens through the system
+/// opener like `l` does.
+pub fn handleChildrenClick(self: *Model, index: usize) !void {
+    const pane = self.getPane(.children);
+    const listing = &(pane.listing orelse return);
+    if (index >= listing.entries.len) return;
+    const entry = listing.entries[index];
+
+    const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
+    defer self.alloc.free(target);
+    if (!entry.is_dir) {
+        try self.openWithSystem(target, entry.name);
+        return;
+    }
+
+    self.replaceAnchoredView(target, .{
+        .preferred_name = entry.name,
+        .transfers = &.{.{ .source = .children, .target = .parent }},
+        .reject_empty_center = true,
+    }) catch |err| switch (err) {
+        error.EmptyDirectory => {
+            listing.setDirectoryEmpty(index, true);
+            try self.flashError("empty directory: {s}", .{entry.name});
+        },
+        else => return err,
+    };
+}
+
 pub fn handleWheel(
     self: *Model,
     ctx: *vxfw.EventContext,
@@ -2939,13 +2999,17 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try testing.expect(ctx.redraw);
 }
 
-test "side panes ignore clicks and browse focus returns to cwd" {
+test "side pane clicks navigate and browse focus returns to cwd" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     try Io.Dir.createDir(temp.dir, testing.io, "cwd", .default_dir);
     try Io.Dir.createDir(temp.dir, testing.io, "cwd/child", .default_dir);
     try Io.Dir.createDir(temp.dir, testing.io, "sibling", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "sibling/inner.txt",
+        .data = "i",
+    });
     try Io.Dir.writeFile(temp.dir, testing.io, .{
         .sub_path = "cwd/child/a.txt",
         .data = "a",
@@ -2974,6 +3038,13 @@ test "side panes ignore clicks and browse focus returns to cwd" {
     });
     defer model.deinit();
 
+    var opened: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (opened.items) |item| testing.allocator.free(item);
+        opened.deinit(testing.allocator);
+    }
+    model.open_recorder = &opened;
+
     var ctx: vxfw.EventContext = .{
         .io = testing.io,
         .alloc = testing.allocator,
@@ -2989,37 +3060,82 @@ test "side panes ignore clicks and browse focus returns to cwd" {
         .type = .press,
     };
 
-    const parent = model.getPane(.parent);
-    const sibling_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
-    const parent_cursor = parent.list_view.cursor;
-    try parent.rows[sibling_index].widget().handleEvent(&ctx, .{ .mouse = click });
-    try testing.expectEqual(parent_cursor, parent.list_view.cursor);
-    try testing.expectEqual(@as(usize, 0), parent.listing.?.selectedCount());
-    try testing.expect(ctx.consume_event);
-    try testing.expect(!ctx.redraw);
-    try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
-
-    ctx.consume_event = false;
+    // Clicking a children row opens that file like `l` would.
     const children = model.getPane(.children);
     try testing.expect(children.rows.len >= 2);
-    const child_cursor = children.list_view.cursor;
-    try children.rows[1].widget().handleEvent(&ctx, .{ .mouse = click });
-    try testing.expectEqual(child_cursor, children.list_view.cursor);
-    try testing.expectEqual(@as(usize, 0), children.listing.?.selectedCount());
+    try children.rows[0].widget().handleEvent(&ctx, .{ .mouse = click });
+    const a_expected = try std.fs.path.join(
+        testing.allocator,
+        &.{ path, "child", "a.txt" },
+    );
+    defer testing.allocator.free(a_expected);
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    try testing.expectEqualStrings(a_expected, opened.items[0]);
+    try testing.expectEqualStrings(path, model.centerListing().path);
     try testing.expect(ctx.consume_event);
-    try testing.expect(!ctx.redraw);
-    try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
+    try testing.expect(ctx.redraw);
 
+    // Clicking a parent row jumps HERE to that sibling directory, with the
+    // clicked name restored as the center cursor.
     ctx.consume_event = false;
+    const parent = model.getPane(.parent);
+    const sibling_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
+    // The parent pane lists cwd's parent, so `sibling` is a sibling of cwd.
+    const sibling_expected = try std.fs.path.join(testing.allocator, &.{
+        process_cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+        "sibling",
+    });
+    defer testing.allocator.free(sibling_expected);
+    try parent.rows[sibling_index].widget().handleEvent(&ctx, .{ .mouse = click });
+    try testing.expectEqualStrings(sibling_expected, model.centerListing().path);
+    // The clicked directory is HERE itself now; its cursor rests on the
+    // first contained entry.
+    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expect(ctx.consume_event);
+    try testing.expect(ctx.redraw);
+
+    // Ascend lands at the shared parent; clicking the old cwd row in the
+    // parent pane returns home through the same feature.
+    ctx.consume_event = false;
+    ctx.redraw = false;
+    try model.ascend();
+    const sub_path = try std.fs.path.join(testing.allocator, &.{
+        process_cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(sub_path);
+    try testing.expectEqualStrings(sub_path, model.centerListing().path);
+
+    // Click back down into <sub>, then into cwd, to return home.
+    ctx.consume_event = false;
+    const sub_row = file_system.indexOfName(
+        &model.getPane(.parent).listing.?,
+        &temp.sub_path,
+    ).?;
+    try model.getPane(.parent).rows[sub_row].widget().handleEvent(
+        &ctx,
+        .{ .mouse = click },
+    );
+    try testing.expectEqualStrings(sub_path, model.centerListing().path);
+    // Return home with the keyboard path: select cwd, then descend.
+    const cwd_here = file_system.indexOfName(model.centerListing(), "cwd").?;
+    model.centerListing().cursor = cwd_here;
+    model.getPane(.here).list_view.cursor = @intCast(cwd_here);
+    try model.openCenter();
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    ctx.redraw = false;
+
     const center_cursor = model.getPane(.here).list_view.cursor;
     const tab: Key = .{ .codepoint = Key.tab };
     try model.handleEvent(&ctx, .{ .key_press = tab });
     try testing.expectEqual(center_cursor, model.getPane(.here).list_view.cursor);
-    try testing.expectEqual(parent_cursor, parent.list_view.cursor);
-    try testing.expectEqual(child_cursor, children.list_view.cursor);
     try testing.expect(ctx.consume_event);
     try testing.expect(!ctx.redraw);
-    try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
 
     try model.openCommand(&ctx);
     try testing.expectEqual(@as(usize, 1), ctx.cmds.items.len);
@@ -3033,17 +3149,6 @@ test "side panes ignore clicks and browse focus returns to cwd" {
     try testing.expect(ctx.cmds.items[0].request_focus.eql(
         model.getPane(.here).list_view.widget(),
     ));
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const child_surface = try children.rows[child_cursor].widget().draw(.{
-        .arena = arena.allocator(),
-        .min = .{ .width = 30, .height = 1 },
-        .max = .{ .width = 30, .height = 1 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    });
-    try testing.expect(!child_surface.buffer[0].style.reverse);
 }
 
 test "watcher re-anchors at the parent when HERE disappears" {

@@ -37,14 +37,15 @@ fn typeErasedEventHandler(
         .mouse => |mouse| {
             if (self.pane.model.mode != .browse) return;
             if (mouse.button != .left or mouse.type != .press) return;
-            if (self.pane.role != .here) {
-                ctx.consumeEvent();
-                return;
-            }
-
             if (self.index >= self.pane.itemCount()) return;
             defer ctx.consumeAndRedraw();
-            return self.pane.model.handleRowClick(ctx, self.index);
+            switch (self.pane.role) {
+                .here => try self.pane.model.handleRowClick(ctx, self.index),
+                // Side-pane clicks navigate instead of focusing: a parent row
+                // jumps HERE to that sibling, a children row descends into it.
+                .parent => try self.pane.model.handleParentClick(self.index),
+                .children => try self.pane.model.handleChildrenClick(self.index),
+            }
         },
         else => {},
     }
