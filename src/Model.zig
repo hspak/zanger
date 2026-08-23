@@ -46,6 +46,9 @@ preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
 // Left-press bookkeeping for double-click descent on HERE rows.
 last_click: ?LastClick = null,
+/// True while the HERE cursor rests on the `..` row. The listing cursor
+/// keeps pointing at its last real entry; every consumer branches on this.
+up_selected: bool = false,
 /// Transient blocked-input notice rendered beside the header path until
 /// `error_deadline`, then cleared on a watcher tick.
 error_message: ?[]u8 = null,
@@ -807,6 +810,7 @@ fn replaceAnchoredView(
     // A press from before this transaction must not pair with a press after
     // it: row indices belong to different listings.
     self.last_click = null;
+    self.up_selected = false;
 }
 
 fn installPane(self: *Model, role: PaneRole, options: InstallOptions) !void {
@@ -883,7 +887,12 @@ fn syncRight(self: *Model) !void {
     var replacement_preview: ?Preview = null;
     errdefer if (replacement_preview) |*preview| preview.deinit();
 
-    if (center.entries.len == 0) {
+    if (self.up_selected and self.getPane(.here).showsUpRow()) {
+        // Highlighting `..`: hint at what it does instead of previewing the
+        // remembered entry.
+        self.cursor_status = null;
+        replacement_preview = try Preview.initMessage(self.alloc, "go up one level");
+    } else if (center.entries.len == 0) {
         self.cursor_status = null;
         replacement_preview = try Preview.initMessage(self.alloc, "empty directory");
     } else {
@@ -1058,6 +1067,10 @@ fn reapChildren() void {
 }
 
 fn openCenter(self: *Model) !void {
+    if (self.hereCursorOnUp()) {
+        try self.ascend();
+        return;
+    }
     const listing = self.centerListing();
     if (listing.entries.len == 0) return;
     const entry = listing.entries[listing.cursor];
@@ -1117,6 +1130,21 @@ pub fn ascend(self: *Model) !void {
 
 fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
+    // Step between the real entries and the `..` row above them.
+    if (down and self.up_selected) {
+        self.up_selected = false;
+        try self.deferRightSync(ctx);
+        return;
+    }
+    if (!down and !self.up_selected and
+        pane.list_view.cursor == 0 and pane.showsUpRow())
+    {
+        self.up_selected = true;
+        try self.deferRightSync(ctx);
+        return;
+    }
+    self.up_selected = false;
+
     const before = pane.list_view.cursor;
     if (down) pane.list_view.nextItem(ctx) else pane.list_view.prevItem(ctx);
     if (pane.listing) |*listing| listing.cursor = pane.list_view.cursor;
@@ -1132,6 +1160,7 @@ pub fn handleRowClick(
     index: usize,
 ) Allocator.Error!void {
     const pane = self.getPane(.here);
+    self.up_selected = false;
     const previous_cursor = pane.list_view.cursor;
     pane.list_view.cursor = @intCast(index);
     if (pane.listing) |*listing| listing.cursor = index;
@@ -1235,10 +1264,11 @@ pub fn handleWheel(
 fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
-    if (listing.entries.len == 0) {
+    if (listing.entries.len == 0 or self.up_selected and !down) {
         ctx.consumeEvent();
         return;
     }
+    self.up_selected = false;
 
     const distance = @max(@as(usize, 1), @as(usize, self.cwd_visible_rows) / 2);
     const current: usize = pane.list_view.cursor;
@@ -1262,6 +1292,7 @@ fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
     if (listing.entries.len == 0) return;
+    self.up_selected = false;
     const target: u32 = if (bottom) @intCast(listing.entries.len - 1) else 0;
     const previous_cursor = pane.list_view.cursor;
     pane.list_view.jumpToItem(target);
@@ -1272,7 +1303,7 @@ fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
 fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
-    if (listing.entries.len == 0) return;
+    if (listing.entries.len == 0 or self.hereCursorOnUp()) return;
     listing.toggleSelected();
     try self.setMessage("", .{});
 
@@ -1302,6 +1333,10 @@ fn deleteCount(self: *const Model) usize {
 }
 
 fn beginDelete(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.hereCursorOnUp()) {
+        try self.flashError("nothing safe to delete", .{});
+        return;
+    }
     const count = self.deleteCount();
     if (count == 0) {
         try self.returnToBrowse(ctx);
@@ -1392,6 +1427,12 @@ fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
     self.error_deadline = Io.Clock.awake.now(self.io).addDuration(
         .fromMilliseconds(error_flash_ms),
     );
+}
+
+/// Whether the HERE cursor currently highlights the `..` row.
+pub fn hereCursorOnUp(self: *const Model) bool {
+    return self.up_selected and
+        @constCast(self).getPane(.here).showsUpRow();
 }
 
 /// Drops any active flash immediately in response to user input.
@@ -2723,6 +2764,140 @@ test "a failed system open reports the spawn error" {
 
     // Sweeping with no children must be a harmless no-op.
     reapChildren();
+}
+
+test "stepping onto dotdot hints and enter ascends" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "d", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "d/inner.txt", .data = "i" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const root_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(root_path);
+    const d_path = try std.fs.path.join(testing.allocator, &.{ root_path, "d" });
+    defer testing.allocator.free(d_path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = d_path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // k from the first entry steps up onto '..'.
+    const up_key: Key = .{ .codepoint = 'k' };
+    try model.captureEvent(&ctx, .{ .key_press = up_key });
+    try testing.expect(model.up_selected);
+
+    // The children pane hints instead of previewing a stale entry.
+    try model.syncRight();
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .placeholder);
+    try testing.expectEqualStrings("go up one level", child_pane.preview.?.lines[0]);
+    try testing.expect(model.cursor_status == null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const up_surface = try model.getPane(.here).up_row.widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 20, .height = 1 },
+        .max = .{ .width = 20, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    try testing.expect(up_surface.buffer[0].style.reverse);
+
+    // Enter on '..' ascends.
+    const enter: Key = .{ .codepoint = Key.enter };
+    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try testing.expectEqualStrings(root_path, model.centerListing().path);
+    try testing.expect(!model.up_selected);
+
+    // j steps back off '..' and the children pane resumes normally.
+    const down_key: Key = .{ .codepoint = 'j' };
+    model.up_selected = true;
+    try model.captureEvent(&ctx, .{ .key_press = down_key });
+    try testing.expect(!model.up_selected);
+    try model.syncRight();
+    try testing.expect(model.cursor_status != null);
+}
+
+test "dotdot selection blocks entry-scoped input and jumps clear it" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "b.txt", .data = "b" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    const up_key: Key = .{ .codepoint = 'k' };
+    try model.captureEvent(&ctx, .{ .key_press = up_key });
+    try testing.expect(model.up_selected);
+
+    // Space has nothing to toggle.
+    const space: Key = .{ .codepoint = Key.space };
+    try model.handleEvent(&ctx, .{ .key_press = space });
+    try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
+
+    // Deletion is refused with the standard flash.
+    try model.beginDelete(&ctx);
+    try testing.expect(model.mode != .confirm);
+    try testing.expectEqualStrings(
+        "nothing safe to delete",
+        model.error_message.?,
+    );
+
+    // Jumping to the bottom clears the '..' selection.
+    const jump_key: Key = .{ .codepoint = 'G' };
+    try model.handleEvent(&ctx, .{ .key_press = jump_key });
+    try testing.expect(!model.up_selected);
+    try testing.expectEqualStrings(
+        "b.txt",
+        model.centerListing().entries[model.centerListing().cursor].name,
+    );
 }
 
 test "clicking the dotdot row ascends and it hides at the root" {

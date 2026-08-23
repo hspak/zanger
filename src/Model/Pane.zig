@@ -37,6 +37,8 @@ pub const UpRow = struct {
                 if (self.pane.model.mode != .browse) return;
                 if (mouse.button != .left or mouse.type != .press) return;
                 defer ctx.consumeAndRedraw();
+                // Highlight first so the click lands like a keyboard step.
+                self.pane.model.up_selected = true;
                 return self.pane.model.ascend() catch |err| {
                     try self.pane.model.reportError("up", @errorName(err));
                 };
@@ -53,6 +55,9 @@ pub const UpRow = struct {
         const style: vaxis.Cell.Style = .{
             .fg = .{ .index = 12 },
             .bold = true,
+            // Highlighted whenever the HERE cursor rests on `..`.
+            .reverse = self.pane.model.mode != .command and
+                self.pane.model.hereCursorOnUp(),
         };
         // Same marker layout as an unselected directory row.
         return Row.drawClippedSurface(ctx, self.widget(), "  ▸  ..", style);

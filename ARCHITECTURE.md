@@ -80,8 +80,11 @@ The model maintains these invariants after every committed operation:
    only: clicking a parent row makes that sibling the current directory —
    empty ones included — and clicking a children row descends into it
    (non-directories open through the system opener). Keyboard browse
-   interaction remains HERE-only, which also renders a clickable `..` line
-   above its listing except at `/`.
+   interaction remains HERE-only. HERE also renders a clickable `..` line
+   above its listing except at `/`; the cursor steps onto it from the first
+   entry (the children pane then shows a `go up one level` hint, Enter
+   ascends, and entry-scoped input like space or deletion is refused until
+   the cursor steps back off).
 4. Every non-empty pane has a valid `ListView` cursor and a row-widget array
    parallel to its displayed content.
 5. Selection bitsets have one bit per listing entry. Selection follows a
@@ -250,7 +253,7 @@ Empty directories remain previews and cannot become HERE. A no-op click or jump
 does not rebuild CHILDREN. Side-pane clicks navigate — a parent row (empty ones included) becomes the
 current directory, a children row descends into it or opens it — and refusals
 flash beside the header path like other blocked input. HERE renders a
-clickable `..` line above its listing except at `/`. A second left press on the same HERE row within
+clickable, cursor-selectable `..` line above its listing except at `/`. A second left press on the same HERE row within
 400 ms descends when that row is a directory and opens any other non-executable
 entry with the system opener; every view transaction clears the pending-click
 state so presses cannot pair across listings. Blocked input — refused opens, empty
