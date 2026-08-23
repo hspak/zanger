@@ -84,11 +84,11 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
             if (self.index >= preview.lines.len) return self.emptySurface(ctx);
             // A preview's first line may be a notice rendered like the
             // placeholder messages ahead of otherwise metadata content.
-            const is_header = preview.header and self.index == 0;
-            const dimmed = preview.kind == .placeholder or is_header;
+            const in_header = self.index < preview.header_lines;
+            const dimmed = preview.kind == .placeholder or in_header;
             style.dim = dimmed;
             style.italic = dimmed;
-            if (preview.kind == .metadata and !is_header) {
+            if (preview.kind == .metadata and !in_header) {
                 return self.drawMetadataRow(ctx, preview.lines[self.index], style);
             }
             break :row_text preview.lines[self.index];

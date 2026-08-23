@@ -31,9 +31,9 @@ pub const Kind = enum {
 alloc: Allocator,
 lines: []const []const u8 = &.{},
 kind: Kind = .metadata,
-/// When true, `lines[0]` is a notice rendered with placeholder styling
-/// ahead of otherwise metadata-kind content.
-header: bool = false,
+/// Number of leading lines rendered with placeholder styling ahead of
+/// otherwise metadata-kind content, including any blank separator.
+header_lines: usize = 0,
 
 pub fn deinit(self: *Preview) void {
     for (self.lines) |line| self.alloc.free(line);
@@ -53,9 +53,10 @@ pub fn initMessage(alloc: Allocator, message: []const u8) Allocator.Error!Previe
     };
 }
 
-/// A dimmed non-text notice followed by an eight-line metadata sheet for a
-/// regular file whose contents are not rendered. `loaded_metadata` may carry
-/// metadata already stat'ed for the same path; otherwise one `statx` runs.
+/// A dimmed non-text notice, one blank separator line, and an eight-line
+/// metadata sheet for a regular file whose contents are not rendered.
+/// `loaded_metadata` may carry metadata already stat'ed for the same path;
+/// otherwise one `statx` runs.
 pub fn initFile(
     alloc: Allocator,
     identities: *IdentityCache,
@@ -65,7 +66,7 @@ pub fn initFile(
     const metadata = loaded_metadata orelse try FileMetadata.init(path);
 
     var made: usize = 0;
-    const lines = try alloc.alloc([]const u8, 9);
+    const lines = try alloc.alloc([]const u8, 10);
     errdefer {
         for (lines[0..made]) |line| alloc.free(line);
         alloc.free(lines);
@@ -73,34 +74,36 @@ pub fn initFile(
 
     lines[0] = try alloc.dupe(u8, "non-text files are not rendered");
     made += 1;
-    lines[1] = try std.fmt.allocPrint(alloc, "Name: {s}", .{std.fs.path.basename(path)});
+    lines[1] = try alloc.dupe(u8, "");
     made += 1;
-    lines[2] = try std.fmt.allocPrint(alloc, "Type: {s}", .{@tagName(metadata.kind)});
+    lines[2] = try std.fmt.allocPrint(alloc, "Name: {s}", .{std.fs.path.basename(path)});
     made += 1;
-    lines[3] = try formatMode(alloc, metadata.kind, metadata.mode);
+    lines[3] = try std.fmt.allocPrint(alloc, "Type: {s}", .{@tagName(metadata.kind)});
     made += 1;
-    lines[4] = try formatOwner(alloc, identities, metadata.uid, metadata.gid);
+    lines[4] = try formatMode(alloc, metadata.kind, metadata.mode);
     made += 1;
-    lines[5] = try std.fmt.allocPrint(alloc, "Size: {Bi:.2} ({d} bytes)", .{
+    lines[5] = try formatOwner(alloc, identities, metadata.uid, metadata.gid);
+    made += 1;
+    lines[6] = try std.fmt.allocPrint(alloc, "Size: {Bi:.2} ({d} bytes)", .{
         metadata.size,
         metadata.size,
     });
     made += 1;
-    lines[6] = try formatModifiedTime(alloc, metadata.mtime);
+    lines[7] = try formatModifiedTime(alloc, metadata.mtime);
     made += 1;
-    lines[7] = try std.fmt.allocPrint(
+    lines[8] = try std.fmt.allocPrint(
         alloc,
         "Writable: {s}",
         .{if (metadata.mode & 0o222 == 0) "no" else "yes"},
     );
     made += 1;
-    lines[8] = try std.fmt.allocPrint(alloc, "Links: {d}", .{metadata.nlink});
+    lines[9] = try std.fmt.allocPrint(alloc, "Links: {d}", .{metadata.nlink});
 
     return .{
         .alloc = alloc,
         .lines = lines,
         .kind = .metadata,
-        .header = true,
+        .header_lines = 2,
     };
 }
 
