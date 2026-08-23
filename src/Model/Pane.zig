@@ -13,6 +13,51 @@ const Model = @import("../Model.zig");
 const Preview = @import("Preview.zig");
 const Row = @import("Row.zig");
 
+/// The clickable `..` line above the HERE listing. Lives inside its pane so
+/// the widget address is stable for hit testing across frames.
+pub const UpRow = struct {
+    pane: *Pane,
+
+    pub fn widget(self: *const UpRow) vxfw.Widget {
+        return .{
+            .userdata = @constCast(self),
+            .eventHandler = upTypeErasedEventHandler,
+            .drawFn = upTypeErasedDrawFn,
+        };
+    }
+
+    fn upTypeErasedEventHandler(
+        ptr: *anyopaque,
+        ctx: *vxfw.EventContext,
+        event: vxfw.Event,
+    ) anyerror!void {
+        const self: *UpRow = @ptrCast(@alignCast(ptr));
+        switch (event) {
+            .mouse => |mouse| {
+                if (self.pane.model.mode != .browse) return;
+                if (mouse.button != .left or mouse.type != .press) return;
+                defer ctx.consumeAndRedraw();
+                return self.pane.model.ascend() catch |err| {
+                    try self.pane.model.reportError("up", @errorName(err));
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn upTypeErasedDrawFn(
+        ptr: *anyopaque,
+        ctx: vxfw.DrawContext,
+    ) Allocator.Error!vxfw.Surface {
+        const self: *UpRow = @ptrCast(@alignCast(ptr));
+        const style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 12 },
+            .bold = true,
+        };
+        return Row.drawClippedSurface(ctx, self.widget(), "..", style);
+    }
+};
+
 const Pane = @This();
 
 model: *Model,
@@ -26,6 +71,8 @@ rows: []Row,
 // Stable location marker for the center directory in the parent listing.
 cwd_index: ?usize,
 list_view: vxfw.ListView,
+// Clickable `..` row; only rendered by HERE panes below the filesystem root.
+up_row: UpRow,
 
 /// Direction of a wheel report, coalesced by the model.
 pub const WheelDirection = enum {
@@ -51,6 +98,7 @@ pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
         .rows = &.{},
         .cwd_index = null,
         .list_view = undefined,
+        .up_row = .{ .pane = self },
     };
     self.resetListView(0);
 }
@@ -108,11 +156,47 @@ fn typeErasedCaptureHandler(
     try self.model.handleWheel(ctx, direction);
 }
 
+/// Whether this pane renders the clickable `..` line: only a HERE pane that
+/// sits below the filesystem root.
+pub fn showsUpRow(self: *const Pane) bool {
+    if (self.role != .here or self.listing == null) return false;
+    return !std.mem.eql(u8, self.listing.?.path, "/");
+}
+
 fn typeErasedDrawFn(
     ptr: *anyopaque,
     ctx: vxfw.DrawContext,
 ) Allocator.Error!vxfw.Surface {
     const self: *Pane = @ptrCast(@alignCast(ptr));
+    const size = ctx.max.size();
+
+    if (self.showsUpRow()) {
+        // Reserve the top row for `..` and give the rest to the list.
+        const list_height = size.height -| 1;
+        const up_ctx = ctx.withConstraints(
+            .{ .width = size.width, .height = 1 },
+            .{ .width = size.width, .height = 1 },
+        );
+        const up_surface = try self.up_row.widget().draw(up_ctx);
+        const list_ctx = ctx.withConstraints(
+            .{ .width = size.width, .height = list_height },
+            .{ .width = size.width, .height = list_height },
+        );
+        const list_surface = try self.list_view.widget().draw(list_ctx);
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        children[0] = .{ .origin = .{ .col = 0, .row = 0 }, .surface = up_surface };
+        children[1] = .{
+            .origin = .{ .col = 0, .row = 1 },
+            .surface = list_surface,
+        };
+        return .{
+            .size = size,
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
+    }
+
     const list_surface = try self.list_view.widget().draw(ctx);
     const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
     children[0] = .{

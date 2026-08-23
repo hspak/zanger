@@ -1091,7 +1091,7 @@ fn openCenter(self: *Model) !void {
     };
 }
 
-fn ascend(self: *Model) !void {
+pub fn ascend(self: *Model) !void {
     const center = self.centerListing();
     if (std.mem.eql(u8, center.path, "/")) {
         try self.flashError("already at filesystem root", .{});
@@ -1178,16 +1178,9 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
     // Clicking the entry that is already HERE is a no-op.
     if (std.mem.eql(u8, self.centerListing().path, target)) return;
 
-    self.replaceAnchoredView(target, .{
-        .preferred_name = entry.name,
-        .reject_empty_center = true,
-    }) catch |err| switch (err) {
-        error.EmptyDirectory => {
-            listing.setDirectoryEmpty(index, true);
-            try self.flashError("empty directory: {s}", .{entry.name});
-        },
-        else => return err,
-    };
+    // An explicit click expresses intent, so empty directories are entered
+    // like any other.
+    try self.replaceAnchoredView(target, .{ .preferred_name = entry.name });
 }
 
 /// Navigates HERE into the children-pane entry at `index`: a directory
@@ -1385,7 +1378,7 @@ fn setMessage(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
     self.message = replacement;
 }
 
-fn reportError(self: *Model, action: []const u8, error_name: []const u8) Allocator.Error!void {
+pub fn reportError(self: *Model, action: []const u8, error_name: []const u8) Allocator.Error!void {
     try self.setMessage("{s}: {s}", .{ action, error_name });
 }
 
@@ -2730,6 +2723,131 @@ test "a failed system open reports the spawn error" {
 
     // Sweeping with no children must be a harmless no-op.
     reapChildren();
+}
+
+test "clicking the dotdot row ascends and it hides at the root" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "d", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "d/inner.txt", .data = "i" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const root_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(root_path);
+    const d_path = try std.fs.path.join(testing.allocator, &.{ root_path, "d" });
+    defer testing.allocator.free(d_path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = d_path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    // The row exists only for HERE panes below the root.
+    try testing.expect(model.getPane(.here).showsUpRow());
+    try testing.expect(!model.getPane(.parent).showsUpRow());
+    try testing.expect(!model.getPane(.children).showsUpRow());
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const pane_surface = try model.getPane(.here).widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 40, .height = 8 },
+        .max = .{ .width = 40, .height = 8 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    // Top band renders "..", styled like a directory.
+    const up_band = pane_surface.children[0].surface;
+    try testing.expectEqualStrings(".", up_band.buffer[0].char.grapheme);
+    try testing.expectEqualStrings(".", up_band.buffer[1].char.grapheme);
+    try testing.expect(up_band.buffer[0].style.bold);
+    try testing.expect(up_band.buffer[1].style.bold);
+
+    // Clicking it ascends one level.
+    const press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(root_path, model.centerListing().path);
+    try testing.expect(ctx.consume_event);
+    try testing.expect(ctx.redraw);
+}
+
+test "the dotdot row hides at the filesystem root" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = "/",
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    try testing.expect(!model.getPane(.here).showsUpRow());
+}
+
+test "parent clicks enter empty directories" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "home", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "home/x", .data = "x" });
+    try Io.Dir.createDir(temp.dir, testing.io, "target", .default_dir);
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const root_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(root_path);
+    const home_path = try std.fs.path.join(testing.allocator, &.{ root_path, "home" });
+    defer testing.allocator.free(home_path);
+    const target_path = try std.fs.path.join(testing.allocator, &.{ root_path, "target" });
+    defer testing.allocator.free(target_path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = home_path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    const index = file_system.indexOfName(
+        &model.getPane(.parent).listing.?,
+        "target",
+    ).?;
+    try model.handleParentClick(index);
+
+    // An explicit click expresses intent: empty directories are entered.
+    try testing.expectEqualStrings(target_path, model.centerListing().path);
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .placeholder);
 }
 
 test "double click on a directory descends into it" {

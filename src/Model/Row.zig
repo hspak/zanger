@@ -73,7 +73,7 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         const parent_cwd_index = self.pane.role == .parent and
             self.pane.cwd_index == self.index;
         style.reverse = active_cursor or parent_cwd_index;
-        return self.drawClippedRow(ctx, listing.rows[self.index], style);
+        return drawClippedSurface(ctx, self.widget(), listing.rows[self.index], style);
     }
     if (self.pane.preview) |*preview| {
         if (self.index >= preview.lines.len) return self.emptySurface(ctx);
@@ -89,7 +89,7 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         // Empty lines must still occupy a row: ListView constrains children
         // to min.height 0, so an empty Text collapses to zero height and
         // pulls every following row up. drawClippedRow always fills one row.
-        return self.drawClippedRow(ctx, preview.lines[self.index], style);
+        return drawClippedSurface(ctx, self.widget(), preview.lines[self.index], style);
     }
     return self.emptySurface(ctx);
 }
@@ -97,9 +97,13 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
 /// Draws one row into an exact-width surface. Grapheme-aware clipping stops
 /// at the pane width and writes an ellipsis over the last fitting cell, so a
 /// long off-screen link target adds no per-frame work beyond the viewport.
-fn drawClippedRow(
-    self: *const Row,
+/// Draws one line into an exact-width surface owned by `widget`.
+/// Grapheme-aware clipping stops at the pane width and writes an ellipsis
+/// over the last fitting cell, so long lines add no per-frame work beyond
+/// the viewport.
+pub fn drawClippedSurface(
     ctx: vxfw.DrawContext,
+    owner: vxfw.Widget,
     line: []const u8,
     style: vaxis.Cell.Style,
 ) Allocator.Error!vxfw.Surface {
@@ -111,7 +115,7 @@ fn drawClippedRow(
         requested_height;
     const surface = try vxfw.Surface.init(
         ctx.arena,
-        self.widget(),
+        owner,
         .{ .width = width, .height = height },
     );
     @memset(surface.buffer, vaxis.Cell{ .style = style });
