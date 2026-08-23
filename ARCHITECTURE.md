@@ -229,7 +229,9 @@ failure still aborts initialization.
 - `j`/`k`, Ctrl-N/Ctrl-P, and arrows move HERE.
 - Ctrl-D/Ctrl-U move by half of the visible HERE rows.
 - `g`/`G` jump directly to the first or last entry.
-- Enter or `l` descends into a non-empty directory.
+- Enter or `l` descends into a non-empty directory. On any other entry they
+  spawn `xdg-open` for the resolved path, detached, with the child collected
+  on a later watcher tick; failures surface as an `open:` status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
 - `r` rebuilds the anchored view.

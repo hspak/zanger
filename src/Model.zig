@@ -46,6 +46,11 @@ preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
 // Left-press bookkeeping for double-click descent on HERE rows.
 last_click: ?LastClick = null,
+/// Program spawned to open files with; overridable in tests.
+open_program: []const u8 = "xdg-open",
+/// Test seam: when set, open requests append the target path here instead
+/// of spawning a process. Borrowed for the model's lifetime.
+open_recorder: ?*std.ArrayList([]const u8) = null,
 // Terminals may encode one physical wheel notch as a burst of reports.
 wheel_tick_pending: bool = false,
 wheel_direction: ?WheelDirection = null,
@@ -992,12 +997,58 @@ fn recoverMissingCenter(self: *Model, failure: anyerror) !void {
     try self.setMessage("{s} is gone ({s})", .{ deleted_name, @errorName(failure) });
 }
 
+/// Opens `path` with the system opener. In tests the request may be
+/// recorded instead of spawned; see `open_recorder`.
+fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
+    if (self.open_recorder) |recorder| {
+        try recorder.append(self.alloc, try self.alloc.dupe(u8, path));
+    } else {
+        self.spawnOpen(path) catch |err| {
+            try self.reportError("open", @errorName(err));
+            return;
+        };
+    }
+    try self.setMessage("opened {s}", .{name});
+}
+
+/// Spawns `self.open_program` for one path without waiting for it. The
+/// child is left for `reapChildren` to collect on later watcher ticks.
+fn spawnOpen(self: *Model, path: []const u8) std.process.SpawnError!void {
+    _ = try std.process.spawn(self.io, .{
+        .argv = &.{ self.open_program, path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+}
+
+/// Collects exited opener children so detached spawns leave no zombies.
+/// Nonblocking: returns as soon as no child has exited.
+fn reapChildren() void {
+    var status: u32 = undefined;
+    while (true) {
+        const rc = std.os.linux.wait4(-1, &status, std.os.linux.W.NOHANG, null);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                // rc is the child pid, or 0 when children exist but none has
+                // exited yet.
+                if (rc == 0) return;
+            },
+            .CHILD => return,
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
 fn openCenter(self: *Model) !void {
     const listing = self.centerListing();
     if (listing.entries.len == 0) return;
     const entry = listing.entries[listing.cursor];
     if (!entry.is_dir) {
-        try self.setMessage("not a directory: {s}", .{entry.name});
+        const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
+        defer self.alloc.free(target);
+        try self.openWithSystem(target, entry.name);
         return;
     }
     const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
@@ -1402,6 +1453,7 @@ fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
             ctx.consumeEvent();
         },
         .tick => {
+            reapChildren();
             try ctx.tick(watcher_interval_ms, self.widget());
             const refreshed = self.reconcileWatcher() catch |err| {
                 try self.reportError("watcher", @errorName(err));
@@ -2236,6 +2288,118 @@ test "delete keeps the cursor row and clamps it at the end" {
     try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
     try testing.expectEqualStrings("a.txt", listing.entries[listing.cursor].name);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
+}
+
+test "enter on a file opens it through the system opener" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
+    try Io.Dir.createDir(temp.dir, testing.io, "sub", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "sub/inner.txt",
+        .data = "i",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var opened: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (opened.items) |item| testing.allocator.free(item);
+        opened.deinit(testing.allocator);
+    }
+    model.open_recorder = &opened;
+
+    const index = file_system.indexOfName(model.centerListing(), "f.txt").?;
+    model.centerListing().cursor = index;
+    model.getPane(.here).list_view.cursor = @intCast(index);
+
+    const enter: Key = .{ .codepoint = Key.enter };
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    try model.handleEvent(&ctx, .{ .key_press = enter });
+
+    // The request went to the opener seam, not to navigation.
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    const expected = try std.fs.path.join(testing.allocator, &.{ path, "f.txt" });
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, opened.items[0]);
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqualStrings("opened f.txt", model.message);
+
+    // Directories still descend and are never sent to the opener.
+    const dir_index = file_system.indexOfName(model.centerListing(), "sub").?;
+    model.centerListing().cursor = dir_index;
+    model.getPane(.here).list_view.cursor = @intCast(dir_index);
+    ctx.cmds.clearRetainingCapacity();
+    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    try testing.expect(model.centerListing().path.len > path.len);
+}
+
+test "a failed system open reports the spawn error" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+    model.open_program = "/nonexistent/opener-for-tests";
+
+    const index = file_system.indexOfName(model.centerListing(), "f.txt").?;
+    model.centerListing().cursor = index;
+    model.getPane(.here).list_view.cursor = @intCast(index);
+
+    const enter: Key = .{ .codepoint = Key.enter };
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try testing.expectEqualStrings("open: FileNotFound", model.message);
+
+    // Sweeping with no children must be a harmless no-op.
+    reapChildren();
 }
 
 test "double click on a directory descends into it" {
