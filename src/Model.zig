@@ -72,7 +72,7 @@ const Mode = enum { browse, command, confirm };
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
 const double_click_interval_ms = 400;
-const preview_debounce_ms = 25;
+const preview_debounce_ms = 12;
 const wheel_coalesce_ms = 12;
 
 const WheelDirection = Pane.WheelDirection;
