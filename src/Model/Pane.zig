@@ -41,6 +41,7 @@ pub const Replacement = struct {
     cwd_index: ?usize = null,
 };
 
+/// Initializes an empty pane bound to `model` with the given ownership role.
 pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
     self.* = .{
         .model = model,
@@ -54,6 +55,8 @@ pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
     self.resetListView(0);
 }
 
+/// Releases the owned listing, preview, and row widgets, then poisons
+/// `self`.
 pub fn deinit(self: *Pane) void {
     if (self.listing) |*listing| listing.deinit();
     if (self.preview) |*preview| preview.deinit();
@@ -61,6 +64,8 @@ pub fn deinit(self: *Pane) void {
     self.* = undefined;
 }
 
+/// Returns a widget borrowing `self`. The pane address must stay stable for
+/// the widget's lifetime.
 pub fn widget(self: *Pane) vxfw.Widget {
     return .{
         .userdata = self,

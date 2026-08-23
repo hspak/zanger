@@ -16,6 +16,8 @@ const Row = @This();
 pane: *Pane,
 index: usize,
 
+/// Returns a widget borrowing `self`; the row's address inside its pane's
+/// rows array is the click-identity key.
 pub fn widget(self: *const Row) vxfw.Widget {
     return .{
         .userdata = @constCast(self),

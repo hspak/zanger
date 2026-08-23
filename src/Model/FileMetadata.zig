@@ -5,6 +5,18 @@ const Io = std.Io;
 
 const FileMetadata = @This();
 
+/// Errors from `toPosixPath`, the `statx` syscall mapping, and unexpected
+/// kernel responses.
+pub const InitError =
+    error{
+        NameTooLong,
+        AccessDenied,
+        SymLinkLoop,
+        FileNotFound,
+        NotDir,
+        SystemResources,
+    } || std.posix.UnexpectedError;
+
 kind: Io.File.Kind,
 size: u64,
 mtime: Io.Timestamp,
@@ -15,7 +27,7 @@ gid: u32,
 
 /// Stats `path` without following symlinks. The error set contains no
 /// allocation failure; every failure is an `statx` outcome.
-pub fn init(path: []const u8) !FileMetadata {
+pub fn init(path: []const u8) InitError!FileMetadata {
     const linux = std.os.linux;
     const path_z = try std.posix.toPosixPath(path);
     const requested: linux.STATX = .{
