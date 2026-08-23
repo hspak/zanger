@@ -491,6 +491,7 @@ fn prepareView(
         self.getPane(transfer.source).listing
     else
         null;
+    var reused_applied = false;
     if (reused_children) |candidate| {
         const children_parent = std.fs.path.dirname(candidate.path) orelse "/";
         const matches_selected = center.entries.len > 0 and
@@ -523,80 +524,109 @@ fn prepareView(
                 );
                 pending_view.cursors[PaneRole.children.toIndex()] = @intCast(children.cursor);
             }
-        } else {
-            try self.buildChildContent(&pending_view, center);
+            reused_applied = true;
         }
-    } else {
-        try self.buildChildContent(&pending_view, center);
+    }
+
+    if (!reused_applied) {
+        const child_index = PaneRole.children.toIndex();
+        if (center.entries.len == 0) {
+            pending_view.previews[child_index] = try Preview.initMessage(
+                self.alloc,
+                "empty directory",
+            );
+        } else {
+            const entry = center.entries[center.cursor];
+            const outcome = try self.buildChildrenOutcome(
+                center.path,
+                entry,
+                if (pending_view.cursor_status) |status| status.metadata else null,
+            );
+            if (outcome.error_name) |error_name| {
+                pending_view.rememberErrorName(error_name);
+            } else {
+                if (outcome.dir_is_empty) |is_empty| {
+                    setStagedDirectoryEmpty(
+                        &pending_view,
+                        .here,
+                        center,
+                        center.cursor,
+                        is_empty,
+                    );
+                }
+                switch (outcome.content.?) {
+                    .listing => |listing| {
+                        pending_view.listings[child_index] = listing;
+                        pending_view.cursors[child_index] = @intCast(listing.cursor);
+                    },
+                    .preview => |preview| pending_view.previews[child_index] = preview,
+                    .none => {},
+                }
+            }
+        }
     }
 
     return pending_view;
 }
 
-fn buildChildContent(
-    self: *Model,
-    pending_view: *PendingView,
-    center: *file_system.Listing,
-) !void {
-    const child_index = PaneRole.children.toIndex();
-    if (center.entries.len == 0) {
-        pending_view.previews[child_index] = try Preview.initMessage(
-            self.alloc,
-            "empty directory",
-        );
-        return;
-    }
+const ChildrenContent = union(enum) {
+    listing: file_system.Listing,
+    preview: Preview,
+    none,
+};
 
-    const entry = center.entries[center.cursor];
-    const child_path = try file_system.joinPath(self.alloc, center.path, entry.name);
+/// What CHILDREN should display for HERE's cursor entry. Only allocation
+/// failure propagates as an error; every other failure is reported through
+/// `error_name` so each caller degrades independently.
+const ChildrenOutcome = struct {
+    content: ?ChildrenContent = null,
+    /// Set when a directory listing was read; whether it had no visible
+    /// entries. Null when no directory was read.
+    dir_is_empty: ?bool = null,
+    /// Name of the first non-OOM preparation error, if any.
+    error_name: ?[]const u8 = null,
+};
+
+fn buildChildrenOutcome(
+    self: *Model,
+    center_path: []const u8,
+    entry: file_system.Entry,
+    metadata_hint: ?FileMetadata,
+) Allocator.Error!ChildrenOutcome {
+    const child_path = try file_system.joinPath(self.alloc, center_path, entry.name);
     defer self.alloc.free(child_path);
+
     if (!entry.is_dir) {
-        if (entry.is_sym) return;
-        pending_view.previews[child_index] = Preview.initFile(
+        // A non-directory symbolic link shows no metadata preview.
+        if (entry.is_sym) return .{};
+        const preview = Preview.initFile(
             self.alloc,
             &self.identities,
             child_path,
-            if (pending_view.cursor_status) |status| status.metadata else null,
+            metadata_hint,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                pending_view.rememberErrorName(@errorName(err));
-                return;
-            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .error_name = @errorName(err) },
         };
-        return;
+        return .{ .content = .{ .preview = preview } };
     }
 
-    pending_view.listings[child_index] = file_system.readDir(
+    var listing = file_system.readDir(
         self.alloc,
         self.io,
         child_path,
         .{ .show_hidden = self.show_hidden },
     ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            pending_view.rememberErrorName(@errorName(err));
-            return;
-        },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .error_name = @errorName(err) },
     };
-    const children = &pending_view.listings[child_index].?;
-    setStagedDirectoryEmpty(
-        pending_view,
-        .here,
-        center,
-        center.cursor,
-        children.entries.len == 0,
-    );
-    if (children.entries.len == 0) {
-        children.deinit();
-        pending_view.listings[child_index] = null;
-        pending_view.previews[child_index] = try Preview.initMessage(
-            self.alloc,
-            "empty directory",
-        );
-        return;
+    const dir_is_empty = listing.entries.len == 0;
+    if (dir_is_empty) {
+        listing.deinit();
+        const preview = try Preview.initMessage(self.alloc, "empty directory");
+        return .{ .content = .{ .preview = preview }, .dir_is_empty = true };
     }
-    pending_view.cursors[child_index] = @intCast(children.cursor);
+    return .{ .content = .{ .listing = listing }, .dir_is_empty = false };
 }
 
 fn makeRows(self: *Model, pane: *Pane, count: usize) Allocator.Error![]Row {
@@ -798,47 +828,28 @@ fn syncRight(self: *Model) !void {
                     return;
                 }
             }
-            replacement_listing = file_system.readDir(
-                self.alloc,
-                self.io,
-                desired,
-                .{ .show_hidden = self.show_hidden },
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    try self.clearPane(.children);
-                    try self.setMessage("preview unavailable: {s}", .{@errorName(err)});
-                    self.preview_dirty = false;
-                    return;
-                },
-            };
-            center.setDirectoryEmpty(
-                center.cursor,
-                replacement_listing.?.entries.len == 0,
-            );
-            if (replacement_listing.?.entries.len == 0) {
-                replacement_listing.?.deinit();
-                replacement_listing = null;
-                replacement_preview = try Preview.initMessage(
-                    self.alloc,
-                    "empty directory",
-                );
-            }
-        } else if (!entry.is_sym) {
-            replacement_preview = Preview.initFile(
-                self.alloc,
-                &self.identities,
-                desired,
+        }
+
+        if (!entry.is_sym) {
+            const outcome = try self.buildChildrenOutcome(
+                center.path,
+                entry,
                 if (self.cursor_status) |status| status.metadata else null,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    try self.clearPane(.children);
-                    try self.setMessage("preview unavailable: {s}", .{@errorName(err)});
-                    self.preview_dirty = false;
-                    return;
-                },
-            };
+            );
+            if (outcome.error_name) |error_name| {
+                try self.clearPane(.children);
+                try self.setMessage("preview unavailable: {s}", .{error_name});
+                self.preview_dirty = false;
+                return;
+            }
+            if (outcome.dir_is_empty) |is_empty| {
+                center.setDirectoryEmpty(center.cursor, is_empty);
+            }
+            switch (outcome.content.?) {
+                .listing => |listing| replacement_listing = listing,
+                .preview => |preview| replacement_preview = preview,
+                .none => {},
+            }
         }
     }
 
