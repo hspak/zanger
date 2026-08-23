@@ -232,8 +232,9 @@ failure still aborts initialization.
 - Enter or `l` descends into a non-empty directory. On any other entry they
   hand the resolved path to `xdg-open`, detached, with the child collected on
   a later watcher tick. Only regular files without execute bits qualify —
-  `xdg-open` may execute what it is given — and excluded entries fall back to
-  the `not a directory` status. Failures surface as an `open:` status message.
+  `xdg-open` may execute what it is given — and excluded entries flash a
+  `cannot open executables` notice instead. Failures surface as an `open:`
+  status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
 - `r` rebuilds the anchored view.
@@ -247,7 +248,7 @@ entry with the system opener; every view transaction clears the pending-click
 state so presses cannot pair across listings. Blocked input — refused opens, empty
 directory descents, ascent past `/`, deletions with nothing selected — flashes
 a red notice beside the header path for three seconds, cleared on a watcher
-tick. Side listings can retain selections for later reuse,
+tick. Any key press or mouse input dismisses the notice immediately. Side listings can retain selections for later reuse,
 but selection and deletion operations always target HERE.
 
 Stable `Row` widgets provide click identity because vxfw `ListView` has no

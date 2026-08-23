@@ -1013,7 +1013,7 @@ fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
         return;
     };
     if (metadata.kind != .file or metadata.mode & 0o111 != 0) {
-        try self.flashError("not a directory: {s}", .{name});
+        try self.flashError("cannot open executables", .{});
         return;
     }
     if (self.open_recorder) |recorder| {
@@ -1341,6 +1341,14 @@ fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
     );
 }
 
+/// Drops any active flash immediately in response to user input.
+fn dismissError(self: *Model, ctx: *vxfw.EventContext) void {
+    const message = self.error_message orelse return;
+    self.alloc.free(message);
+    self.error_message = null;
+    ctx.redraw = true;
+}
+
 /// Drops an expired flash, requesting a redraw when it did.
 fn clearExpiredError(self: *Model) bool {
     const message = self.error_message orelse return false;
@@ -1427,6 +1435,14 @@ fn isUpKey(key: Key) bool {
 }
 
 fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
+    switch (event) {
+        .key_press => {},
+        .mouse => {},
+        else => return,
+    }
+    // Deliberate input always dismisses an active header flash.
+    self.dismissError(ctx);
+
     const key = switch (event) {
         .key_press => |key| key,
         else => return,
@@ -2479,13 +2495,10 @@ test "executable files are excluded from the system opener" {
         model.getPane(.here).list_view.cursor = @intCast(index);
         ctx.cmds.clearRetainingCapacity();
         try model.handleEvent(&ctx, .{ .key_press = enter });
-        const status = try std.fmt.allocPrint(
-            testing.allocator,
-            "not a directory: {s}",
-            .{name},
+        try testing.expectEqualStrings(
+            "cannot open executables",
+            model.error_message.?,
         );
-        defer testing.allocator.free(status);
-        try testing.expectEqualStrings(status, model.error_message.?);
         try testing.expectEqual(@as(usize, 0), opened.items.len);
     }
 
@@ -2502,7 +2515,7 @@ test "executable files are excluded from the system opener" {
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("not a directory: quiet.bin", model.error_message.?);
+    try testing.expectEqualStrings("cannot open executables", model.error_message.?);
     try testing.expectEqual(@as(usize, 0), opened.items.len);
 
     // A non-executable file in the same session still opens.
@@ -2511,6 +2524,18 @@ test "executable files are excluded from the system opener" {
     try rows[plain_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqual(@as(usize, 1), opened.items.len);
     try testing.expectEqualStrings("opened f.txt", model.message);
+
+    // Any deliberate input dismisses an active flash immediately.
+    const tab: Key = .{ .codepoint = Key.tab };
+    ctx.redraw = false;
+    try model.captureEvent(&ctx, .{ .key_press = tab });
+    try testing.expect(model.error_message == null);
+    try testing.expect(ctx.redraw);
+
+    // A second dismissal with no flash pending is a harmless no-op.
+    ctx.redraw = false;
+    try model.captureEvent(&ctx, .{ .key_press = tab });
+    try testing.expect(!ctx.redraw);
 }
 
 test "flashed errors render red beside the path and expire" {
@@ -2554,7 +2579,7 @@ test "flashed errors render red beside the path and expire" {
     try model.openCenter();
 
     try testing.expectEqualStrings(
-        "not a directory: run.sh",
+        "cannot open executables",
         model.error_message.?,
     );
 
@@ -2581,7 +2606,7 @@ test "flashed errors render red beside the path and expire" {
         }
     }
     try testing.expect(saw_red);
-    try testing.expectEqual(@as(usize, "not a directory: run.sh".len), red_cells);
+    try testing.expectEqual(@as(usize, "cannot open executables".len), red_cells);
 
     var ctx: vxfw.EventContext = .{
         .io = testing.io,
