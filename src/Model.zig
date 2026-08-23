@@ -13,6 +13,7 @@ const zeit = @import("zeit");
 const Watcher = @import("Watcher.zig");
 const command = @import("command.zig");
 const file_system = @import("file_system.zig");
+const format = @import("Model/format.zig");
 
 const Model = @This();
 
@@ -162,54 +163,6 @@ const CursorStatus = struct {
     group_name: []const u8,
 };
 
-fn modeBits(kind: Io.File.Kind, mode: u32) [10]u8 {
-    return .{
-        kindCharacter(kind),
-        permissionCharacter(mode, 0o400, 'r'),
-        permissionCharacter(mode, 0o200, 'w'),
-        executeCharacter(mode, 0o100, 0o4000, 's', 'S'),
-        permissionCharacter(mode, 0o040, 'r'),
-        permissionCharacter(mode, 0o020, 'w'),
-        executeCharacter(mode, 0o010, 0o2000, 's', 'S'),
-        permissionCharacter(mode, 0o004, 'r'),
-        permissionCharacter(mode, 0o002, 'w'),
-        executeCharacter(mode, 0o001, 0o1000, 't', 'T'),
-    };
-}
-
-fn kindCharacter(kind: Io.File.Kind) u8 {
-    return switch (kind) {
-        .file => '-',
-        .directory => 'd',
-        .sym_link => 'l',
-        .block_device => 'b',
-        .character_device => 'c',
-        .named_pipe => 'p',
-        .unix_domain_socket => 's',
-        .whiteout => 'w',
-        .door => 'D',
-        .event_port => 'P',
-        .unknown => '?',
-    };
-}
-
-fn permissionCharacter(mode: u32, mask: u32, allowed: u8) u8 {
-    return if (mode & mask != 0) allowed else '-';
-}
-
-fn executeCharacter(
-    mode: u32,
-    execute_mask: u32,
-    special_mask: u32,
-    special_execute: u8,
-    special_no_execute: u8,
-) u8 {
-    if (mode & special_mask != 0) {
-        return if (mode & execute_mask != 0) special_execute else special_no_execute;
-    }
-    return permissionCharacter(mode, execute_mask, 'x');
-}
-
 const IdentityCache = struct {
     users: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     groups: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
@@ -345,7 +298,7 @@ const Preview = struct {
         kind: Io.File.Kind,
         mode: u32,
     ) Allocator.Error![]const u8 {
-        const bits = modeBits(kind, mode);
+        const bits = format.modeBits(kind, mode);
         return std.fmt.allocPrint(alloc, "Mode: {s}", .{bits[0..]});
     }
 
@@ -980,7 +933,7 @@ fn loadCursorStatus(
     const group_name = self.identities.groupName(self.alloc, metadata.gid) catch return null;
     return .{
         .metadata = metadata,
-        .mode_bits = modeBits(metadata.kind, metadata.mode),
+        .mode_bits = format.modeBits(metadata.kind, metadata.mode),
         .entry_name = entry_name,
         .user_name = user_name,
         .group_name = group_name,
@@ -1808,8 +1761,8 @@ fn executeDelete(self: *Model) !void {
     }
 }
 
-fn setMessage(self: *Model, comptime format: []const u8, args: anytype) Allocator.Error!void {
-    const replacement = try std.fmt.allocPrint(self.alloc, format, args);
+fn setMessage(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    const replacement = try std.fmt.allocPrint(self.alloc, fmt, args);
     self.alloc.free(self.message);
     self.message = replacement;
 }
@@ -2033,52 +1986,6 @@ fn drawHeader(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
     ));
 }
 
-fn formatHumanSize(alloc: Allocator, size: u64) Allocator.Error![]const u8 {
-    if (size < 1024) return std.fmt.allocPrint(alloc, "{d}", .{size});
-
-    const suffixes = "KMGTPE";
-    var suffix_index: usize = 0;
-    var divisor: u64 = 1024;
-    while (suffix_index + 1 < suffixes.len and size >= divisor * 1024) {
-        divisor *= 1024;
-        suffix_index += 1;
-    }
-
-    const tenths: u128 = (@as(u128, size) * 10 + divisor / 2) / divisor;
-    if (tenths < 100) {
-        return std.fmt.allocPrint(alloc, "{d}.{d}{c}", .{
-            tenths / 10,
-            tenths % 10,
-            suffixes[suffix_index],
-        });
-    }
-    return std.fmt.allocPrint(alloc, "{d}{c}", .{
-        (tenths + 5) / 10,
-        suffixes[suffix_index],
-    });
-}
-
-fn formatStatusTime(
-    alloc: Allocator,
-    timestamp: Io.Timestamp,
-    time_zone: *const zeit.TimeZone,
-) Allocator.Error![]const u8 {
-    const seconds = @divFloor(timestamp.nanoseconds, std.time.ns_per_s);
-    if (std.math.cast(zeit.Seconds, seconds) == null or
-        std.math.cast(zeit.Days, @divFloor(seconds, std.time.s_per_day)) == null)
-    {
-        return std.fmt.allocPrint(alloc, "{d}", .{seconds});
-    }
-
-    const local = zeit.instant(.{ .unix_nano = timestamp.nanoseconds }, time_zone).time();
-    return std.fmt.allocPrint(alloc, "{s} {d: >2} {d:0>2}:{d:0>2}", .{
-        local.month.shortName(),
-        local.day,
-        local.hour,
-        local.minute,
-    });
-}
-
 fn drawCounts(
     ctx: vxfw.DrawContext,
     child_ctx: vxfw.DrawContext,
@@ -2163,8 +2070,8 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         "{d}",
         .{cursor_status.metadata.nlink},
     );
-    const size = try formatHumanSize(ctx.arena, cursor_status.metadata.size);
-    const modified = try formatStatusTime(
+    const size = try format.humanSize(ctx.arena, cursor_status.metadata.size);
+    const modified = try format.statusTime(
         ctx.arena,
         cursor_status.metadata.mtime,
         &self.local_time_zone,
@@ -3417,46 +3324,4 @@ test "directory symlinks are navigable and file symlinks omit metadata" {
         clipped_surface.buffer[0].style.fg,
     );
     try testing.expectEqualStrings("…", clipped_surface.buffer[19].char.grapheme);
-}
-
-test "mode formatter includes special execute bits" {
-    const testing = std.testing;
-    const mode = try Preview.formatMode(testing.allocator, .file, 0o7644);
-    defer testing.allocator.free(mode);
-
-    try testing.expectEqualStrings("Mode: -rwSr-Sr-T", mode);
-}
-
-test "status size formatter uses ls-like units" {
-    const testing = std.testing;
-    const bytes = try formatHumanSize(testing.allocator, 999);
-    defer testing.allocator.free(bytes);
-    const kibibytes = try formatHumanSize(testing.allocator, 4096);
-    defer testing.allocator.free(kibibytes);
-
-    try testing.expectEqualStrings("999", bytes);
-    try testing.expectEqualStrings("4.0K", kibibytes);
-}
-
-test "status timestamp omits signs from positive fields" {
-    const testing = std.testing;
-    const rendered = try formatStatusTime(testing.allocator, .{
-        .nanoseconds = 1_700_000_000 * std.time.ns_per_s,
-    }, &zeit.utc);
-    defer testing.allocator.free(rendered);
-
-    try testing.expect(std.mem.indexOfScalar(u8, rendered, '+') == null);
-}
-
-test "status timestamp uses the supplied time zone" {
-    const testing = std.testing;
-    const fixed: zeit.TimeZone = .{ .fixed = .{
-        .name = "UTC-8",
-        .offset = -8 * std.time.s_per_hour,
-        .is_dst = false,
-    } };
-    const rendered = try formatStatusTime(testing.allocator, .zero, &fixed);
-    defer testing.allocator.free(rendered);
-
-    try testing.expectEqualStrings("Dec 31 16:00", rendered);
 }
