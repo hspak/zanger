@@ -15,6 +15,7 @@ const command = @import("command.zig");
 const file_system = @import("file_system.zig");
 const format = @import("Model/format.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
+pub const IdentityCache = @import("Model/IdentityCache.zig");
 
 const Model = @This();
 
@@ -87,71 +88,6 @@ const CursorStatus = struct {
     // Borrowed from `identities`; cached identity strings have stable storage.
     user_name: []const u8,
     group_name: []const u8,
-};
-
-const IdentityCache = struct {
-    users: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
-    groups: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
-
-    fn deinit(self: *IdentityCache, alloc: Allocator) void {
-        var users = self.users.valueIterator();
-        while (users.next()) |name| alloc.free(name.*);
-        self.users.deinit(alloc);
-        var groups = self.groups.valueIterator();
-        while (groups.next()) |name| alloc.free(name.*);
-        self.groups.deinit(alloc);
-        self.* = undefined;
-    }
-
-    fn userName(self: *IdentityCache, alloc: Allocator, uid: u32) Allocator.Error![]const u8 {
-        if (self.users.get(uid)) |name| return name;
-        const name = try lookupUserName(alloc, uid);
-        errdefer alloc.free(name);
-        try self.users.putNoClobber(alloc, uid, name);
-        return name;
-    }
-
-    fn groupName(self: *IdentityCache, alloc: Allocator, gid: u32) Allocator.Error![]const u8 {
-        if (self.groups.get(gid)) |name| return name;
-        const name = try lookupGroupName(alloc, gid);
-        errdefer alloc.free(name);
-        try self.groups.putNoClobber(alloc, gid, name);
-        return name;
-    }
-
-    fn lookupUserName(alloc: Allocator, uid: u32) Allocator.Error![]const u8 {
-        var record: std.c.passwd = undefined;
-        var result: ?*std.c.passwd = null;
-        var buffer: [16 * 1024]u8 = undefined;
-        const rc = std.c.getpwuid_r(
-            @intCast(uid),
-            &record,
-            &buffer,
-            buffer.len,
-            &result,
-        );
-        if (rc == 0 and result != null) {
-            if (result.?.name) |name| return alloc.dupe(u8, std.mem.span(name));
-        }
-        return std.fmt.allocPrint(alloc, "{d}", .{uid});
-    }
-
-    fn lookupGroupName(alloc: Allocator, gid: u32) Allocator.Error![]const u8 {
-        var record: std.c.group = undefined;
-        var result: ?*std.c.group = null;
-        var buffer: [16 * 1024]u8 = undefined;
-        const rc = std.c.getgrgid_r(
-            @intCast(gid),
-            &record,
-            &buffer,
-            buffer.len,
-            &result,
-        );
-        if (rc == 0 and result != null) {
-            if (result.?.name) |name| return alloc.dupe(u8, std.mem.span(name));
-        }
-        return std.fmt.allocPrint(alloc, "{d}", .{gid});
-    }
 };
 
 // Preview text is independent of a directory listing but uses the same row
