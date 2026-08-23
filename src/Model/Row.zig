@@ -82,9 +82,9 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         }
         if (self.pane.preview) |*preview| {
             if (self.index >= preview.lines.len) return self.emptySurface(ctx);
-            style.dim = preview.placeholder;
-            style.italic = preview.placeholder;
-            if (!preview.placeholder) {
+            style.dim = preview.kind == .placeholder;
+            style.italic = preview.kind == .placeholder;
+            if (preview.kind == .metadata) {
                 return self.drawMetadataRow(ctx, preview.lines[self.index], style);
             }
             break :row_text preview.lines[self.index];

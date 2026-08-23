@@ -1,6 +1,7 @@
-//! Right-pane content for non-directory entries: detailed file metadata or an
-//! italic placeholder message. Rows reuse the directory row widgets so
-//! previews scroll and clip consistently with listings.
+//! Right-pane content for non-directory entries: detailed file metadata, a
+//! plain text file's contents, or an italic placeholder message. Rows reuse
+//! the directory row widgets so previews scroll and clip consistently with
+//! listings.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -12,9 +13,20 @@ const format = @import("format.zig");
 
 const Preview = @This();
 
+/// How a preview's lines should render. Metadata sheets bold the key up to
+/// the first colon; text and placeholder lines render verbatim.
+pub const Kind = enum {
+    /// A single dimmed italic status message.
+    placeholder,
+    /// File metadata sheet lines shaped like `Key: value`.
+    metadata,
+    /// Verbatim file content lines.
+    text,
+};
+
 alloc: Allocator,
 lines: []const []const u8 = &.{},
-placeholder: bool = false,
+kind: Kind = .metadata,
 
 pub fn deinit(self: *Preview) void {
     for (self.lines) |line| self.alloc.free(line);
@@ -30,7 +42,7 @@ pub fn initMessage(alloc: Allocator, message: []const u8) Allocator.Error!Previe
     return .{
         .alloc = alloc,
         .lines = lines,
-        .placeholder = true,
+        .kind = .placeholder,
     };
 }
 

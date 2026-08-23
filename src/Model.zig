@@ -2760,7 +2760,7 @@ test "children preview shows empty directories and file metadata" {
     try testing.expectEqualStrings("     empty", center.rows[center.cursor]);
     var child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.placeholder);
+    try testing.expect(child_pane.preview.?.kind == .placeholder);
     try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
     const empty_message_pointer = child_pane.preview.?.lines[0].ptr;
     var event_ctx: vxfw.EventContext = .{
@@ -2789,7 +2789,7 @@ test "children preview shows empty directories and file metadata" {
     try testing.expect(model.centerListing().entries[model.centerListing().cursor].is_empty.?);
 
     child_pane = model.getPane(.children);
-    try testing.expect(child_pane.preview.?.placeholder);
+    try testing.expect(child_pane.preview.?.kind == .placeholder);
     try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
     try testing.expectEqualStrings(
         "     empty",
@@ -2804,7 +2804,7 @@ test "children preview shows empty directories and file metadata" {
 
     child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
-    try testing.expect(!child_pane.preview.?.placeholder);
+    try testing.expect(child_pane.preview.?.kind != .placeholder);
     try testing.expectEqual(@as(usize, 8), child_pane.preview.?.lines.len);
     try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[0]);
     try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[1]);
