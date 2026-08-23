@@ -2768,10 +2768,15 @@ test "clicking the dotdot row ascends and it hides at the root" {
     });
     // Top band renders "..", styled like a directory.
     const up_band = pane_surface.children[0].surface;
-    try testing.expectEqualStrings(".", up_band.buffer[0].char.grapheme);
-    try testing.expectEqualStrings(".", up_band.buffer[1].char.grapheme);
-    try testing.expect(up_band.buffer[0].style.bold);
-    try testing.expect(up_band.buffer[1].style.bold);
+    // Marker layout matches an unselected directory row: "  ▸  ..".
+    try testing.expectEqualStrings(" ", up_band.buffer[0].char.grapheme);
+    try testing.expectEqualStrings(" ", up_band.buffer[1].char.grapheme);
+    try testing.expectEqualStrings("▸", up_band.buffer[2].char.grapheme);
+    try testing.expectEqualStrings(".", up_band.buffer[5].char.grapheme);
+    try testing.expectEqualStrings(".", up_band.buffer[6].char.grapheme);
+    for (up_band.buffer[2..7]) |cell| {
+        try testing.expect(cell.style.bold);
+    }
 
     // Clicking it ascends one level.
     const press: vaxis.Mouse = .{

@@ -54,7 +54,8 @@ pub const UpRow = struct {
             .fg = .{ .index = 12 },
             .bold = true,
         };
-        return Row.drawClippedSurface(ctx, self.widget(), "..", style);
+        // Same marker layout as an unselected directory row.
+        return Row.drawClippedSurface(ctx, self.widget(), "  ▸  ..", style);
     }
 };
 
