@@ -267,14 +267,17 @@ fn centerListing(self: *Model) *file_system.Listing {
     return &self.getPane(.here).listing.?;
 }
 
+/// Loads the bottom-bar metadata for one entry. Stat failures return null so
+/// the bar degrades to counts; allocation failure propagates because callers
+/// roll back transactionally on OOM.
 fn loadCursorStatus(
     self: *Model,
     path: []const u8,
     entry_name: []const u8,
-) ?CursorStatus {
+) Allocator.Error!?CursorStatus {
     const metadata = FileMetadata.init(path) catch return null;
-    const user_name = self.identities.userName(self.alloc, metadata.uid) catch return null;
-    const group_name = self.identities.groupName(self.alloc, metadata.gid) catch return null;
+    const user_name = try self.identities.userName(self.alloc, metadata.uid);
+    const group_name = try self.identities.groupName(self.alloc, metadata.gid);
     return .{
         .metadata = metadata,
         .mode_bits = format.modeBits(metadata.kind, metadata.mode),
@@ -483,7 +486,7 @@ fn prepareView(
         const entry = center.entries[center.cursor];
         const cursor_path = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(cursor_path);
-        pending_view.cursor_status = self.loadCursorStatus(cursor_path, entry.name);
+        pending_view.cursor_status = try self.loadCursorStatus(cursor_path, entry.name);
     }
 
     const children_transfer = transferTo(transfers, .children);
@@ -819,7 +822,7 @@ fn syncRight(self: *Model) !void {
         const entry = center.entries[center.cursor];
         const desired = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(desired);
-        self.cursor_status = self.loadCursorStatus(desired, entry.name);
+        self.cursor_status = try self.loadCursorStatus(desired, entry.name);
         if (entry.is_dir) {
             if (right.listing) |listing| {
                 if (std.mem.eql(u8, listing.path, desired)) {
