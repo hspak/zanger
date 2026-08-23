@@ -701,15 +701,15 @@ fn replaceAnchoredView(
     const next_center = &pending_view.listings[PaneRole.here.toIndex()].?;
     if (options.restore_here_from) |previous| {
         std.debug.assert(pending_view.listing_sources[PaneRole.here.toIndex()] == null);
-        var restored_selection = false;
+        // Rewrite only rows whose selection bit changed; work is proportional
+        // to restored selections, not to the size of the new listing.
         for (previous.entries, 0..) |entry, index| {
             if (!previous.selected.isSet(index)) continue;
             const next_index = file_system.indexOfName(next_center, entry.name) orelse continue;
             next_center.selected.set(next_index);
             next_center.selected_count += 1;
-            restored_selection = true;
+            next_center.refreshRow(next_index);
         }
-        if (restored_selection) next_center.rebuildRows();
     }
 
     var rows: [3][]Row = undefined;

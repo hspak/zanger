@@ -103,9 +103,13 @@ pub const Listing = struct {
     /// Clears every selected entry and updates their display rows.
     pub fn clearSelection(self: *Listing) void {
         if (self.selected_count == 0) return;
-        self.selected.setRangeValue(.{ .start = 0, .end = self.entries.len }, false);
+        var index: usize = 0;
+        while (index < self.entries.len) : (index += 1) {
+            if (!self.selected.isSet(index)) continue;
+            self.selected.unset(index);
+            self.refreshRow(index);
+        }
         self.selected_count = 0;
-        self.rebuildRows();
     }
 
     /// Updates one directory's known emptiness and its display row.
@@ -123,7 +127,8 @@ pub const Listing = struct {
         self.refreshRow(index);
     }
 
-    /// Rebuilds display text within the existing row allocation.
+    /// Rewrites every display row. Prefer `refreshRow` when only known
+    /// entries changed.
     pub fn rebuildRows(self: *Listing) void {
         for (self.entries, 0..) |_, index| self.refreshRow(index);
     }
@@ -157,7 +162,10 @@ pub const Listing = struct {
         self.row_storage = storage;
     }
 
-    fn refreshRow(self: *Listing, index: usize) void {
+    /// Rewrites one row's display text in place after its selection or known
+    /// emptiness changed. The row allocation is unchanged, so the update is
+    /// visible to already-rendered frame borrows only via the next draw.
+    pub fn refreshRow(self: *Listing, index: usize) void {
         const entry = self.entries[index];
         const capacity = rowCapacity(entry);
         const buffer = @constCast(self.rows[index].ptr)[0..capacity];
