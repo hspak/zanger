@@ -542,6 +542,15 @@ and deliver completed ownership through a UI event. That would require explicit
 thread allocator, cancellation, watcher-snapshot, and shutdown rules and is not
 needed for the current continuous-scrolling target.
 
+Delivery is currently blocked by the dependency, not by this codebase: vaxis
+0.6.0 creates its event loop inside `App.run` as stack-local state and exposes
+no cross-thread event posting (`App.Options` carries only `framerate`). The
+underlying `Loop.postEvent` is queue-based and thread-safe, but the loop handle
+is unreachable. Wiring a worker thread to wake the UI requires an upstream
+change that publishes the loop or an equivalent posting API; until then,
+delivery through polling or shared mutable state would be racy and is
+deliberately not attempted.
+
 ## Verification
 
 `zig build test` runs parser, filesystem, watcher, model, headless rendering,
