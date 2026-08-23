@@ -311,6 +311,14 @@ candidate directory watch, pane preparation runs, and only a successful view
 commit makes that watch current and retires the previous descriptor. Rollback
 cancels the candidate.
 
+When rebuilding the anchored view fails because HERE disappeared or became
+unwatchable, the pending refresh is dropped and the model re-anchors at the
+nearest surviving ancestor, reporting what vanished. Later filesystem events
+schedule fresh refreshes, so failures never repeat on a timer. Replaced row
+widget arrays are retired until the next draw instead of freed at commit,
+because vxfw hit tests against the previous frame's surface tree and input
+events can share one queue batch with a commit.
+
 ## libvaxis and vxfw integration
 
 libvaxis has two layers:
