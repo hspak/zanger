@@ -913,15 +913,56 @@ fn reconcileWatcher(self: *Model) !bool {
     else
         null;
     const rearm_watcher = self.watch_refresh == .rearm;
-    try self.replaceAnchoredView(center.path, .{
+    self.replaceAnchoredView(center.path, .{
         .preferred_name = preferred,
         .transfers = &.{.{ .source = .parent, .target = .parent }},
         .restore_here_from = center,
         .preserve_message = true,
         .rearm_watcher = rearm_watcher,
-    });
+    }) catch |err| {
+        // Clear the pending refresh either way: later filesystem events
+        // schedule a fresh one, so retrying on a timer would only repeat the
+        // failure every tick.
+        self.watch_refresh = .none;
+        if (err == error.OutOfMemory) return err;
+        try self.recoverMissingCenter(err);
+        return true;
+    };
     self.watch_refresh = .none;
     return true;
+}
+
+/// Re-anchors HERE at the nearest surviving ancestor after the anchored view
+/// could not be rebuilt, typically because the directory was deleted or
+/// unmounted externally. Every path is duped first: re-anchoring releases the
+/// live listing that `center.path` borrows. Reports the original failure when
+/// even `/` cannot host the view.
+fn recoverMissingCenter(self: *Model, failure: anyerror) !void {
+    const center_path = try self.alloc.dupe(u8, self.centerListing().path);
+    defer self.alloc.free(center_path);
+    const deleted_name = try self.alloc.dupe(u8, std.fs.path.basename(center_path));
+    defer self.alloc.free(deleted_name);
+
+    var candidate: []const u8 = try file_system.parentPath(self.alloc, center_path);
+    defer self.alloc.free(candidate);
+    while (true) {
+        const usable = blk: {
+            const dir = Io.Dir.openDirAbsolute(self.io, candidate, .{}) catch
+                break :blk false;
+            Io.Dir.close(dir, self.io);
+            break :blk true;
+        };
+        if (usable or std.mem.eql(u8, candidate, "/")) break;
+        const next = try file_system.parentPath(self.alloc, candidate);
+        self.alloc.free(candidate);
+        candidate = next;
+    }
+
+    self.replaceAnchoredView(candidate, .{}) catch |err| {
+        try self.reportError("watcher", @errorName(failure));
+        return err;
+    };
+    try self.setMessage("{s} is gone ({s})", .{ deleted_name, @errorName(failure) });
 }
 
 fn openCenter(self: *Model) !void {
@@ -2332,6 +2373,56 @@ test "side panes ignore clicks and browse focus returns to cwd" {
         .cell_size = .{ .width = 8, .height = 16 },
     });
     try testing.expect(!child_surface.buffer[0].style.reverse);
+}
+
+test "watcher re-anchors at the parent when HERE disappears" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "gone", .default_dir);
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const root_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(root_path);
+    const gone_path = try std.fs.path.join(testing.allocator, &.{ root_path, "gone" });
+    defer testing.allocator.free(gone_path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = gone_path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    try Io.Dir.deleteDir(temp.dir, testing.io, "gone");
+    try model.handleEvent(&ctx, .tick);
+
+    try testing.expectEqualStrings(root_path, model.centerListing().path);
+    try testing.expectEqualStrings("gone is gone (FileNotFound)", model.message);
+    try testing.expect(model.watcher.hasCurrent());
+    try testing.expect(ctx.redraw);
+
+    // The failure must not repeat on later ticks.
+    ctx.redraw = false;
+    ctx.cmds.clearRetainingCapacity();
+    try model.handleEvent(&ctx, .tick);
+    try testing.expect(!ctx.redraw);
+    try testing.expectEqualStrings("gone is gone (FileNotFound)", model.message);
 }
 
 test "watcher refresh preserves cursor selection and parent listing" {
