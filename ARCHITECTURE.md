@@ -237,7 +237,9 @@ failure still aborts initialization.
 - Ctrl-H toggles hidden entries and performs a full anchored rebuild.
 
 Empty directories remain previews and cannot become HERE. A no-op click or jump
-does not rebuild CHILDREN. Side listings can retain selections for later reuse,
+does not rebuild CHILDREN. A second left press on the same HERE row within
+400 ms descends when that row is a directory; every view transaction clears
+the pending-click state so presses cannot pair across listings. Side listings can retain selections for later reuse,
 but selection and deletion operations always target HERE.
 
 Stable `Row` widgets provide click identity because vxfw `ListView` has no

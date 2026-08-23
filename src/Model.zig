@@ -44,6 +44,8 @@ watch_refresh: WatchRefresh = .none,
 preview_dirty: bool = false,
 preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
+// Left-press bookkeeping for double-click descent on HERE rows.
+last_click: ?LastClick = null,
 // Terminals may encode one physical wheel notch as a burst of reports.
 wheel_tick_pending: bool = false,
 wheel_direction: ?WheelDirection = null,
@@ -64,10 +66,16 @@ hostname: []const u8 = "localhost",
 const Mode = enum { browse, command, confirm };
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
+const double_click_interval_ms = 400;
 const preview_debounce_ms = 25;
 const wheel_coalesce_ms = 12;
 
 const WheelDirection = Pane.WheelDirection;
+
+const LastClick = struct {
+    index: usize,
+    at_ns: i128,
+};
 
 pub const PaneRole = enum(u2) {
     parent = 0,
@@ -785,6 +793,9 @@ fn replaceAnchoredView(
     self.message = next_message;
     self.cursor_status = pending_view.cursor_status;
     self.preview_dirty = false;
+    // A press from before this transaction must not pair with a press after
+    // it: row indices belong to different listings.
+    self.last_click = null;
 }
 
 fn installPane(self: *Model, role: PaneRole, options: InstallOptions) !void {
@@ -1043,6 +1054,36 @@ fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     if (down) pane.list_view.nextItem(ctx) else pane.list_view.prevItem(ctx);
     if (pane.listing) |*listing| listing.cursor = pane.list_view.cursor;
     if (pane.list_view.cursor != before) try self.deferRightSync(ctx);
+}
+
+/// Handles a left press on a HERE row. A single press moves the cursor; a
+/// second press on the same row within `double_click_interval_ms` descends
+/// when that row is a directory.
+pub fn handleRowClick(
+    self: *Model,
+    ctx: *vxfw.EventContext,
+    index: usize,
+) Allocator.Error!void {
+    const pane = self.getPane(.here);
+    const previous_cursor = pane.list_view.cursor;
+    pane.list_view.cursor = @intCast(index);
+    if (pane.listing) |*listing| listing.cursor = index;
+    if (previous_cursor != index) try self.deferRightSync(ctx);
+
+    const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
+    const is_double = if (self.last_click) |click|
+        click.index == index and
+            now_ns - click.at_ns <= double_click_interval_ms * std.time.ns_per_ms
+    else
+        false;
+    self.last_click = .{ .index = index, .at_ns = now_ns };
+    if (!is_double) return;
+
+    self.last_click = null;
+    const listing = self.centerListing();
+    if (listing.entries.len == 0) return;
+    if (!listing.entries[listing.cursor].is_dir) return;
+    self.openCenter() catch |err| try self.reportError("open", @errorName(err));
 }
 
 pub fn handleWheel(
@@ -2195,6 +2236,163 @@ test "delete keeps the cursor row and clamps it at the end" {
     try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
     try testing.expectEqualStrings("a.txt", listing.entries[listing.cursor].name);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
+}
+
+test "double click on a directory descends into it" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "child", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "child/x.txt", .data = "x" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "top.txt", .data = "t" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    const press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+
+    const index = file_system.indexOfName(model.centerListing(), "child").?;
+    const row_widget = model.getPane(.here).rows[index].widget();
+
+    // First press only moves the cursor.
+    try row_widget.handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqual(index, model.centerListing().cursor);
+
+    // Second press inside the window descends.
+    try row_widget.handleEvent(&ctx, .{ .mouse = press });
+    const child_path = try std.fs.path.join(testing.allocator, &.{ path, "child" });
+    defer testing.allocator.free(child_path);
+    try testing.expectEqualStrings(child_path, model.centerListing().path);
+    // The transaction cleared pending click state.
+    try testing.expect(model.last_click == null);
+}
+
+test "double click requires the same row within the interval" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "a-dir", .default_dir);
+    try Io.Dir.createDir(temp.dir, testing.io, "b-dir", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    const press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    const rows = model.getPane(.here).rows;
+
+    // A second press past the interval is just another single click.
+    const a_index = file_system.indexOfName(model.centerListing(), "a-dir").?;
+    try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    model.last_click.?.at_ns -=
+        (double_click_interval_ms + 1) * std.time.ns_per_ms;
+    try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    model.last_click = null;
+
+    // Presses on different rows never pair up.
+    const b_index = file_system.indexOfName(model.centerListing(), "b-dir").?;
+    try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[b_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqual(b_index, model.centerListing().cursor);
+
+    // Double-clicking a regular file never attempts an open, so no
+    // "not a directory" status appears.
+    const f_index = file_system.indexOfName(model.centerListing(), "f.txt").?;
+    try model.getPane(.here).rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try model.getPane(.here).rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqualStrings("", model.message);
+}
+
+test "a view transaction invalidates pending double clicks" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "child", .default_dir);
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    model.last_click = .{
+        .index = 0,
+        .at_ns = Io.Clock.awake.now(testing.io).nanoseconds,
+    };
+    try model.ascend();
+    try testing.expect(model.last_click == null);
 }
 
 test "mouse wheel moves cwd one item and is ignored by side panes" {

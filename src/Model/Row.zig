@@ -43,13 +43,8 @@ fn typeErasedEventHandler(
             }
 
             if (self.index >= self.pane.itemCount()) return;
-            const previous_cursor = self.pane.list_view.cursor;
-            self.pane.list_view.cursor = @intCast(self.index);
-            if (self.pane.listing) |*listing| listing.cursor = self.index;
-            if (previous_cursor != self.index) {
-                try self.pane.model.deferRightSync(ctx);
-            }
-            ctx.consumeAndRedraw();
+            defer ctx.consumeAndRedraw();
+            return self.pane.model.handleRowClick(ctx, self.index);
         },
         else => {},
     }
