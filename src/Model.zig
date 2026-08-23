@@ -2824,19 +2824,20 @@ test "children preview shows empty directories and file metadata" {
     child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
     try testing.expect(child_pane.preview.?.kind != .placeholder);
-    try testing.expectEqual(@as(usize, 2), child_pane.preview.?.header_lines);
-    try testing.expectEqual(@as(usize, 10), child_pane.preview.?.lines.len);
+    try testing.expectEqual(@as(usize, 3), child_pane.preview.?.header_lines);
+    try testing.expectEqual(@as(usize, 11), child_pane.preview.?.lines.len);
     try testing.expectEqualStrings(
         "non-text files are not rendered",
         child_pane.preview.?.lines[0],
     );
     try testing.expectEqualStrings("", child_pane.preview.?.lines[1]);
-    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[2]);
-    try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[3]);
-    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[4]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[5], "Owner: "));
-    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[6]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[7], "Modified: "));
+    try testing.expectEqualStrings("", child_pane.preview.?.lines[2]);
+    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[3]);
+    try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[4]);
+    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[5]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[6], "Owner: "));
+    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[7]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[8], "Modified: "));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2884,16 +2885,18 @@ test "children preview shows empty directories and file metadata" {
     try testing.expect(header_surface.buffer[0].style.italic);
     try testing.expect(!header_surface.buffer[0].style.bold);
 
-    // The blank separator renders without metadata styling either.
-    const spacer_surface = try child_pane.rows[1].widget().draw(.{
-        .arena = arena.allocator(),
-        .min = .{ .width = 40, .height = 1 },
-        .max = .{ .width = 40, .height = 1 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    });
-    try testing.expect(!spacer_surface.buffer[0].style.bold);
+    // Both blank separators render without metadata styling.
+    for ([2]usize{ 1, 2 }) |spacer_index| {
+        const spacer_surface = try child_pane.rows[spacer_index].widget().draw(.{
+            .arena = arena.allocator(),
+            .min = .{ .width = 40, .height = 1 },
+            .max = .{ .width = 40, .height = 1 },
+            .cell_size = .{ .width = 8, .height = 16 },
+        });
+        try testing.expect(!spacer_surface.buffer[0].style.bold);
+    }
 
-    const metadata_surface = try child_pane.rows[2].widget().draw(.{
+    const metadata_surface = try child_pane.rows[3].widget().draw(.{
         .arena = arena.allocator(),
         .min = .{ .width = 40, .height = 1 },
         .max = .{ .width = 40, .height = 1 },

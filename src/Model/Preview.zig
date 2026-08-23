@@ -53,7 +53,7 @@ pub fn initMessage(alloc: Allocator, message: []const u8) Allocator.Error!Previe
     };
 }
 
-/// A dimmed non-text notice, one blank separator line, and an eight-line
+/// A dimmed non-text notice, two blank separator lines, and an eight-line
 /// metadata sheet for a regular file whose contents are not rendered.
 /// `loaded_metadata` may carry metadata already stat'ed for the same path;
 /// otherwise one `statx` runs.
@@ -89,7 +89,7 @@ fn initSheet(
         loaded_metadata orelse try FileMetadata.init(path);
 
     var made: usize = 0;
-    const lines = try alloc.alloc([]const u8, 10);
+    const lines = try alloc.alloc([]const u8, 11);
     errdefer {
         for (lines[0..made]) |line| alloc.free(line);
         alloc.free(lines);
@@ -99,34 +99,36 @@ fn initSheet(
     made += 1;
     lines[1] = try alloc.dupe(u8, "");
     made += 1;
-    lines[2] = try std.fmt.allocPrint(alloc, "Name: {s}", .{std.fs.path.basename(path)});
+    lines[2] = try alloc.dupe(u8, "");
     made += 1;
-    lines[3] = try std.fmt.allocPrint(alloc, "Type: {s}", .{@tagName(metadata.kind)});
+    lines[3] = try std.fmt.allocPrint(alloc, "Name: {s}", .{std.fs.path.basename(path)});
     made += 1;
-    lines[4] = try formatMode(alloc, metadata.kind, metadata.mode);
+    lines[4] = try std.fmt.allocPrint(alloc, "Type: {s}", .{@tagName(metadata.kind)});
     made += 1;
-    lines[5] = try formatOwner(alloc, identities, metadata.uid, metadata.gid);
+    lines[5] = try formatMode(alloc, metadata.kind, metadata.mode);
     made += 1;
-    lines[6] = try std.fmt.allocPrint(alloc, "Size: {Bi:.2} ({d} bytes)", .{
+    lines[6] = try formatOwner(alloc, identities, metadata.uid, metadata.gid);
+    made += 1;
+    lines[7] = try std.fmt.allocPrint(alloc, "Size: {Bi:.2} ({d} bytes)", .{
         metadata.size,
         metadata.size,
     });
     made += 1;
-    lines[7] = try formatModifiedTime(alloc, metadata.mtime);
+    lines[8] = try formatModifiedTime(alloc, metadata.mtime);
     made += 1;
-    lines[8] = try std.fmt.allocPrint(
+    lines[9] = try std.fmt.allocPrint(
         alloc,
         "Writable: {s}",
         .{if (metadata.mode & 0o222 == 0) "no" else "yes"},
     );
     made += 1;
-    lines[9] = try std.fmt.allocPrint(alloc, "Links: {d}", .{metadata.nlink});
+    lines[10] = try std.fmt.allocPrint(alloc, "Links: {d}", .{metadata.nlink});
 
     return .{
         .alloc = alloc,
         .lines = lines,
         .kind = .metadata,
-        .header_lines = 2,
+        .header_lines = 3,
     };
 }
 
@@ -443,12 +445,13 @@ test "file symlink sheets follow targets behind the notice" {
     defer preview.deinit();
 
     // The sheet describes the followed file, not the link.
-    try testing.expectEqual(@as(usize, 2), preview.header_lines);
+    try testing.expectEqual(@as(usize, 3), preview.header_lines);
     try testing.expectEqualStrings(
         "non-text files are not rendered",
         preview.lines[0],
     );
     try testing.expectEqualStrings("", preview.lines[1]);
-    try testing.expectEqualStrings("Name: link.dat", preview.lines[2]);
-    try testing.expectEqualStrings("Type: file", preview.lines[3]);
+    try testing.expectEqualStrings("", preview.lines[2]);
+    try testing.expectEqualStrings("Name: link.dat", preview.lines[3]);
+    try testing.expectEqualStrings("Type: file", preview.lines[4]);
 }
