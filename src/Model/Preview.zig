@@ -63,7 +63,30 @@ pub fn initFile(
     path: []const u8,
     loaded_metadata: ?FileMetadata,
 ) !Preview {
-    const metadata = loaded_metadata orelse try FileMetadata.init(path);
+    return initSheet(alloc, identities, path, loaded_metadata, false);
+}
+
+/// The same sheet, statting through symbolic links so it describes the
+/// linked file's target rather than the link itself.
+pub fn initFileFollow(
+    alloc: Allocator,
+    identities: *IdentityCache,
+    path: []const u8,
+) !Preview {
+    return initSheet(alloc, identities, path, null, true);
+}
+
+fn initSheet(
+    alloc: Allocator,
+    identities: *IdentityCache,
+    path: []const u8,
+    loaded_metadata: ?FileMetadata,
+    follow_symlinks: bool,
+) !Preview {
+    const metadata = if (follow_symlinks)
+        try FileMetadata.initFollow(path)
+    else
+        loaded_metadata orelse try FileMetadata.init(path);
 
     var made: usize = 0;
     const lines = try alloc.alloc([]const u8, 10);
@@ -390,4 +413,42 @@ test "oversized files truncate with a marker line" {
     try testing.expectEqualStrings("abcde", preview.?.lines[1]);
     try testing.expectEqualStrings("… (truncated)", preview.?.lines[2]);
     try testing.expectEqual(@as(usize, 3), preview.?.lines.len);
+}
+
+test "file symlink sheets follow targets behind the notice" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "blob.dat",
+        .data = "bin\x00ary",
+    });
+    try Io.Dir.symLink(temp.dir, testing.io, "blob.dat", "link.dat", .{});
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+        "link.dat",
+    });
+    defer testing.allocator.free(path);
+
+    var identities: IdentityCache = .{};
+    defer identities.deinit(testing.allocator);
+
+    var preview = try initFileFollow(testing.allocator, &identities, path);
+    defer preview.deinit();
+
+    // The sheet describes the followed file, not the link.
+    try testing.expectEqual(@as(usize, 2), preview.header_lines);
+    try testing.expectEqualStrings(
+        "non-text files are not rendered",
+        preview.lines[0],
+    );
+    try testing.expectEqualStrings("", preview.lines[1]);
+    try testing.expectEqualStrings("Name: link.dat", preview.lines[2]);
+    try testing.expectEqualStrings("Type: file", preview.lines[3]);
 }

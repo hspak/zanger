@@ -61,9 +61,9 @@ PARENT                         CWD / HERE                      CHILDREN
 dirname(C)                 listing for path C          projection of C/entry
     │                              │                            │
     └─ highlight basename(C)       └─ owns cursor               ├─ directory listing
-                                                               ├─ empty placeholder
-                                                               ├─ file metadata
-                                                               └─ nothing for file symlink
+                                                               ├─ text contents
+                                                               ├─ notice + metadata
+                                                               └─ empty placeholder
 ```
 
 The model maintains these invariants after every committed operation:
@@ -72,9 +72,11 @@ The model maintains these invariants after every committed operation:
    accepts browse interaction.
 2. PARENT is absent at `/`. Otherwise, when readable, it represents
    `dirname(C)` and its `cwd_index` identifies `basename(C)`.
-3. CHILDREN is derived from HERE's cursor. A directory produces a listing or an
-   empty-directory placeholder, a regular file produces metadata, and a
-   non-directory symbolic link produces no metadata preview.
+3. CHILDREN is derived from HERE's cursor. A directory — including a
+   symbolic link to one — produces a listing or an empty-directory
+   placeholder, a text file produces its rendered contents, and any other
+   regular file or file symbolic link produces the non-text notice followed
+   by metadata for the resolved file.
 4. Every non-empty pane has a valid `ListView` cursor and a row-widget array
    parallel to its displayed content.
 5. Selection bitsets have one bit per listing entry. Selection follows a
@@ -204,6 +206,10 @@ placeholder message. Binary files keep the metadata sheet under a dimmed
 italic notice reading "non-text files are not rendered", styled like the
 empty-directory placeholder. The read is bounded and debounced like all
 children work, so oversized or slow files cannot affect cursor movement.
+
+Symbolic links render like their targets: content reads and the sheet's
+`statx` resolve through the link (the bottom status bar keeps describing the
+link itself). A dangling link therefore previews as an unavailable target.
 
 A binary file's metadata sheet performs one `statx` and formats type, Unix
 mode bits, owner/group, size, modification time, writability, and link count.

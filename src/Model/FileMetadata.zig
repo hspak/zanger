@@ -28,6 +28,17 @@ gid: u32,
 /// Stats `path` without following symlinks. The error set contains no
 /// allocation failure; every failure is an `statx` outcome.
 pub fn init(path: []const u8) InitError!FileMetadata {
+    return initPath(path, false);
+}
+
+/// Stats `path`, resolving symbolic links to their targets. Used when a
+/// preview describes what a linked file behaves as rather than the link
+/// itself.
+pub fn initFollow(path: []const u8) InitError!FileMetadata {
+    return initPath(path, true);
+}
+
+fn initPath(path: []const u8, comptime follow_symlinks: bool) InitError!FileMetadata {
     const linux = std.os.linux;
     const path_z = try std.posix.toPosixPath(path);
     const requested: linux.STATX = .{
@@ -39,12 +50,20 @@ pub fn init(path: []const u8) InitError!FileMetadata {
         .MTIME = true,
         .SIZE = true,
     };
+    // AT.SYMLINK_NOFOLLOW's packed-struct bit comes from a comptime int, so
+    // build the flag word as a runtime u32 instead.
+    // follow_symlinks is comptime so the flag word stays a compile-time
+    // value like the original expression.
+    const at_flags = if (follow_symlinks)
+        linux.AT.NO_AUTOMOUNT
+    else
+        linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW;
 
     var statx = std.mem.zeroes(linux.Statx);
     while (true) switch (linux.errno(linux.statx(
         linux.AT.FDCWD,
         &path_z,
-        linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
+        at_flags,
         requested,
         &statx,
     ))) {

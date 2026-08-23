@@ -609,31 +609,34 @@ fn buildChildrenOutcome(
     defer self.alloc.free(child_path);
 
     if (!entry.is_dir) {
-        // A non-directory symbolic link shows no metadata preview.
-        if (entry.is_sym) return .{};
+        // Symbolic links render like their targets: reads and stats resolve
+        // through the link, so a linked text file shows its contents and a
+        // linked binary file shows the notice plus its target's sheet.
         // Text files render their contents; anything binary or invalid
         // UTF-8 keeps the metadata sheet.
+        const size_hint: ?u64 = if (entry.is_sym)
+            null // A link's statx size is the target-path length, not content.
+        else if (metadata_hint) |hint| hint.size else null;
         const text_preview = Preview.initTextContent(
             self.alloc,
             self.io,
             child_path,
-            if (metadata_hint) |hint| hint.size else null,
+            size_hint,
             Preview.max_preview_bytes,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .error_name = @errorName(err) },
         };
         if (text_preview) |preview| return .{ .content = .{ .preview = preview } };
-        const preview = Preview.initFile(
-            self.alloc,
-            &self.identities,
-            child_path,
-            metadata_hint,
-        ) catch |err| switch (err) {
+        const preview = if (entry.is_sym)
+            Preview.initFileFollow(self.alloc, &self.identities, child_path)
+        else
+            Preview.initFile(self.alloc, &self.identities, child_path, metadata_hint);
+        const sheet = preview catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .error_name = @errorName(err) },
         };
-        return .{ .content = .{ .preview = preview } };
+        return .{ .content = .{ .preview = sheet } };
     }
 
     var listing = file_system.readDir(
@@ -876,27 +879,25 @@ fn syncRight(self: *Model) !void {
             }
         }
 
-        if (!entry.is_sym) {
-            const outcome = try self.buildChildrenOutcome(
-                center.path,
-                entry,
-                if (self.cursor_status) |status| status.metadata else null,
-            );
-            if (outcome.error_name) |error_name| {
-                try self.clearPane(.children);
-                try self.setMessage("preview unavailable: {s}", .{error_name});
-                self.preview_dirty = false;
-                return;
-            }
-            if (outcome.dir_is_empty) |is_empty| {
-                center.setDirectoryEmpty(center.cursor, is_empty);
-            }
-            if (outcome.content) |content| switch (content) {
-                .listing => |listing| replacement_listing = listing,
-                .preview => |preview| replacement_preview = preview,
-                .none => {},
-            };
+        const outcome = try self.buildChildrenOutcome(
+            center.path,
+            entry,
+            if (self.cursor_status) |status| status.metadata else null,
+        );
+        if (outcome.error_name) |error_name| {
+            try self.clearPane(.children);
+            try self.setMessage("preview unavailable: {s}", .{error_name});
+            self.preview_dirty = false;
+            return;
         }
+        if (outcome.dir_is_empty) |is_empty| {
+            center.setDirectoryEmpty(center.cursor, is_empty);
+        }
+        if (outcome.content) |content| switch (content) {
+            .listing => |listing| replacement_listing = listing,
+            .preview => |preview| replacement_preview = preview,
+            .none => {},
+        };
     }
 
     const cursor: u32 = if (replacement_listing) |listing|
@@ -2553,8 +2554,11 @@ test "init stages children for a directory of only file symlinks" {
     });
     defer model.deinit();
 
-    try testing.expect(model.getPane(.children).listing == null);
-    try testing.expect(model.getPane(.children).preview == null);
+    // A file symlink renders its target's contents like a normal file.
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .text);
+    try testing.expectEqualStrings("t", child_pane.preview.?.lines[0]);
 
     // The debounced sync must tolerate the same entry as well.
     var ctx: vxfw.EventContext = .{
@@ -2566,7 +2570,8 @@ test "init stages children for a directory of only file symlinks" {
     defer ctx.cmds.deinit(ctx.alloc);
     try model.syncRight();
     try testing.expect(model.getPane(.children).listing == null);
-    try testing.expect(model.getPane(.children).preview == null);
+    try testing.expect(model.getPane(.children).preview.?.kind == .text);
+    try testing.expectEqualStrings("t", model.getPane(.children).preview.?.lines[0]);
 }
 
 test "replaced rows stay readable until the next draw" {
@@ -2954,7 +2959,7 @@ test "text file preview renders contents without metadata styling" {
     try testing.expect(!surface.buffer[0].style.bold);
 }
 
-test "directory symlinks are navigable and file symlinks omit metadata" {
+test "directory symlinks list targets and file symlinks render them" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
@@ -3034,8 +3039,10 @@ test "directory symlinks are navigable and file symlinks omit metadata" {
     center.cursor = file_link_index;
     model.getPane(.here).list_view.cursor = @intCast(file_link_index);
     try model.syncRight();
-    try testing.expect(model.getPane(.children).listing == null);
-    try testing.expect(model.getPane(.children).preview == null);
+    const link_child = model.getPane(.children);
+    try testing.expect(link_child.listing == null);
+    try testing.expect(link_child.preview.?.kind == .text);
+    try testing.expectEqualStrings("target", link_child.preview.?.lines[0]);
 
     const long_link_index = file_system.indexOfName(center, "long-link").?;
     try testing.expectEqual(
