@@ -1222,11 +1222,16 @@ fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void 
             if (isDownKey(key)) {
                 self.moveCenter(ctx, true) catch |err|
                     try self.reportError("move", @errorName(err));
+                // Movement is fully handled here. Consuming stops propagation
+                // before the focused ListView's own movement handler would
+                // step the cursor a second time.
+                ctx.consumeEvent();
                 return;
             }
             if (isUpKey(key)) {
                 self.moveCenter(ctx, false) catch |err|
                     try self.reportError("move", @errorName(err));
+                ctx.consumeEvent();
                 return;
             }
         },
@@ -1778,6 +1783,59 @@ test "ctrl-d and ctrl-u move half the visible cwd rows" {
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = ctrl_u });
     try testing.expectEqual(@as(usize, 14), model.centerListing().cursor);
+}
+
+test "browse movement keys move one row and are consumed" {
+    // Model.captureEvent moves the cursor during the capture phase. It must
+    // consume the key so vxfw stops propagation before the focused ListView
+    // applies its built-in movement handling to the same event.
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    for (0..3) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file-{d}", .{index});
+        try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = name, .data = "" });
+    }
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    const down: Key = .{ .codepoint = 'j' };
+    try model.captureEvent(&ctx, .{ .key_press = down });
+    try testing.expectEqual(@as(usize, 1), model.centerListing().cursor);
+    try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
+    try testing.expect(ctx.consume_event);
+    ctx.consume_event = false;
+
+    const up: Key = .{ .codepoint = 'k' };
+    try model.captureEvent(&ctx, .{ .key_press = up });
+    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
+    try testing.expect(ctx.consume_event);
 }
 
 test "ctrl-u saturates at the first entry instead of wrapping" {
