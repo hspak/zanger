@@ -2819,13 +2819,18 @@ test "children preview shows empty directories and file metadata" {
     child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
     try testing.expect(child_pane.preview.?.kind != .placeholder);
-    try testing.expectEqual(@as(usize, 8), child_pane.preview.?.lines.len);
-    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[0]);
-    try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[1]);
-    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[2]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[3], "Owner: "));
-    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[4]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[5], "Modified: "));
+    try testing.expect(child_pane.preview.?.header);
+    try testing.expectEqual(@as(usize, 9), child_pane.preview.?.lines.len);
+    try testing.expectEqualStrings(
+        "non-text files are not rendered",
+        child_pane.preview.?.lines[0],
+    );
+    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[1]);
+    try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[2]);
+    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[3]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[4], "Owner: "));
+    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[5]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[6], "Modified: "));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2861,7 +2866,19 @@ test "children preview shows empty directories and file metadata" {
     };
     for (details[name_column..][0..name.len]) |cell| try testing.expect(cell.style.bold);
 
-    const metadata_surface = try child_pane.rows[0].widget().draw(.{
+    const header_surface = try child_pane.rows[0].widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 40, .height = 1 },
+        .max = .{ .width = 40, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    // The notice renders like the empty-directory placeholder: dimmed and
+    // italic, without metadata key styling.
+    try testing.expect(header_surface.buffer[0].style.dim);
+    try testing.expect(header_surface.buffer[0].style.italic);
+    try testing.expect(!header_surface.buffer[0].style.bold);
+
+    const metadata_surface = try child_pane.rows[1].widget().draw(.{
         .arena = arena.allocator(),
         .min = .{ .width = 40, .height = 1 },
         .max = .{ .width = 40, .height = 1 },

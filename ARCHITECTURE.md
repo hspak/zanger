@@ -197,12 +197,13 @@ filled, so a long off-screen link target does not add work to every frame.
 ### Metadata previews and identity caching
 
 A regular-file preview first reads up to 128 KiB and classifies the contents:
-a NUL byte or invalid UTF-8 marks the file as binary, and it keeps the
-metadata sheet. Text files render one preview line per source line instead,
-with tabs expanded, control characters dropped, and a truncation marker for
-oversized files; empty files preview as a placeholder message. The read is
-bounded and debounced like all children work, so oversized or slow files
-cannot affect cursor movement.
+a NUL byte or invalid UTF-8 marks the file as binary. Text files render one
+preview line per source line instead, with tabs expanded, control characters
+dropped, and a truncation marker for oversized files; empty files preview as a
+placeholder message. Binary files keep the metadata sheet under a dimmed
+italic notice reading "non-text files are not rendered", styled like the
+empty-directory placeholder. The read is bounded and debounced like all
+children work, so oversized or slow files cannot affect cursor movement.
 
 A binary file's metadata sheet performs one `statx` and formats type, Unix
 mode bits, owner/group, size, modification time, writability, and link count.
