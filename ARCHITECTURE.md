@@ -196,10 +196,18 @@ filled, so a long off-screen link target does not add work to every frame.
 
 ### Metadata previews and identity caching
 
-A regular-file preview performs one `statx` and formats type, Unix mode bits,
-owner/group, size, modification time, writability, and link count. User and
-group names are resolved through `getpwuid_r` and `getgrgid_r` and cached by
-numeric ID because NSS may consult services outside local files.
+A regular-file preview first reads up to 128 KiB and classifies the contents:
+a NUL byte or invalid UTF-8 marks the file as binary, and it keeps the
+metadata sheet. Text files render one preview line per source line instead,
+with tabs expanded, control characters dropped, and a truncation marker for
+oversized files; empty files preview as a placeholder message. The read is
+bounded and debounced like all children work, so oversized or slow files
+cannot affect cursor movement.
+
+A binary file's metadata sheet performs one `statx` and formats type, Unix
+mode bits, owner/group, size, modification time, writability, and link count.
+User and group names are resolved through `getpwuid_r` and `getgrgid_r` and
+cached by numeric ID because NSS may consult services outside local files.
 
 The detailed preview renders its timestamp in UTC. The compact browse status
 uses the model's cached local `zeit.TimeZone`; `formatStatusTime` converts the
@@ -494,9 +502,9 @@ zig build profile-check -- --json
 ```
 
 The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
-links, complete model initialization, top and bottom large-directory frames,
-cursor movement and pending-preview frames, combined input plus draw, and a
-viewport of 4,000-byte link targets. `--samples=N` changes the frame sample
+links, a 1 MiB text file preview, complete model initialization, top and
+bottom large-directory frames, cursor movement and pending-preview frames,
+combined input plus draw, and a viewport of 4,000-byte link targets. `--samples=N` changes the frame sample
 count; scan sample counts are derived from it. Fixture creation and cleanup are
 outside the measured regions.
 
@@ -506,6 +514,7 @@ Regression gates use these p95 budgets:
 |---|---:|
 | Large-directory scan | 50 ms |
 | Symlink-heavy scan | 50 ms |
+| Text-file preview build | 25 ms |
 | Full large-model initialization | 100 ms |
 | Cursor movement | 1 ms |
 | Every headless frame workload | 4 ms |

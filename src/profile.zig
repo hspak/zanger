@@ -15,6 +15,7 @@ const file_system = @import("file_system.zig");
 const scan_budget_ns = 50 * std.time.ns_per_ms;
 const model_init_budget_ns = 100 * std.time.ns_per_ms;
 const frame_budget_ns = 4 * std.time.ns_per_ms;
+const text_preview_budget_ns = 25 * std.time.ns_per_ms;
 const cursor_budget_ns = 1 * std.time.ns_per_ms;
 const warmup_count = 2;
 
@@ -22,6 +23,7 @@ const Options = struct {
     file_count: usize = 20_000,
     symlink_count: usize = 2_000,
     long_symlink_count: usize = 100,
+    text_bytes: usize = 1024 * 1024,
     frame_samples: usize = 100,
     scan_samples: usize = 7,
     check: bool = false,
@@ -45,6 +47,7 @@ const Fixture = struct {
     large_path: []u8,
     symlink_path: []u8,
     long_symlink_path: []u8,
+    text_path: []u8,
 
     const random_bytes_count = 12;
     const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
@@ -78,8 +81,10 @@ const Fixture = struct {
         errdefer alloc.free(symlink_path);
         const long_symlink_path = try std.fs.path.join(alloc, &.{ path, "long-symlinks" });
         errdefer alloc.free(long_symlink_path);
+        const text_path = try std.fs.path.join(alloc, &.{ path, "text" });
+        errdefer alloc.free(text_path);
 
-        try populate(io, root, options);
+        try populate(alloc, io, root, options);
         return .{
             .alloc = alloc,
             .io = io,
@@ -90,6 +95,7 @@ const Fixture = struct {
             .large_path = large_path,
             .symlink_path = symlink_path,
             .long_symlink_path = long_symlink_path,
+            .text_path = text_path,
         };
     }
 
@@ -98,6 +104,7 @@ const Fixture = struct {
         self.parent.deleteTree(self.io, &self.sub_path) catch |err|
             log.warn("failed to remove profiling fixture: {s}", .{@errorName(err)});
         self.parent.close(self.io);
+        self.alloc.free(self.text_path);
         self.alloc.free(self.long_symlink_path);
         self.alloc.free(self.symlink_path);
         self.alloc.free(self.large_path);
@@ -105,7 +112,26 @@ const Fixture = struct {
         self.* = undefined;
     }
 
-    fn populate(io: Io, root: Io.Dir, options: Options) !void {
+    fn populate(alloc: Allocator, io: Io, root: Io.Dir, options: Options) !void {
+        // One text file whose preview build and frames are measured. Short
+        // lines maximize per-line allocation work within the byte budget.
+        var text_dir = try root.createDirPathOpen(io, "text", .{});
+        defer text_dir.close(io);
+        const text_line = "0123456789\n";
+        const line_count = options.text_bytes / text_line.len;
+        const text_data = try alloc.alloc(u8, line_count * text_line.len);
+        defer alloc.free(text_data);
+        for (0..line_count) |index| {
+            @memcpy(
+                text_data[index * text_line.len ..][0..text_line.len],
+                text_line,
+            );
+        }
+        try Io.Dir.writeFile(text_dir, io, .{
+            .sub_path = "lines.txt",
+            .data = text_data,
+        });
+
         var large = try root.createDirPathOpen(io, "large", .{});
         defer large.close(io);
         for (0..options.file_count) |index| {
@@ -309,6 +335,7 @@ fn parseOptions(args: []const []const u8) !Options {
         options.file_count = 2_000;
         options.symlink_count = 200;
         options.long_symlink_count = 20;
+        options.text_bytes = 128 * 1024;
         options.frame_samples = 25;
         options.scan_samples = 3;
     }
@@ -342,12 +369,13 @@ fn runSuite(
         try writer.print(
             "{{\"kind\":\"config\",\"mode\":\"ReleaseSafe\",\"width\":120," ++
                 "\"height\":40,\"files\":{d},\"symlinks\":{d}," ++
-                "\"long_symlinks\":{d},\"frame_samples\":{d}," ++
-                "\"scan_samples\":{d}}}\n",
+                "\"long_symlinks\":{d},\"text_bytes\":{d}," ++
+                "\"frame_samples\":{d},\"scan_samples\":{d}}}\n",
             .{
                 options.file_count,
                 options.symlink_count,
                 options.long_symlink_count,
+                options.text_bytes,
                 options.frame_samples,
                 options.scan_samples,
             },
@@ -355,8 +383,13 @@ fn runSuite(
     } else {
         try writer.print(
             "zanger profile: ReleaseSafe, 120x40, {d} files, {d} directory symlinks, " ++
-                "{d} long symlinks\n",
-            .{ options.file_count, options.symlink_count, options.long_symlink_count },
+                "{d} long symlinks, {d} KiB text\n",
+            .{
+                options.file_count,
+                options.symlink_count,
+                options.long_symlink_count,
+                options.text_bytes / 1024,
+            },
         );
     }
     try writer.flush();
@@ -474,6 +507,32 @@ fn runSuite(
         options,
         "long_symlink_frame",
         try measure(alloc, io, options.frame_samples, &long_frame),
+        frame_budget_ns,
+    ) and passed;
+
+    // Building the preview reads and splits every line of the fixture file.
+    var text_init: ModelInit = .{
+        .alloc = alloc,
+        .io = io,
+        .path = fixture.text_path,
+        .expected_count = 1,
+    };
+    passed = try emitMetric(
+        writer,
+        options,
+        "text_preview_build",
+        try measure(alloc, io, options.scan_samples, &text_init),
+        text_preview_budget_ns,
+    ) and passed;
+
+    var text_session = try Model.ProfileSession.init(alloc, io, fixture.text_path);
+    defer text_session.deinit();
+    var text_frame: DrawFrame = .{ .session = &text_session, .arena = &arena };
+    passed = try emitMetric(
+        writer,
+        options,
+        "text_preview_top_frame",
+        try measure(alloc, io, options.frame_samples, &text_frame),
         frame_budget_ns,
     ) and passed;
 
