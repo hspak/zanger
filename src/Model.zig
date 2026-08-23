@@ -997,9 +997,19 @@ fn recoverMissingCenter(self: *Model, failure: anyerror) !void {
     try self.setMessage("{s} is gone ({s})", .{ deleted_name, @errorName(failure) });
 }
 
-/// Opens `path` with the system opener. In tests the request may be
-/// recorded instead of spawned; see `open_recorder`.
+/// Opens `path` with the system opener. Restricted to regular files
+/// without execute bits: `xdg-open` may execute whatever it is handed.
+/// Symbolic links are classified by their targets. In tests the request may
+/// be recorded instead of spawned; see `open_recorder`.
 fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
+    const metadata = FileMetadata.initFollow(path) catch |err| {
+        try self.reportError("open", @errorName(err));
+        return;
+    };
+    if (metadata.kind != .file or metadata.mode & 0o111 != 0) {
+        try self.setMessage("not a directory: {s}", .{name});
+        return;
+    }
     if (self.open_recorder) |recorder| {
         try recorder.append(self.alloc, try self.alloc.dupe(u8, path));
     } else {
@@ -2363,6 +2373,104 @@ test "enter on a file opens it through the system opener" {
     try model.handleEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqual(@as(usize, 1), opened.items.len);
     try testing.expect(model.centerListing().path.len > path.len);
+}
+
+test "executable files are excluded from the system opener" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\n" });
+    try Io.Dir.setFilePermissions(
+        temp.dir,
+        testing.io,
+        "run.sh",
+        .fromMode(0o755),
+        .{},
+    );
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "quiet.bin", .data = "x\x00y" });
+    try Io.Dir.setFilePermissions(
+        temp.dir,
+        testing.io,
+        "quiet.bin",
+        .fromMode(0o700),
+        .{},
+    );
+    try Io.Dir.symLink(temp.dir, testing.io, "run.sh", "linked.sh", .{});
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var opened: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (opened.items) |item| testing.allocator.free(item);
+        opened.deinit(testing.allocator);
+    }
+    model.open_recorder = &opened;
+
+    const enter: Key = .{ .codepoint = Key.enter };
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // The keyboard path refuses executables, including behind a symlink.
+    for ([_][]const u8{ "run.sh", "linked.sh" }) |name| {
+        const index = file_system.indexOfName(model.centerListing(), name).?;
+        model.centerListing().cursor = index;
+        model.getPane(.here).list_view.cursor = @intCast(index);
+        ctx.cmds.clearRetainingCapacity();
+        try model.handleEvent(&ctx, .{ .key_press = enter });
+        const status = try std.fmt.allocPrint(
+            testing.allocator,
+            "not a directory: {s}",
+            .{name},
+        );
+        defer testing.allocator.free(status);
+        try testing.expectEqualStrings(status, model.message);
+        try testing.expectEqual(@as(usize, 0), opened.items.len);
+    }
+
+    // The mouse path shares the same gate.
+    const press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    const exe_index = file_system.indexOfName(model.centerListing(), "quiet.bin").?;
+    const rows = model.getPane(.here).rows;
+    try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqualStrings("not a directory: quiet.bin", model.message);
+    try testing.expectEqual(@as(usize, 0), opened.items.len);
+
+    // A non-executable file in the same session still opens.
+    const plain_index = file_system.indexOfName(model.centerListing(), "f.txt").?;
+    try rows[plain_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[plain_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    try testing.expectEqualStrings("opened f.txt", model.message);
 }
 
 test "a failed system open reports the spawn error" {

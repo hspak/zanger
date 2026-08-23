@@ -230,8 +230,10 @@ failure still aborts initialization.
 - Ctrl-D/Ctrl-U move by half of the visible HERE rows.
 - `g`/`G` jump directly to the first or last entry.
 - Enter or `l` descends into a non-empty directory. On any other entry they
-  spawn `xdg-open` for the resolved path, detached, with the child collected
-  on a later watcher tick; failures surface as an `open:` status message.
+  hand the resolved path to `xdg-open`, detached, with the child collected on
+  a later watcher tick. Only regular files without execute bits qualify —
+  `xdg-open` may execute what it is given — and excluded entries fall back to
+  the `not a directory` status. Failures surface as an `open:` status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
 - `r` rebuilds the anchored view.
@@ -240,9 +242,9 @@ failure still aborts initialization.
 
 Empty directories remain previews and cannot become HERE. A no-op click or jump
 does not rebuild CHILDREN. A second left press on the same HERE row within
-400 ms descends when that row is a directory and opens any other entry with
-the system opener; every view transaction clears the pending-click state so
-presses cannot pair across listings. Side listings can retain selections for later reuse,
+400 ms descends when that row is a directory and opens any other non-executable
+entry with the system opener; every view transaction clears the pending-click
+state so presses cannot pair across listings. Side listings can retain selections for later reuse,
 but selection and deletion operations always target HERE.
 
 Stable `Row` widgets provide click identity because vxfw `ListView` has no
