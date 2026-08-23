@@ -823,6 +823,7 @@ const InstallOptions = struct {
 
 const ReplaceViewOptions = struct {
     preferred_name: ?[]const u8 = null,
+    fallback_cursor: ?usize = null,
     transfers: []const ListingTransfer = &.{},
     restore_here_from: ?*const file_system.Listing = null,
     preserve_message: bool = false,
@@ -1326,10 +1327,8 @@ fn replaceAnchoredView(
     }
     errdefer if (pending_watch) |watch| self.watcher.cancel(watch);
 
-    const fallback_cursor = if (options.restore_here_from) |listing|
-        listing.cursor
-    else
-        null;
+    const fallback_cursor = options.fallback_cursor orelse
+        if (options.restore_here_from) |listing| listing.cursor else null;
     var pending_view = try self.prepareView(
         center_path,
         options.preferred_name,
@@ -1792,6 +1791,7 @@ fn executeDelete(self: *Model) !void {
 
     try self.replaceAnchoredView(center_path, .{
         .preferred_name = preferred,
+        .fallback_cursor = listing.cursor,
         .transfers = &.{.{ .source = .parent, .target = .parent }},
     });
     if (failed > 0) {
@@ -2736,6 +2736,54 @@ test "delete recursively removes selected directories and their children" {
     try Io.Dir.accessAbsolute(testing.io, kept_path, .{});
     try testing.expectEqualStrings("deleted 2 items", model.message);
     try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
+}
+
+test "delete keeps the cursor row and clamps it at the end" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "b.txt", .data = "b" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "c.txt", .data = "c" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var listing = model.centerListing();
+    const middle_index = file_system.indexOfName(listing, "b.txt").?;
+    listing.cursor = middle_index;
+    model.getPane(.here).list_view.cursor = @intCast(middle_index);
+
+    try model.executeDelete();
+
+    listing = model.centerListing();
+    try testing.expectEqual(@as(usize, 1), listing.cursor);
+    try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
+    try testing.expectEqualStrings("c.txt", listing.entries[listing.cursor].name);
+    try testing.expectEqualStrings("c.txt", model.cursor_status.?.entry_name);
+
+    try model.executeDelete();
+
+    listing = model.centerListing();
+    try testing.expectEqual(@as(usize, 0), listing.cursor);
+    try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
+    try testing.expectEqualStrings("a.txt", listing.entries[listing.cursor].name);
+    try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
 }
 
 test "mouse wheel moves cwd one item and is ignored by side panes" {

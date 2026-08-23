@@ -274,8 +274,8 @@ links are unlinked even when they resolve to directories, so their targets are
 never traversed.
 
 Successful partial work is retained. After deletion, the anchored view is
-refreshed and the status reports the number deleted and, if applicable, the
-first failure.
+refreshed, the cursor keeps its row when possible, and the status reports the
+number deleted and, if applicable, the first failure.
 
 ## Live directory watching
 
