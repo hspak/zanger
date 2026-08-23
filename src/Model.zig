@@ -1133,7 +1133,14 @@ pub fn handleRowClick(
     self.last_click = null;
     const listing = self.centerListing();
     if (listing.entries.len == 0) return;
-    if (!listing.entries[listing.cursor].is_dir) return;
+    const entry = listing.entries[listing.cursor];
+    if (!entry.is_dir) {
+        // Double-clicking anything but a directory opens it like `l` does.
+        const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
+        defer self.alloc.free(target);
+        try self.openWithSystem(target, entry.name);
+        return;
+    }
     self.openCenter() catch |err| try self.reportError("open", @errorName(err));
 }
 
@@ -2466,6 +2473,7 @@ test "double click requires the same row within the interval" {
     defer temp.cleanup();
     try Io.Dir.createDir(temp.dir, testing.io, "a-dir", .default_dir);
     try Io.Dir.createDir(temp.dir, testing.io, "b-dir", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "b-dir/x.txt", .data = "x" });
     try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
 
     const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
@@ -2502,6 +2510,14 @@ test "double click requires the same row within the interval" {
     };
     const rows = model.getPane(.here).rows;
 
+    // File double-clicks route to the opener seam instead of spawning.
+    var opened: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (opened.items) |item| testing.allocator.free(item);
+        opened.deinit(testing.allocator);
+    }
+    model.open_recorder = &opened;
+
     // A second press past the interval is just another single click.
     const a_index = file_system.indexOfName(model.centerListing(), "a-dir").?;
     try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
@@ -2518,13 +2534,27 @@ test "double click requires the same row within the interval" {
     try testing.expectEqualStrings(path, model.centerListing().path);
     try testing.expectEqual(b_index, model.centerListing().cursor);
 
-    // Double-clicking a regular file never attempts an open, so no
-    // "not a directory" status appears.
+    // Double-clicking a regular file opens it through the system opener.
     const f_index = file_system.indexOfName(model.centerListing(), "f.txt").?;
-    try model.getPane(.here).rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
-    try model.getPane(.here).rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[f_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    const expected_path = try std.fs.path.join(
+        testing.allocator,
+        &.{ path, "f.txt" },
+    );
+    defer testing.allocator.free(expected_path);
+    try testing.expectEqualStrings(expected_path, opened.items[0]);
+    try testing.expectEqualStrings("opened f.txt", model.message);
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("", model.message);
+
+    // Directory double-clicks still descend and never reach the opener.
+    try rows[b_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try rows[b_index].widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expectEqual(@as(usize, 1), opened.items.len);
+    const b_child = try std.fs.path.join(testing.allocator, &.{ path, "b-dir" });
+    defer testing.allocator.free(b_child);
+    try testing.expectEqualStrings(b_child, model.centerListing().path);
 }
 
 test "a view transaction invalidates pending double clicks" {
