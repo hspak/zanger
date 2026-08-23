@@ -244,7 +244,10 @@ Empty directories remain previews and cannot become HERE. A no-op click or jump
 does not rebuild CHILDREN. A second left press on the same HERE row within
 400 ms descends when that row is a directory and opens any other non-executable
 entry with the system opener; every view transaction clears the pending-click
-state so presses cannot pair across listings. Side listings can retain selections for later reuse,
+state so presses cannot pair across listings. Blocked input — refused opens, empty
+directory descents, ascent past `/`, deletions with nothing selected — flashes
+a red notice beside the header path for three seconds, cleared on a watcher
+tick. Side listings can retain selections for later reuse,
 but selection and deletion operations always target HERE.
 
 Stable `Row` widgets provide click identity because vxfw `ListView` has no

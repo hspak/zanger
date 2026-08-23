@@ -46,6 +46,10 @@ preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
 // Left-press bookkeeping for double-click descent on HERE rows.
 last_click: ?LastClick = null,
+/// Transient blocked-input notice rendered beside the header path until
+/// `error_deadline`, then cleared on a watcher tick.
+error_message: ?[]u8 = null,
+error_deadline: Io.Timestamp = .zero,
 /// Program spawned to open files with; overridable in tests.
 open_program: []const u8 = "xdg-open",
 /// Test seam: when set, open requests append the target path here instead
@@ -72,6 +76,7 @@ const Mode = enum { browse, command, confirm };
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
 const double_click_interval_ms = 400;
+const error_flash_ms = 3000;
 const preview_debounce_ms = 12;
 const wheel_coalesce_ms = 12;
 
@@ -249,6 +254,7 @@ pub fn deinit(self: *Model) void {
     self.identities.deinit(self.alloc);
     self.freeRetiredRows();
     self.retired_rows.deinit(self.alloc);
+    if (self.error_message) |message| self.alloc.free(message);
     self.alloc.free(self.message);
     self.* = undefined;
 }
@@ -1007,14 +1013,14 @@ fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
         return;
     };
     if (metadata.kind != .file or metadata.mode & 0o111 != 0) {
-        try self.setMessage("not a directory: {s}", .{name});
+        try self.flashError("not a directory: {s}", .{name});
         return;
     }
     if (self.open_recorder) |recorder| {
         try recorder.append(self.alloc, try self.alloc.dupe(u8, path));
     } else {
         self.spawnOpen(path) catch |err| {
-            try self.reportError("open", @errorName(err));
+            try self.flashError("open: {s}", .{@errorName(err)});
             return;
         };
     }
@@ -1079,7 +1085,7 @@ fn openCenter(self: *Model) !void {
     }) catch |err| switch (err) {
         error.EmptyDirectory => {
             listing.setDirectoryEmpty(listing.cursor, true);
-            try self.setMessage("empty directory: {s}", .{entry.name});
+            try self.flashError("empty directory: {s}", .{entry.name});
         },
         else => return err,
     };
@@ -1088,7 +1094,7 @@ fn openCenter(self: *Model) !void {
 fn ascend(self: *Model) !void {
     const center = self.centerListing();
     if (std.mem.eql(u8, center.path, "/")) {
-        try self.setMessage("already at filesystem root", .{});
+        try self.flashError("already at filesystem root", .{});
         return;
     }
     const target = try file_system.parentPath(self.alloc, center.path);
@@ -1246,7 +1252,7 @@ fn beginDelete(self: *Model, ctx: *vxfw.EventContext) !void {
     const count = self.deleteCount();
     if (count == 0) {
         try self.returnToBrowse(ctx);
-        try self.setMessage("nothing safe to delete", .{});
+        try self.flashError("nothing safe to delete", .{});
         return;
     }
     self.confirm_count = count;
@@ -1321,6 +1327,28 @@ fn setMessage(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
 
 fn reportError(self: *Model, action: []const u8, error_name: []const u8) Allocator.Error!void {
     try self.setMessage("{s}: {s}", .{ action, error_name });
+}
+
+/// Flashes a blocked-input notice beside the header path in red for
+/// `error_flash_ms`; a watcher tick clears it once the deadline passes.
+/// Replaces any pending notice and restarts its window.
+fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    const replacement = try std.fmt.allocPrint(self.alloc, fmt, args);
+    if (self.error_message) |old| self.alloc.free(old);
+    self.error_message = replacement;
+    self.error_deadline = Io.Clock.awake.now(self.io).addDuration(
+        .fromMilliseconds(error_flash_ms),
+    );
+}
+
+/// Drops an expired flash, requesting a redraw when it did.
+fn clearExpiredError(self: *Model) bool {
+    const message = self.error_message orelse return false;
+    if (Io.Clock.awake.now(self.io).nanoseconds < self.error_deadline.nanoseconds)
+        return false;
+    self.alloc.free(message);
+    self.error_message = null;
+    return true;
 }
 
 fn openCommand(self: *Model, ctx: *vxfw.EventContext) !void {
@@ -1471,6 +1499,7 @@ fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
         },
         .tick => {
             reapChildren();
+            if (self.clearExpiredError()) ctx.redraw = true;
             try ctx.tick(watcher_interval_ms, self.widget());
             const refreshed = self.reconcileWatcher() catch |err| {
                 try self.reportError("watcher", @errorName(err));
@@ -1525,15 +1554,26 @@ fn drawHeader(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         .fg = .{ .index = 2 },
         .bold = true,
     };
-    const header_text: [5]vaxis.Segment = .{
+    var header_text: [7]vaxis.Segment = .{
         .{ .text = self.user, .style = identity_style },
         .{ .text = "@", .style = identity_style },
         .{ .text = self.hostname, .style = identity_style },
         .{ .text = " " },
         .{ .text = self.centerListing().path },
+        undefined,
+        undefined,
     };
+    var segment_count: usize = 5;
+    if (self.error_message) |message| {
+        header_text[5] = .{ .text = "  " };
+        header_text[6] = .{
+            .text = message,
+            .style = .{ .fg = .{ .index = 1 }, .bold = true },
+        };
+        segment_count = 7;
+    }
     const header: vxfw.RichText = .{
-        .text = &header_text,
+        .text = header_text[0..segment_count],
         .softwrap = false,
         .overflow = .ellipsis,
         .width_basis = .parent,
@@ -2445,7 +2485,7 @@ test "executable files are excluded from the system opener" {
             .{name},
         );
         defer testing.allocator.free(status);
-        try testing.expectEqualStrings(status, model.message);
+        try testing.expectEqualStrings(status, model.error_message.?);
         try testing.expectEqual(@as(usize, 0), opened.items.len);
     }
 
@@ -2462,7 +2502,7 @@ test "executable files are excluded from the system opener" {
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("not a directory: quiet.bin", model.message);
+    try testing.expectEqualStrings("not a directory: quiet.bin", model.error_message.?);
     try testing.expectEqual(@as(usize, 0), opened.items.len);
 
     // A non-executable file in the same session still opens.
@@ -2471,6 +2511,96 @@ test "executable files are excluded from the system opener" {
     try rows[plain_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqual(@as(usize, 1), opened.items.len);
     try testing.expectEqualStrings("opened f.txt", model.message);
+}
+
+test "flashed errors render red beside the path and expire" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "f.txt", .data = "f" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    // Refuse an executable to trigger a flash.
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\n" });
+    try Io.Dir.setFilePermissions(
+        temp.dir,
+        testing.io,
+        "run.sh",
+        .fromMode(0o755),
+        .{},
+    );
+    // Rebuild HERE so run.sh is visible.
+    try model.replaceAnchoredView(path, .{});
+    const index = file_system.indexOfName(model.centerListing(), "run.sh").?;
+    model.centerListing().cursor = index;
+    model.getPane(.here).list_view.cursor = @intCast(index);
+    try model.openCenter();
+
+    try testing.expectEqualStrings(
+        "not a directory: run.sh",
+        model.error_message.?,
+    );
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const header = try model.drawHeader(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 120, .height = 1 },
+        .max = .{ .width = 120, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    }, 120);
+
+    // Exactly one run of red bold cells exists after the path.
+    var red_cells: usize = 0;
+    var saw_red = false;
+    for (header.buffer) |cell| {
+        if (cell.style.fg == .index and cell.style.fg.index == 1) {
+            saw_red = true;
+            red_cells += 1;
+            try testing.expect(cell.style.bold);
+        } else {
+            if (saw_red) break;
+        }
+    }
+    try testing.expect(saw_red);
+    try testing.expectEqual(@as(usize, "not a directory: run.sh".len), red_cells);
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // A tick before the deadline keeps the flash.
+    try model.handleEvent(&ctx, .tick);
+    try testing.expect(model.error_message != null);
+
+    // A tick past the deadline clears it and redraws.
+    model.error_deadline.nanoseconds -= error_flash_ms * std.time.ns_per_ms + 1;
+    ctx.redraw = false;
+    try model.handleEvent(&ctx, .tick);
+    try testing.expect(model.error_message == null);
+    try testing.expect(ctx.redraw);
 }
 
 test "a failed system open reports the spawn error" {
@@ -2511,7 +2641,7 @@ test "a failed system open reports the spawn error" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
     try model.handleEvent(&ctx, .{ .key_press = enter });
-    try testing.expectEqualStrings("open: FileNotFound", model.message);
+    try testing.expectEqualStrings("open: FileNotFound", model.error_message.?);
 
     // Sweeping with no children must be a harmless no-op.
     reapChildren();
@@ -3234,7 +3364,7 @@ test "anchored model navigation" {
     try Io.Dir.deleteFile(temp.dir, testing.io, "child/nested.txt");
     try model.openCenter();
     try testing.expectEqual(reascended_path_pointer, model.centerListing().path.ptr);
-    try testing.expectEqualStrings("empty directory: child", model.message);
+    try testing.expectEqualStrings("empty directory: child", model.error_message.?);
     try testing.expect(model.centerListing().entries[model.centerListing().cursor].is_empty.?);
 }
 
@@ -3298,7 +3428,7 @@ test "children preview shows empty directories and file metadata" {
     try model.openCenter();
     try testing.expectEqual(original_center_path, model.centerListing().path.ptr);
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("empty directory: empty", model.message);
+    try testing.expectEqualStrings("empty directory: empty", model.error_message.?);
 
     // Enter may arrive before the debounced CHILDREN preview has established
     // emptiness. The pending view must still be rejected before commit.
