@@ -11,7 +11,14 @@ The executable is split into a small entry point and five focused modules:
 | File | Responsibility |
 |---|---|
 | [`src/main.zig`](src/main.zig) | Creates the terminal app and stable heap-allocated model, then enters the vxfw loop |
-| [`src/Model.zig`](src/Model.zig) | Owns interactive state, panes, navigation transactions, previews, commands, deletion, and rendering |
+| [`src/Model.zig`](src/Model.zig) | Owns interactive state, navigation transactions, commands, deletion, and rendering |
+| [`src/Model/Pane.zig`](src/Model/Pane.zig) | One pane's owned listing or preview, its row widgets, and wheel capture |
+| [`src/Model/PendingView.zig`](src/Model/PendingView.zig) | Stages all-or-nothing pane and watcher replacement content |
+| [`src/Model/Row.zig`](src/Model/Row.zig) | Stable row widgets for click identity, clipping, and metadata styling |
+| [`src/Model/Preview.zig`](src/Model/Preview.zig) | File metadata sheets and placeholder messages for the children pane |
+| [`src/Model/FileMetadata.zig`](src/Model/FileMetadata.zig) | One file's `statx` metadata |
+| [`src/Model/IdentityCache.zig`](src/Model/IdentityCache.zig) | Cached UID/GID to account-name resolution |
+| [`src/Model/format.zig`](src/Model/format.zig) | Pure permission-bit, size, and timestamp formatters |
 | [`src/file_system.zig`](src/file_system.zig) | Builds and owns directory snapshots, entries, selection state, and preformatted rows |
 | [`src/Watcher.zig`](src/Watcher.zig) | Owns the nonblocking inotify descriptor and transactional HERE watch |
 | [`src/command.zig`](src/command.zig) | Resolves unique command prefixes into a closed command enum |
