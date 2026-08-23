@@ -52,6 +52,11 @@ cwd_visible_rows: u16 = 1,
 // Owned and replaced transactionally by `setMessage`.
 message: []u8 = &.{},
 confirm_count: usize = 0,
+// Replaced pane row arrays, kept readable until the next draw. vxfw retains
+// the previous frame's surface tree for hit testing until a new frame
+// renders, so freeing rows at commit time could leave mouse handlers reading
+// freed memory when input events share one queue batch with a commit.
+retired_rows: std.ArrayList([]Row) = .empty,
 // Both names are borrowed for the model's lifetime.
 user: []const u8 = "user",
 hostname: []const u8 = "localhost",
@@ -229,6 +234,8 @@ pub fn deinit(self: *Model) void {
     self.local_time_zone.deinit();
     self.text_field.deinit();
     self.identities.deinit(self.alloc);
+    self.freeRetiredRows();
+    self.retired_rows.deinit(self.alloc);
     self.alloc.free(self.message);
     self.* = undefined;
 }
@@ -636,6 +643,27 @@ fn makeRows(self: *Model, pane: *Pane, count: usize) Allocator.Error![]Row {
     const rows = try self.alloc.alloc(Row, count);
     for (rows, 0..) |*row, index| row.* = .{ .pane = pane, .index = index };
     return rows;
+}
+
+/// Defers freeing replaced row widgets until the next draw. vxfw hit tests
+/// against the previous frame's surface tree, and App drains the whole input
+/// queue before rendering; freeing rows at commit time could otherwise leave
+/// an in-flight mouse handler reading freed memory.
+pub fn retireRows(self: *Model, rows: []Row) void {
+    if (rows.len == 0) {
+        self.alloc.free(rows);
+        return;
+    }
+    self.retired_rows.append(self.alloc, rows) catch {
+        // Nothing can be done about OOM here; immediate free is safe when no
+        // frame referencing these rows was rendered yet.
+        self.alloc.free(rows);
+    };
+}
+
+fn freeRetiredRows(self: *Model) void {
+    for (self.retired_rows.items) |rows| self.alloc.free(rows);
+    self.retired_rows.clearRetainingCapacity();
 }
 
 fn replaceAnchoredView(
@@ -1477,6 +1505,9 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
 }
 
 fn draw(self: *Model, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+    // Rows retired since the last draw are only now unreachable by hit
+    // testing, because the new tree replaces the retained one.
+    self.freeRetiredRows();
     const size = ctx.max.size();
     self.cwd_visible_rows = if (size.height >= 4 and size.width >= 6)
         size.height - 3
@@ -2387,6 +2418,57 @@ test "watcher refresh preserves cursor selection and parent listing" {
     try testing.expectEqualStrings("gamma.txt", center.entries[center.cursor].name);
     try testing.expectEqual(@as(usize, 0), center.selectedCount());
     try testing.expect(ctx.redraw);
+}
+
+test "replaced rows stay readable until the next draw" {
+    // A commit frees pane content while vxfw's retained surface tree may
+    // still reference its row widgets. Retirement must keep that memory
+    // alive until the next draw replaces the hit-testing tree.
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "child", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "child/a.txt",
+        .data = "a",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    const retired_rows = model.getPane(.here).rows.ptr;
+    try model.openCenter();
+    try testing.expect(model.retired_rows.items.len > 0);
+    // The retired array is still readable; handlers dispatched from a stale
+    // hit list would read these Row values.
+    try testing.expectEqual(@as(usize, 0), retired_rows[0].index);
+
+    // Drawing releases retirement storage and deinit must not double free.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    _ = try model.draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 60, .height = 12 },
+        .max = .{ .width = 60, .height = 12 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    try testing.expectEqual(@as(usize, 0), model.retired_rows.items.len);
 }
 
 test "anchored model navigation" {

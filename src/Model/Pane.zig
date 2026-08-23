@@ -145,7 +145,7 @@ pub fn resetListView(self: *Pane, cursor: u32) void {
 pub fn replace(self: *Pane, replacement: Replacement) void {
     if (self.listing) |*old| old.deinit();
     if (self.preview) |*old| old.deinit();
-    self.model.alloc.free(self.rows);
+    self.model.retireRows(self.rows);
 
     self.listing = replacement.listing;
     self.preview = replacement.preview;
