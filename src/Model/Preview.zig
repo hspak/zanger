@@ -11,6 +11,10 @@ const FileMetadata = @import("FileMetadata.zig");
 const IdentityCache = @import("IdentityCache.zig");
 const format = @import("format.zig");
 
+/// Upper bound on bytes read from one file for a content preview. Files at or
+/// below this size render fully; larger files show a truncation marker.
+pub const max_preview_bytes: usize = 128 * 1024;
+
 const Preview = @This();
 
 /// How a preview's lines should render. Metadata sheets bold the key up to
@@ -142,4 +146,234 @@ fn formatModifiedTime(
             day_seconds.getSecondsIntoMinute(),
         },
     );
+}
+
+/// Errors from opening and reading a candidate text file, plus allocation.
+pub const TextContentError =
+    Allocator.Error || Io.File.OpenError || Io.File.StatError || Io.File.ReadPositionalError;
+
+/// Reads at most `max_bytes` of `path` and renders its contents as one preview
+/// line per source line. Returns null when the file is not text: a NUL byte
+/// or invalid UTF-8 in the read portion classifies it as binary, leaving the
+/// metadata sheet as the preview. Empty files preview as a placeholder
+/// message. `size_hint` avoids one `stat` when the caller already knows the
+/// file size.
+pub fn initTextContent(
+    alloc: Allocator,
+    io: Io,
+    path: []const u8,
+    size_hint: ?u64,
+    max_bytes: usize,
+) TextContentError!?Preview {
+    const file = try Io.Dir.openFileAbsolute(io, path, .{});
+    defer Io.File.close(file, io);
+
+    const size: u64 = if (size_hint) |hint|
+        hint
+    else
+        (try file.stat(io)).size;
+    const read_length: usize = @intCast(@min(size, max_bytes));
+    const bytes = try alloc.alloc(u8, read_length);
+    defer alloc.free(bytes);
+    const filled = try file.readPositionalAll(io, bytes, 0);
+    const content = bytes[0..filled];
+
+    // Binary heuristics: a NUL byte anywhere, or invalid UTF-8, means the
+    // terminal cannot render this safely as text.
+    if (std.mem.indexOfScalar(u8, content, 0) != null) return null;
+    if (!std.unicode.utf8ValidateSlice(content)) return null;
+
+    if (content.len == 0) return try initMessage(alloc, "(empty file)");
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    var iterator = std.mem.splitScalar(u8, content, '\n');
+    while (iterator.next()) |raw_line| {
+        try appendTextLine(alloc, &lines, raw_line);
+    }
+    // splitScalar yields a trailing empty segment for content ending in '\n';
+    // drop it so the list holds exactly the visible lines.
+    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+        const last = lines.pop().?;
+        alloc.free(last);
+    }
+    if (lines.items.len == 0) return try initMessage(alloc, "(empty file)");
+
+    if (size > content.len) {
+        try appendTextLine(alloc, &lines, "… (truncated)");
+    }
+
+    return .{
+        .alloc = alloc,
+        .lines = try lines.toOwnedSlice(alloc),
+        .kind = .text,
+    };
+}
+
+/// Copies one source line into an owned display line. Tabs expand to four
+/// spaces; other control characters are dropped so terminal escape sequences
+/// cannot hide inside file contents.
+fn appendTextLine(
+    alloc: Allocator,
+    lines: *std.ArrayList([]const u8),
+    raw_line: []const u8,
+) Allocator.Error!void {
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(alloc);
+    for (raw_line) |byte| {
+        switch (byte) {
+            '\t' => try line.appendSlice(alloc, "    "),
+            0x00...0x08, 0x0a...0x1f, 0x7f => {},
+            else => try line.append(alloc, byte),
+        }
+    }
+    try lines.append(alloc, try line.toOwnedSlice(alloc));
+}
+
+test "text file preview splits sanitized lines" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "notes.txt",
+        .data = "alpha\r\nbe\tta\nga\x01mma\nfinal",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+        "notes.txt",
+    });
+    defer testing.allocator.free(path);
+
+    var preview = try initTextContent(
+        testing.allocator,
+        testing.io,
+        path,
+        null,
+        max_preview_bytes,
+    );
+    try testing.expect(preview != null);
+    defer preview.?.deinit();
+
+    try testing.expectEqual(Kind.text, preview.?.kind);
+    try testing.expectEqual(@as(usize, 4), preview.?.lines.len);
+    try testing.expectEqualStrings("alpha", preview.?.lines[0]);
+    try testing.expectEqualStrings("be    ta", preview.?.lines[1]);
+    try testing.expectEqualStrings("gamma", preview.?.lines[2]);
+    try testing.expectEqualStrings("final", preview.?.lines[3]);
+}
+
+test "binary and invalid utf-8 files decline text preview" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "blob.bin",
+        .data = "ok\x00not ok",
+    });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "mojibake.txt",
+        .data = "\xff\xfe broken",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const dir_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(dir_path);
+
+    const binary_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "blob.bin" });
+    defer testing.allocator.free(binary_path);
+    try testing.expect(try initTextContent(
+        testing.allocator,
+        testing.io,
+        binary_path,
+        null,
+        max_preview_bytes,
+    ) == null);
+
+    const invalid_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "mojibake.txt" });
+    defer testing.allocator.free(invalid_path);
+    try testing.expect(try initTextContent(
+        testing.allocator,
+        testing.io,
+        invalid_path,
+        null,
+        max_preview_bytes,
+    ) == null);
+}
+
+test "empty file previews as a placeholder message" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "hollow.txt", .data = "" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+        "hollow.txt",
+    });
+    defer testing.allocator.free(path);
+
+    var preview = try initTextContent(
+        testing.allocator,
+        testing.io,
+        path,
+        0,
+        max_preview_bytes,
+    );
+    try testing.expect(preview != null);
+    defer preview.?.deinit();
+
+    try testing.expectEqual(Kind.placeholder, preview.?.kind);
+    try testing.expectEqualStrings("(empty file)", preview.?.lines[0]);
+}
+
+test "oversized files truncate with a marker line" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "long.txt",
+        .data = "0123456789\nabcdefghij\nklmnopqrst\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+        "long.txt",
+    });
+    defer testing.allocator.free(path);
+
+    var preview = try initTextContent(testing.allocator, testing.io, path, null, 16);
+    try testing.expect(preview != null);
+    defer preview.?.deinit();
+
+    try testing.expectEqual(Kind.text, preview.?.kind);
+    // The 16-byte cap ends mid-line; partial lines render as-is.
+    try testing.expectEqualStrings("0123456789", preview.?.lines[0]);
+    try testing.expectEqualStrings("abcde", preview.?.lines[1]);
+    try testing.expectEqualStrings("… (truncated)", preview.?.lines[2]);
+    try testing.expectEqual(@as(usize, 3), preview.?.lines.len);
 }

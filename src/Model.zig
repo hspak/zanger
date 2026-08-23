@@ -611,6 +611,19 @@ fn buildChildrenOutcome(
     if (!entry.is_dir) {
         // A non-directory symbolic link shows no metadata preview.
         if (entry.is_sym) return .{};
+        // Text files render their contents; anything binary or invalid
+        // UTF-8 keeps the metadata sheet.
+        const text_preview = Preview.initTextContent(
+            self.alloc,
+            self.io,
+            child_path,
+            if (metadata_hint) |hint| hint.size else null,
+            Preview.max_preview_bytes,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .error_name = @errorName(err) },
+        };
+        if (text_preview) |preview| return .{ .content = .{ .preview = preview } };
         const preview = Preview.initFile(
             self.alloc,
             &self.identities,
@@ -2010,7 +2023,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
     try testing.expect(model.preview_dirty);
     try testing.expect(model.preview_tick_pending);
-    try testing.expectEqualStrings("Name: a.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
     var pending_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer pending_arena.deinit();
@@ -2031,7 +2044,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("Name: b.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
     try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
     try testing.expect(!model.preview_dirty);
     try testing.expect(ctx.consume_event);
@@ -2235,10 +2248,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 1), model.centerListing().cursor);
     try testing.expect(model.preview_dirty);
-    try testing.expectEqualStrings("Name: a.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("Name: b.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
     try testing.expectEqual(@as(u8, 0), model.getPane(.here).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.parent).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.children).list_view.wheel_scroll);
@@ -2262,10 +2275,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
     try testing.expect(model.preview_dirty);
-    try testing.expectEqualStrings("Name: b.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("Name: a.txt", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 }
@@ -2725,9 +2738,10 @@ test "children preview shows empty directories and file metadata" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     try Io.Dir.createDir(temp.dir, testing.io, "empty", .default_dir);
+    // A NUL byte classifies the file as binary, keeping the metadata sheet.
     try Io.Dir.writeFile(temp.dir, testing.io, .{
         .sub_path = "notes.txt",
-        .data = "four",
+        .data = "four\x00",
     });
     try Io.Dir.setFilePermissions(
         temp.dir,
@@ -2810,7 +2824,7 @@ test "children preview shows empty directories and file metadata" {
     try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[1]);
     try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[2]);
     try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[3], "Owner: "));
-    try testing.expectEqualStrings("Size: 4B (4 bytes)", child_pane.preview.?.lines[4]);
+    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[4]);
     try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[5], "Modified: "));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2857,6 +2871,60 @@ test "children preview shows empty directories and file metadata" {
         try testing.expect(cell.style.bold);
     }
     try testing.expect(!metadata_surface.buffer["Name:".len].style.bold);
+}
+
+test "text file preview renders contents without metadata styling" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "readme.txt",
+        // The first line has no colon; metadata styling would crash on it.
+        .data = "no colon here\nsecond: line\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    const index = file_system.indexOfName(model.centerListing(), "readme.txt").?;
+    model.centerListing().cursor = index;
+    model.getPane(.here).list_view.cursor = @intCast(index);
+    try model.syncRight();
+
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .text);
+    try testing.expectEqual(@as(usize, 2), child_pane.preview.?.lines.len);
+    try testing.expectEqualStrings("no colon here", child_pane.preview.?.lines[0]);
+    try testing.expectEqualStrings("second: line", child_pane.preview.?.lines[1]);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const surface = try child_pane.rows[0].widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 30, .height = 1 },
+        .max = .{ .width = 30, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    try testing.expectEqualStrings("n", surface.buffer[0].char.grapheme);
+    // Text lines render verbatim: no bolded key span.
+    try testing.expect(!surface.buffer[0].style.bold);
 }
 
 test "directory symlinks are navigable and file symlinks omit metadata" {
