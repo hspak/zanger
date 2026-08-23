@@ -2908,6 +2908,94 @@ test "children preview shows empty directories and file metadata" {
     try testing.expect(!metadata_surface.buffer["Name:".len].style.bold);
 }
 
+test "non-text notice keeps its blank rows in list layout" {
+    // Regression: ListView constrains row widgets to min.height 0, so empty
+    // preview lines drawn as plain Text collapsed to zero height and pulled
+    // the metadata sheet up against the notice.
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "blob.dat",
+        .data = "bin\x00ary",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+
+    // Draw through the pane's ListView exactly like the real frame does.
+    const pane_surface = try model.getPane(.children).widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 40, .height = 12 },
+        .max = .{ .width = 40, .height = 12 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+
+    // Walk the surface tree collecting (row, first grapheme) for visible rows.
+    const RenderedRow = struct { row: i17, grapheme: []const u8 };
+    const Collector = struct {
+        fn walk(
+            surface: vxfw.Surface,
+            row_offset: i17,
+            rows: *std.ArrayList(RenderedRow),
+            alloc: Allocator,
+        ) Allocator.Error!void {
+            if (surface.buffer.len >= surface.size.width) {
+                try rows.append(alloc, .{
+                    .row = row_offset,
+                    .grapheme = surface.buffer[0].char.grapheme,
+                });
+            }
+            for (surface.children) |child| {
+                try walk(
+                    child.surface,
+                    row_offset + child.origin.row,
+                    rows,
+                    alloc,
+                );
+            }
+        }
+    };
+
+    var rows: std.ArrayList(RenderedRow) = .empty;
+    defer rows.deinit(testing.allocator);
+    try Collector.walk(pane_surface, 0, &rows, testing.allocator);
+
+    var notice_row: ?i17 = null;
+    var name_row: ?i17 = null;
+    var blank_rows: usize = 0;
+    for (rows.items) |item| {
+        // Blank cells carry vaxis's default single-space grapheme.
+        if (std.mem.eql(u8, item.grapheme, " ")) blank_rows += 1;
+        if (std.mem.eql(u8, item.grapheme, "n")) notice_row = item.row;
+        if (std.mem.eql(u8, item.grapheme, "N")) name_row = item.row;
+    }
+    const start = notice_row orelse return error.TestUnexpectedResult;
+    const sheet = name_row orelse return error.TestUnexpectedResult;
+    // Notice, two blanks, then the sheet's first line.
+    try testing.expectEqual(@as(i17, 3), sheet - start);
+    try testing.expectEqual(@as(usize, 2), blank_rows);
+}
+
 test "text file preview renders contents without metadata styling" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});

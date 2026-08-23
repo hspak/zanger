@@ -58,56 +58,44 @@ fn typeErasedEventHandler(
 fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
     const self: *Row = @ptrCast(@alignCast(ptr));
     var style: vaxis.Cell.Style = .{};
-    const row_text = row_text: {
-        if (self.pane.listing) |*listing| {
-            if (self.index >= listing.rows.len) return self.emptySurface(ctx);
-            const entry = listing.entries[self.index];
-            const selected = listing.selected.isSet(self.index);
-            style.fg = if (selected)
-                .{ .index = 11 }
-            else if (entry.is_sym)
-                .{ .index = 6 }
-            else if (entry.is_dir)
-                .{ .index = 12 }
-            else
-                .default;
-            style.bold = selected or entry.is_dir;
-            const active_cursor = self.pane.role == .here and
-                self.pane.model.mode != .command and
-                self.pane.list_view.cursor == self.index;
-            const parent_cwd_index = self.pane.role == .parent and
-                self.pane.cwd_index == self.index;
-            style.reverse = active_cursor or parent_cwd_index;
-            return self.drawClippedRow(ctx, listing.rows[self.index], style);
+    if (self.pane.listing) |*listing| {
+        if (self.index >= listing.rows.len) return self.emptySurface(ctx);
+        const entry = listing.entries[self.index];
+        const selected = listing.selected.isSet(self.index);
+        style.fg = if (selected)
+            .{ .index = 11 }
+        else if (entry.is_sym)
+            .{ .index = 6 }
+        else if (entry.is_dir)
+            .{ .index = 12 }
+        else
+            .default;
+        style.bold = selected or entry.is_dir;
+        const active_cursor = self.pane.role == .here and
+            self.pane.model.mode != .command and
+            self.pane.list_view.cursor == self.index;
+        const parent_cwd_index = self.pane.role == .parent and
+            self.pane.cwd_index == self.index;
+        style.reverse = active_cursor or parent_cwd_index;
+        return self.drawClippedRow(ctx, listing.rows[self.index], style);
+    }
+    if (self.pane.preview) |*preview| {
+        if (self.index >= preview.lines.len) return self.emptySurface(ctx);
+        // A preview's leading lines may be a notice rendered like the
+        // placeholder messages ahead of otherwise metadata content.
+        const in_header = self.index < preview.header_lines;
+        const dimmed = preview.kind == .placeholder or in_header;
+        style.dim = dimmed;
+        style.italic = dimmed;
+        if (preview.kind == .metadata and !in_header) {
+            return self.drawMetadataRow(ctx, preview.lines[self.index], style);
         }
-        if (self.pane.preview) |*preview| {
-            if (self.index >= preview.lines.len) return self.emptySurface(ctx);
-            // A preview's first line may be a notice rendered like the
-            // placeholder messages ahead of otherwise metadata content.
-            const in_header = self.index < preview.header_lines;
-            const dimmed = preview.kind == .placeholder or in_header;
-            style.dim = dimmed;
-            style.italic = dimmed;
-            if (preview.kind == .metadata and !in_header) {
-                return self.drawMetadataRow(ctx, preview.lines[self.index], style);
-            }
-            break :row_text preview.lines[self.index];
-        }
-        return self.emptySurface(ctx);
-    };
-
-    const text: vxfw.Text = .{
-        .text = row_text,
-        .style = style,
-        .softwrap = false,
-        .overflow = .ellipsis,
-        .width_basis = .parent,
-    };
-    var surface = try text.draw(ctx);
-    // Text is a stack-local helper; the row is the persistent widget that
-    // must appear in the surface tree for mouse hit testing.
-    surface.widget = self.widget();
-    return surface;
+        // Empty lines must still occupy a row: ListView constrains children
+        // to min.height 0, so an empty Text collapses to zero height and
+        // pulls every following row up. drawClippedRow always fills one row.
+        return self.drawClippedRow(ctx, preview.lines[self.index], style);
+    }
+    return self.emptySurface(ctx);
 }
 
 /// Draws one row into an exact-width surface. Grapheme-aware clipping stops
