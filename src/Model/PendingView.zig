@@ -11,6 +11,17 @@ const Preview = @import("Preview.zig");
 
 const PendingView = @This();
 
+listings: [3]?file_system.Listing = .{ null, null, null },
+cursors: [3]u32 = .{ 0, 0, 0 },
+previews: [3]?Preview = .{ null, null, null },
+cwd_indices: [3]?usize = .{ null, null, null },
+preview_error_name: ?[]const u8 = null,
+cursor_status: ?Model.CursorStatus = null,
+// A non-null source means the target slot is a borrowed shallow copy of a
+// live listing. Ownership moves only after all fallible preparation ends.
+listing_sources: [3]?Model.PaneRole = .{ null, null, null },
+directory_empty_transfers: [3]?DirectoryEmptyTransfer = .{ null, null, null },
+
 /// Moves one existing snapshot from a source pane role to a target role.
 pub const ListingTransfer = struct {
     source: Model.PaneRole,
@@ -23,17 +34,6 @@ pub const DirectoryEmptyTransfer = struct {
     index: usize,
     is_empty: bool,
 };
-
-listings: [3]?file_system.Listing = .{ null, null, null },
-cursors: [3]u32 = .{ 0, 0, 0 },
-previews: [3]?Preview = .{ null, null, null },
-cwd_indices: [3]?usize = .{ null, null, null },
-preview_error_name: ?[]const u8 = null,
-cursor_status: ?Model.CursorStatus = null,
-// A non-null source means the target slot is a borrowed shallow copy of a
-// live listing. Ownership moves only after all fallible preparation ends.
-listing_sources: [3]?Model.PaneRole = .{ null, null, null },
-directory_empty_transfers: [3]?DirectoryEmptyTransfer = .{ null, null, null },
 
 pub fn deinit(self: *PendingView) void {
     for (&self.listings, 0..) |*maybe_listing, index| {

@@ -8,12 +8,12 @@ const Allocator = std.mem.Allocator;
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const Model = @import("../Model.zig");
+const Pane = @import("Pane.zig");
 
 const Row = @This();
 
 // Borrowed from the pane that owns this row's backing slice.
-pane: *Model.Pane,
+pane: *Pane,
 index: usize,
 
 pub fn widget(self: *const Row) vxfw.Widget {

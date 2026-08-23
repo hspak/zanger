@@ -15,12 +15,6 @@ const Row = @import("Row.zig");
 
 const Pane = @This();
 
-/// Direction of a wheel report, coalesced by the model.
-pub const WheelDirection = enum {
-    up,
-    down,
-};
-
 model: *Model,
 role: Model.PaneRole,
 // Owned snapshot; null when this pane has no readable directory.
@@ -32,6 +26,12 @@ rows: []Row,
 // Stable location marker for the center directory in the parent listing.
 cwd_index: ?usize,
 list_view: vxfw.ListView,
+
+/// Direction of a wheel report, coalesced by the model.
+pub const WheelDirection = enum {
+    up,
+    down,
+};
 
 pub const Replacement = struct {
     listing: ?file_system.Listing = null,
