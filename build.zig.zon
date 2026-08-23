@@ -32,10 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Vendored with a resize-flicker patch: Vaxis.resize wraps its
-        // destructive reposition/erase in synchronized output and queues a
-        // full refresh (vendor/vaxis/src/Vaxis.zig). Pending upstream.
-        .vaxis = .{ .path = "vendor/vaxis" },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#5871bbc288b0cf41dfeccd90f2399ea853016c59",
+            .hash = "vaxis-0.6.0-BWNV_MEkCgBVaftLHtHu9FMZnvUx0Vf0oxiNaN9m2O2U",
+        },
         .zeit = .{
             .url = "git+https://github.com/rockorager/zeit?ref=v0.9.0#b1c1c2fcbc71fd7799a316bbcf0ff88d06d80ccc",
             .hash = "zeit-0.9.0-5I6bk2m9AgBSMH8-L6rYJkwuQAyhXplnfxnvTSGzVHUR",
