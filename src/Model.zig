@@ -18,7 +18,11 @@ pub const FileMetadata = @import("Model/FileMetadata.zig");
 pub const IdentityCache = @import("Model/IdentityCache.zig");
 pub const Preview = @import("Model/Preview.zig");
 pub const Pane = @import("Model/Pane.zig");
+pub const PendingView = @import("Model/PendingView.zig");
 pub const Row = @import("Model/Row.zig");
+
+const ListingTransfer = PendingView.ListingTransfer;
+const DirectoryEmptyTransfer = PendingView.DirectoryEmptyTransfer;
 
 const Model = @This();
 
@@ -65,22 +69,12 @@ pub const PaneRole = enum(u2) {
     here = 1,
     children = 2,
 
-    fn toIndex(self: PaneRole) usize {
+    pub fn toIndex(self: PaneRole) usize {
         return @intFromEnum(self);
     }
 };
 
-const ListingTransfer = struct {
-    source: PaneRole,
-    target: PaneRole,
-};
-
-const DirectoryEmptyTransfer = struct {
-    index: usize,
-    is_empty: bool,
-};
-
-const CursorStatus = struct {
+pub const CursorStatus = struct {
     metadata: FileMetadata,
     mode_bits: [10]u8,
     // Borrowed from HERE's listing, which remains stable during cursor movement.
@@ -92,75 +86,6 @@ const CursorStatus = struct {
 
 // Preparing replacement content first keeps re-anchoring atomic. Matching live
 // listings move between pane roles only after all fallible work succeeds.
-const PendingView = struct {
-    listings: [3]?file_system.Listing = .{
-        null,
-        null,
-        null,
-    },
-    cursors: [3]u32 = .{
-        0,
-        0,
-        0,
-    },
-    previews: [3]?Preview = .{
-        null,
-        null,
-        null,
-    },
-    cwd_indices: [3]?usize = .{
-        null,
-        null,
-        null,
-    },
-    preview_error_name: ?[]const u8 = null,
-    cursor_status: ?CursorStatus = null,
-    // A non-null source means the target slot is a borrowed shallow copy of a
-    // live listing. Ownership moves only after all fallible preparation ends.
-    listing_sources: [3]?PaneRole = .{
-        null,
-        null,
-        null,
-    },
-    directory_empty_transfers: [3]?DirectoryEmptyTransfer = .{
-        null,
-        null,
-        null,
-    },
-
-    fn deinit(self: *PendingView) void {
-        for (&self.listings, 0..) |*maybe_listing, index| {
-            if (self.listing_sources[index] != null) continue;
-            if (maybe_listing.*) |*listing| listing.deinit();
-        }
-        for (&self.previews) |*maybe_preview| {
-            if (maybe_preview.*) |*preview| preview.deinit();
-        }
-        self.* = undefined;
-    }
-
-    fn rememberErrorName(self: *PendingView, error_name: []const u8) void {
-        if (self.preview_error_name == null) self.preview_error_name = error_name;
-    }
-
-    fn borrowListing(
-        self: *PendingView,
-        source: PaneRole,
-        target: PaneRole,
-        listing: file_system.Listing,
-    ) *file_system.Listing {
-        const target_index = target.toIndex();
-        std.debug.assert(self.listings[target_index] == null);
-        std.debug.assert(self.listing_sources[target_index] == null);
-        for (self.listing_sources) |maybe_source| {
-            if (maybe_source) |existing_source| std.debug.assert(existing_source != source);
-        }
-        self.listings[target_index] = listing;
-        self.listing_sources[target_index] = source;
-        return &self.listings[target_index].?;
-    }
-};
-
 /// Inputs borrowed for the lifetime of an initialized model.
 pub const InitOptions = struct {
     /// Absolute directory to install as HERE.
