@@ -14,6 +14,7 @@ const Watcher = @import("Watcher.zig");
 const command = @import("command.zig");
 const file_system = @import("file_system.zig");
 const format = @import("Model/format.zig");
+const interaction = @import("Model/interaction.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
 pub const IdentityCache = @import("Model/IdentityCache.zig");
 pub const Preview = @import("Model/Preview.zig");
@@ -45,11 +46,8 @@ watch_refresh: WatchRefresh = .none,
 preview_dirty: bool = false,
 preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
-// Left-press bookkeeping for double-click descent on HERE rows.
-last_click: ?LastClick = null,
-/// Timestamp of the last press on the `..` row, for its own double-click
-/// detection.
-up_click_at_ns: ?i128 = null,
+// Left-press bookkeeping shared by HERE entries and the pinned `..` row.
+clicks: interaction.DoubleClickTracker = .{},
 
 /// Authoritative logical cursor for HERE. The vxfw and listing cursors are
 /// projections updated only by `applyHereCursor` and view commit.
@@ -94,11 +92,6 @@ const CursorScroll = enum {
     none,
     ensure_visible,
     jump,
-};
-
-const LastClick = struct {
-    index: usize,
-    at_ns: i128,
 };
 
 pub const PaneRole = enum(u2) {
@@ -960,8 +953,7 @@ fn replaceAnchoredView(
     self.preview_dirty = false;
     // A press from before this transaction must not pair with a press after
     // it: row indices belong to different listings.
-    self.last_click = null;
-    self.up_click_at_ns = null;
+    self.clicks.invalidateView();
     const committed_center = self.centerListing();
     self.here_cursor = HereCursor.fromEntryCount(
         committed_center.entries.len,
@@ -1308,15 +1300,13 @@ pub fn handleRowClick(
     _ = try self.setHereCursor(ctx, .{ .entry = index }, .none);
 
     const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
-    const is_double = if (self.last_click) |click|
-        click.index == index and
-            now_ns - click.at_ns <= double_click_interval_ms * std.time.ns_per_ms
-    else
-        false;
-    self.last_click = .{ .index = index, .at_ns = now_ns };
+    const is_double = self.clicks.press(
+        .{ .entry = index },
+        now_ns,
+        double_click_interval_ms * std.time.ns_per_ms,
+    );
     if (!is_double) return;
 
-    self.last_click = null;
     const listing = self.centerListing();
     const center_cursor = self.hereEntryIndex() orelse return;
     const entry = listing.entries[center_cursor];
@@ -1328,6 +1318,19 @@ pub fn handleRowClick(
         return;
     }
     self.openCenter() catch |err| try self.reportError("open", @errorName(err));
+}
+
+/// Handles a left press on HERE's pinned `..` row. One press selects it and a
+/// second press within the shared double-click window ascends.
+pub fn handleUpClick(self: *Model, ctx: *vxfw.EventContext) !void {
+    try self.selectUp(ctx);
+    const is_double = self.clicks.press(
+        .up,
+        Io.Clock.awake.now(self.io).nanoseconds,
+        double_click_interval_ms * std.time.ns_per_ms,
+    );
+    if (!is_double) return;
+    self.ascend() catch |err| try self.reportError("up", @errorName(err));
 }
 
 /// Navigates HERE into the parent directory with the clicked row selected
@@ -1643,7 +1646,7 @@ fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void 
         // Only press-type input dismisses an active header flash: the
         // release and motion reports that trail a click must not wipe a
         // flash the press itself just raised.
-        .mouse => |mouse| if (mouse.type != .press) return,
+        .mouse => |mouse| if (!interaction.isPress(mouse)) return,
         else => return,
     }
     // Deliberate input always dismisses an active header flash.
@@ -3232,11 +3235,39 @@ test "clicking the dotdot row ascends and it hides at the root" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
 
+    // Browse-only adapters leave the event untouched in command mode.
+    model.mode = .command;
+    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expect(!model.hereCursorOnUp());
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
+    model.mode = .browse;
+
     try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expect(model.hereCursorOnUp());
     try testing.expectEqualStrings(d_path, model.centerListing().path);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
+
+    // The trailing hardware release is not an action and cannot complete the
+    // pending click pair.
+    var ignored = press;
+    inline for (.{ .release, .motion, .drag }) |event_type| {
+        ignored.type = event_type;
+        ctx.consume_event = false;
+        ctx.redraw = false;
+        try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = ignored });
+        try testing.expect(model.hereCursorOnUp());
+        try testing.expectEqualStrings(d_path, model.centerListing().path);
+        try testing.expect(!ctx.consume_event);
+        try testing.expect(!ctx.redraw);
+    }
+    ignored.type = .press;
+    ignored.button = .right;
+    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = ignored });
+    try testing.expectEqualStrings(d_path, model.centerListing().path);
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
 
     ctx.consume_event = false;
     try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
@@ -3390,10 +3421,36 @@ test "double click on a directory descends into it" {
     const index = file_system.indexOfName(model.centerListing(), "child").?;
     const row_widget = model.getPane(.here).rows[index].widget();
 
+    model.mode = .command;
+    try row_widget.handleEvent(&ctx, .{ .mouse = press });
+    try testing.expect(model.clicks.last == null);
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
+    model.mode = .browse;
+
     // First press only moves the cursor.
     try row_widget.handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
     try testing.expectEqual(index, model.hereEntryIndex().?);
+
+    // A release delivered to the same row is ignored and does not interfere
+    // with the press pair.
+    var ignored = press;
+    inline for (.{ .release, .motion, .drag }) |event_type| {
+        ignored.type = event_type;
+        ctx.consume_event = false;
+        ctx.redraw = false;
+        try row_widget.handleEvent(&ctx, .{ .mouse = ignored });
+        try testing.expectEqualStrings(path, model.centerListing().path);
+        try testing.expect(!ctx.consume_event);
+        try testing.expect(!ctx.redraw);
+    }
+    ignored.type = .press;
+    ignored.button = .right;
+    try row_widget.handleEvent(&ctx, .{ .mouse = ignored });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
 
     // Second press inside the window descends.
     try row_widget.handleEvent(&ctx, .{ .mouse = press });
@@ -3401,7 +3458,7 @@ test "double click on a directory descends into it" {
     defer testing.allocator.free(child_path);
     try testing.expectEqualStrings(child_path, model.centerListing().path);
     // The transaction cleared pending click state.
-    try testing.expect(model.last_click == null);
+    try testing.expect(model.clicks.last == null);
 }
 
 test "double click requires the same row within the interval" {
@@ -3458,11 +3515,11 @@ test "double click requires the same row within the interval" {
     // A second press past the interval is just another single click.
     const a_index = file_system.indexOfName(model.centerListing(), "a-dir").?;
     try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
-    model.last_click.?.at_ns -=
+    model.clicks.last.?.at_ns -=
         (double_click_interval_ms + 1) * std.time.ns_per_ms;
     try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    model.last_click = null;
+    model.clicks.last = null;
 
     // Presses on different rows never pair up.
     const b_index = file_system.indexOfName(model.centerListing(), "b-dir").?;
@@ -3518,12 +3575,13 @@ test "a view transaction invalidates pending double clicks" {
     });
     defer model.deinit();
 
-    model.last_click = .{
-        .index = 0,
-        .at_ns = Io.Clock.awake.now(testing.io).nanoseconds,
-    };
+    _ = model.clicks.press(
+        .{ .entry = 0 },
+        Io.Clock.awake.now(testing.io).nanoseconds,
+        double_click_interval_ms * std.time.ns_per_ms,
+    );
     try model.ascend();
-    try testing.expect(model.last_click == null);
+    try testing.expect(model.clicks.last == null);
 }
 
 test "mouse wheel moves cwd one item and is ignored by side panes" {
@@ -3567,6 +3625,13 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
         .type = .press,
     };
 
+    model.mode = .command;
+    try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
+    model.mode = .browse;
+
     const parent_cursor = model.getPane(.parent).list_view.cursor;
     try model.getPane(.parent).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(parent_cursor, model.getPane(.parent).list_view.cursor);
@@ -3587,6 +3652,26 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try testing.expectEqual(@as(u8, 0), model.getPane(.children).list_view.wheel_scroll);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
+
+    const release_command_count = ctx.cmds.items.len;
+    inline for (.{ .release, .motion, .drag }) |event_type| {
+        ctx.consume_event = false;
+        ctx.redraw = false;
+        mouse.type = event_type;
+        try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
+        try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+        try testing.expectEqual(release_command_count, ctx.cmds.items.len);
+        try testing.expect(ctx.consume_event);
+        try testing.expect(!ctx.redraw);
+    }
+    mouse.button = .left;
+    mouse.type = .press;
+    ctx.consume_event = false;
+    try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+    try testing.expect(!ctx.consume_event);
+    try testing.expect(!ctx.redraw);
+    mouse.button = .wheel_down;
 
     // Coalesce duplicate reports from a single physical wheel notch.
     ctx.consume_event = false;

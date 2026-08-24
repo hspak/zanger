@@ -4,13 +4,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const file_system = @import("../file_system.zig");
 const Model = @import("../Model.zig");
+const interaction = @import("interaction.zig");
 const Preview = @import("Preview.zig");
 const Row = @import("Row.zig");
 
@@ -36,24 +36,9 @@ pub const UpRow = struct {
         switch (event) {
             .mouse => |mouse| {
                 if (self.pane.model.mode != .browse) return;
-                if (mouse.button != .left or mouse.type != .press) return;
+                if (!interaction.isLeftPress(mouse)) return;
                 defer ctx.consumeAndRedraw();
-
-                // Single press highlights; a second press inside the
-                // double-click window ascends.
-                const model = self.pane.model;
-                const now_ns = Io.Clock.awake.now(model.io).nanoseconds;
-                const is_double = if (model.up_click_at_ns) |at|
-                    now_ns - at <= Model.double_click_interval_ms * std.time.ns_per_ms
-                else
-                    false;
-                model.up_click_at_ns = if (is_double) null else now_ns;
-                try model.selectUp(ctx);
-                if (!is_double) return;
-
-                model.ascend() catch |err| {
-                    try model.reportError("up", @errorName(err));
-                };
+                try self.pane.model.handleUpClick(ctx);
             },
             else => {},
         }
@@ -159,7 +144,7 @@ fn typeErasedCaptureHandler(
 
     // Some terminals emit release-shaped wheel reports. They are part of
     // the same input action and must not produce another cursor step.
-    if (mouse.type != .press) {
+    if (!interaction.isPress(mouse)) {
         ctx.consumeEvent();
         return;
     }

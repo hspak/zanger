@@ -9,6 +9,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const Pane = @import("Pane.zig");
+const interaction = @import("interaction.zig");
 
 const Row = @This();
 
@@ -36,7 +37,7 @@ fn typeErasedEventHandler(
     switch (event) {
         .mouse => |mouse| {
             if (self.pane.model.mode != .browse) return;
-            if (mouse.button != .left or mouse.type != .press) return;
+            if (!interaction.isLeftPress(mouse)) return;
             if (self.index >= self.pane.itemCount()) return;
             defer ctx.consumeAndRedraw();
             switch (self.pane.role) {
