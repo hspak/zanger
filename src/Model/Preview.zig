@@ -268,7 +268,9 @@ fn appendTextLine(
             else => try line.append(alloc, byte),
         }
     }
-    try lines.append(alloc, try line.toOwnedSlice(alloc));
+    const owned = try line.toOwnedSlice(alloc);
+    errdefer alloc.free(owned);
+    try lines.append(alloc, owned);
 }
 
 test "text file preview splits sanitized lines" {
