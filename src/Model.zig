@@ -24,7 +24,6 @@ pub const Row = @import("Model/Row.zig");
 pub const HereCursor = @import("Model/cursor.zig").Here;
 
 const ListingTransfer = PendingView.ListingTransfer;
-const DirectoryEmptyTransfer = PendingView.DirectoryEmptyTransfer;
 
 const Model = @This();
 
@@ -548,24 +547,6 @@ fn transferTo(transfers: []const ListingTransfer, target: PaneRole) ?ListingTran
     return match;
 }
 
-fn setStagedDirectoryEmpty(
-    pending_view: *PendingView,
-    target: PaneRole,
-    listing: *file_system.Listing,
-    index: usize,
-    is_empty: bool,
-) void {
-    const target_index = target.toIndex();
-    if (pending_view.listing_sources[target_index] != null) {
-        pending_view.directory_empty_transfers[target_index] = .{
-            .index = index,
-            .is_empty = is_empty,
-        };
-    } else {
-        listing.setDirectoryEmpty(index, is_empty);
-    }
-}
-
 fn prepareView(
     self: *Model,
     center_path: []const u8,
@@ -577,7 +558,6 @@ fn prepareView(
     var pending_view: PendingView = .{};
     errdefer pending_view.deinit();
 
-    const center_index = PaneRole.here.toIndex();
     const center_reused = center_reused: {
         const transfer = transferTo(transfers, .here) orelse break :center_reused false;
         const candidate = self.getPane(transfer.source).listing() orelse
@@ -587,14 +567,18 @@ fn prepareView(
         break :center_reused true;
     };
     if (!center_reused) {
-        pending_view.listings[center_index] = try file_system.readDir(
-            self.alloc,
-            self.io,
-            center_path,
-            .{ .show_hidden = self.show_hidden },
+        _ = pending_view.stageOwned(
+            .here,
+            .{ .listing = try file_system.readDir(
+                self.alloc,
+                self.io,
+                center_path,
+                .{ .show_hidden = self.show_hidden },
+            ) },
         );
     }
-    const center = &pending_view.listings[center_index].?;
+    const center_pending = pending_view.pane(.here);
+    const center = center_pending.listing().?;
     if (reject_empty_center and center_reused and try file_system.isDirEmpty(
         self.io,
         center_path,
@@ -602,12 +586,11 @@ fn prepareView(
     )) return error.EmptyDirectory;
     if (reject_empty_center and center.entries.len == 0) return error.EmptyDirectory;
     const center_cursor = center.cursorFor(preferred_name, fallback_cursor);
-    pending_view.cursors[center_index] = @intCast(center_cursor);
+    center_pending.cursor = @intCast(center_cursor);
 
     if (!std.mem.eql(u8, center.path, "/")) {
         const parent_path = try file_system.parentPath(self.alloc, center.path);
         defer self.alloc.free(parent_path);
-        const parent_index = PaneRole.parent.toIndex();
         const parent_reused = parent_reused: {
             const transfer = transferTo(transfers, .parent) orelse
                 break :parent_reused false;
@@ -617,16 +600,14 @@ fn prepareView(
                 break :parent_reused false;
             const parent = pending_view.borrowListing(transfer.source, .parent, candidate.*);
             const parent_cursor = parent.cursorFor(std.fs.path.basename(center.path), null);
-            pending_view.cursors[parent_index] = @intCast(parent_cursor);
-            pending_view.cwd_indices[parent_index] = parent_cursor;
-            pending_view.directory_empty_transfers[parent_index] = .{
-                .index = parent_cursor,
-                .is_empty = center.entries.len == 0,
-            };
+            const parent_pending = pending_view.pane(.parent);
+            parent_pending.cursor = @intCast(parent_cursor);
+            parent_pending.cwd_index = parent_cursor;
+            parent_pending.setDirectoryEmpty(parent_cursor, center.entries.len == 0);
             break :parent_reused true;
         };
         if (!parent_reused) {
-            pending_view.listings[parent_index] = file_system.readDir(
+            const parent_listing = file_system.readDir(
                 self.alloc,
                 self.io,
                 parent_path,
@@ -638,14 +619,17 @@ fn prepareView(
                     break :parent_listing null;
                 },
             };
-            if (pending_view.listings[parent_index]) |*parent| {
+            if (parent_listing) |listing| {
+                _ = pending_view.stageOwned(.parent, .{ .listing = listing });
+                const parent_pending = pending_view.pane(.parent);
+                const parent = parent_pending.listing().?;
                 const parent_cursor = parent.cursorFor(
                     std.fs.path.basename(center.path),
                     null,
                 );
                 parent.setDirectoryEmpty(parent_cursor, center.entries.len == 0);
-                pending_view.cursors[parent_index] = @intCast(parent_cursor);
-                pending_view.cwd_indices[parent_index] = parent_cursor;
+                parent_pending.cursor = @intCast(parent_cursor);
+                parent_pending.cwd_index = parent_cursor;
             }
         }
     }
@@ -674,17 +658,17 @@ fn prepareView(
                 std.fs.path.basename(candidate.path),
             );
         if (matches_selected) {
-            setStagedDirectoryEmpty(
-                &pending_view,
-                .here,
-                center,
+            center_pending.setDirectoryEmpty(
                 center_cursor,
                 candidate.entries.len == 0,
             );
             if (candidate.entries.len == 0) {
-                pending_view.previews[PaneRole.children.toIndex()] = try Preview.initMessage(
-                    self.alloc,
-                    "empty directory",
+                _ = pending_view.stageOwned(
+                    .children,
+                    .{ .preview = try Preview.initMessage(
+                        self.alloc,
+                        "empty directory",
+                    ) },
                 );
             } else {
                 const transfer = children_transfer.?;
@@ -694,7 +678,7 @@ fn prepareView(
                     candidate.*,
                 );
                 _ = children;
-                pending_view.cursors[PaneRole.children.toIndex()] =
+                pending_view.pane(.children).cursor =
                     self.getPane(transfer.source).list_view.cursor;
             }
             reused_applied = true;
@@ -702,41 +686,35 @@ fn prepareView(
     }
 
     if (!reused_applied) {
-        const child_index = PaneRole.children.toIndex();
         if (center.entries.len == 0) {
-            pending_view.previews[child_index] = try Preview.initMessage(
-                self.alloc,
-                "empty directory",
+            _ = pending_view.stageOwned(
+                .children,
+                .{ .preview = try Preview.initMessage(
+                    self.alloc,
+                    "empty directory",
+                ) },
             );
         } else {
             const entry = center.entries[center_cursor];
-            const outcome = try self.buildChildrenOutcome(
+            var outcome = try self.buildChildrenOutcome(
                 center.path,
                 entry,
                 if (pending_view.cursor_status) |status| status.metadata else null,
             );
+            defer outcome.content.deinit();
             if (outcome.error_name) |error_name| {
                 pending_view.rememberErrorName(error_name);
             } else {
                 if (outcome.dir_is_empty) |is_empty| {
-                    setStagedDirectoryEmpty(
-                        &pending_view,
-                        .here,
-                        center,
-                        center_cursor,
-                        is_empty,
-                    );
+                    center_pending.setDirectoryEmpty(center_cursor, is_empty);
                 }
-                // Null content: the entry shows nothing, such as a
-                // non-directory symbolic link.
-                if (outcome.content) |content| switch (content) {
-                    .listing => |listing| {
-                        pending_view.listings[child_index] = listing;
-                        pending_view.cursors[child_index] = 0;
+                switch (outcome.content) {
+                    .empty => {},
+                    else => {
+                        _ = pending_view.stageOwned(.children, outcome.content);
+                        outcome.content = .empty;
                     },
-                    .preview => |preview| pending_view.previews[child_index] = preview,
-                    .none => {},
-                };
+                }
             }
         }
     }
@@ -744,17 +722,11 @@ fn prepareView(
     return pending_view;
 }
 
-const ChildrenContent = union(enum) {
-    listing: file_system.Listing,
-    preview: Preview,
-    none,
-};
-
 /// What CHILDREN should display for HERE's cursor entry. Only allocation
 /// failure propagates as an error; every other failure is reported through
 /// `error_name` so each caller degrades independently.
 const ChildrenOutcome = struct {
-    content: ?ChildrenContent = null,
+    content: Pane.Content = .empty,
     /// Set when a directory listing was read; whether it had no visible
     /// entries. Null when no directory was read.
     dir_is_empty: ?bool = null,
@@ -871,9 +843,10 @@ fn replaceAnchoredView(
     );
     defer pending_view.deinit();
 
-    const next_center = &pending_view.listings[PaneRole.here.toIndex()].?;
+    const next_center_pending = pending_view.pane(.here);
+    const next_center = next_center_pending.listing().?;
     if (options.restore_here_from) |previous| {
-        std.debug.assert(pending_view.listing_sources[PaneRole.here.toIndex()] == null);
+        std.debug.assert(next_center_pending.listing_source == null);
         // Rewrite only rows whose selection bit changed; work is proportional
         // to restored selections, not to the size of the new listing.
         for (previous.entries, 0..) |entry, index| {
@@ -889,12 +862,7 @@ fn replaceAnchoredView(
     var made: usize = 0;
     errdefer for (rows[0..made]) |slice| self.alloc.free(slice);
     for (&rows, 0..) |*slice, index| {
-        const count = if (pending_view.listings[index]) |listing|
-            listing.entries.len
-        else if (pending_view.previews[index]) |preview|
-            preview.lines.len
-        else
-            0;
+        const count = pending_view.panes[index].content.itemCount();
         slice.* = try self.makeRows(&self.panes[index], count);
         made += 1;
     }
@@ -912,46 +880,16 @@ fn replaceAnchoredView(
     // changing or free userdata still retained by vxfw's previous frame.
     try self.retired_rows.ensureUnusedCapacity(self.alloc, self.panes.len);
 
-    for (pending_view.directory_empty_transfers, 0..) |maybe_empty, target_index| {
-        const empty_transfer = maybe_empty orelse continue;
-        const source_role = pending_view.listing_sources[target_index].?;
-        const source = self.getPane(source_role);
-        source.listing().?.setDirectoryEmpty(empty_transfer.index, empty_transfer.is_empty);
-    }
+    pending_view.applyDeferredListingMutations(&self.panes);
 
     // No fallible work may remain once live panes begin changing.
     if (pending_watch) |watch| self.watcher.commit(watch);
 
-    var detached_sources: [3]bool = .{ false, false, false };
-    for (pending_view.listing_sources) |maybe_source| {
-        const source_role = maybe_source orelse continue;
-        const source_index = source_role.toIndex();
-        std.debug.assert(!detached_sources[source_index]);
-        const source = self.getPane(source_role);
-        std.debug.assert(source.listing() != null);
-        source.content = .empty;
-        detached_sources[source_index] = true;
-    }
+    pending_view.detachTransferredSources(&self.panes);
 
     for (&self.panes, 0..) |*pane, index| {
-        std.debug.assert(
-            pending_view.listings[index] == null or
-                pending_view.previews[index] == null,
-        );
-        const content: Pane.Content = if (pending_view.listings[index]) |listing|
-            .{ .listing = listing }
-        else if (pending_view.previews[index]) |preview|
-            .{ .preview = preview }
-        else
-            .empty;
-        pane.replace(.{
-            .content = content,
-            .rows = rows[index],
-            .cursor = pending_view.cursors[index],
-            .cwd_index = pending_view.cwd_indices[index],
-        });
-        pending_view.listings[index] = null;
-        pending_view.previews[index] = null;
+        const role: PaneRole = @enumFromInt(index);
+        pane.replace(pending_view.takeForInstall(role, rows[index]));
     }
     self.alloc.free(self.message);
     self.message = next_message;
@@ -1069,11 +1007,12 @@ fn syncRight(self: *Model) !void {
             }
         }
 
-        const outcome = try self.buildChildrenOutcome(
+        var outcome = try self.buildChildrenOutcome(
             center.path,
             entry,
             if (self.cursor_status) |status| status.metadata else null,
         );
+        defer outcome.content.deinit();
         if (outcome.error_name) |error_name| {
             try self.clearPane(.children);
             try self.setMessage("preview unavailable: {s}", .{error_name});
@@ -1084,11 +1023,8 @@ fn syncRight(self: *Model) !void {
         if (outcome.dir_is_empty) |is_empty| {
             center.setDirectoryEmpty(center_cursor, is_empty);
         }
-        if (outcome.content) |content| switch (content) {
-            .listing => |listing| replacement = .{ .listing = listing },
-            .preview => |preview| replacement = .{ .preview = preview },
-            .none => {},
-        };
+        replacement = outcome.content;
+        outcome.content = .empty;
     }
 
     try self.installPane(.children, &replacement, 0, null);
