@@ -58,13 +58,6 @@ pub const Content = union(enum) {
             else => null,
         };
     }
-
-    pub fn previewConst(self: *const Content) ?*const Preview {
-        return switch (self.*) {
-            .preview => |*payload| payload,
-            else => null,
-        };
-    }
 };
 
 /// The clickable `..` line above the HERE listing. Lives inside its pane so
@@ -316,10 +309,6 @@ pub fn listingConst(self: *const Pane) ?*const file_system.Listing {
 
 pub fn preview(self: *Pane) ?*Preview {
     return self.content.previewPtr();
-}
-
-pub fn previewConst(self: *const Pane) ?*const Preview {
-    return self.content.previewConst();
 }
 
 fn buildRow(ptr: *const anyopaque, index: usize, _: usize) ?vxfw.Widget {

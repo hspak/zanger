@@ -50,8 +50,8 @@ preview_schedule: scheduler.Preview = .idle,
 // Left-press bookkeeping shared by HERE entries and the pinned `..` row.
 clicks: interaction.DoubleClickTracker = .{},
 
-/// Authoritative logical cursor for HERE. The vxfw and listing cursors are
-/// projections updated only by `applyHereCursor` and view commit.
+/// Authoritative logical cursor for HERE. The vxfw `ListView` cursor is
+/// projected only by `applyHereCursor` and view commit.
 here_cursor: HereCursor = .none,
 /// Transient blocked-input notice rendered beside the header path.
 flash: ?Flash = null,

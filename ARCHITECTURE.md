@@ -15,7 +15,11 @@ The executable is split into a small entry point and focused modules:
 | [`src/Model/Pane.zig`](src/Model/Pane.zig) | One pane's owned listing or preview, its row widgets, and wheel capture |
 | [`src/Model/PendingView.zig`](src/Model/PendingView.zig) | Stages all-or-nothing pane and watcher replacement content |
 | [`src/Model/Row.zig`](src/Model/Row.zig) | Stable row widgets for click identity, clipping, and metadata styling |
-| [`src/Model/Preview.zig`](src/Model/Preview.zig) | File metadata sheets and placeholder messages for the children pane |
+| [`src/Model/Preview.zig`](src/Model/Preview.zig) | Structured text, notice, spacer, and metadata rows for the children pane |
+| [`src/Model/cursor.zig`](src/Model/cursor.zig) | Pure HERE cursor transitions, including the pinned `..` state |
+| [`src/Model/input.zig`](src/Model/input.zig) | One key-to-browse-action policy shared by capture and bubble handlers |
+| [`src/Model/interaction.zig`](src/Model/interaction.zig) | Actionable mouse-event recognition and double-click tracking |
+| [`src/Model/scheduler.zig`](src/Model/scheduler.zig) | Pure deferred-preview scheduling state |
 | [`src/Model/FileMetadata.zig`](src/Model/FileMetadata.zig) | One file's `statx` metadata |
 | [`src/Model/IdentityCache.zig`](src/Model/IdentityCache.zig) | Cached UID/GID to account-name resolution |
 | [`src/Model/format.zig`](src/Model/format.zig) | Pure permission-bit, size, and timestamp formatters |
@@ -31,6 +35,7 @@ main
  ├─ vxfw.App
  └─ Model
      ├─ Pane / PendingView / Preview / IdentityCache
+     ├─ cursor / input / interaction / scheduler
      ├─ file_system.Listing
      ├─ Watcher
      ├─ command
@@ -51,7 +56,7 @@ In this document, **HERE** or **CWD** means Zanger's current center path. It is
 not necessarily the process working directory after startup.
 
 The center pane is the source of truth. PARENT and CHILDREN are projections of
-its path and cursor:
+its path and the model's logical `HereCursor`:
 
 ```text
                               selected entry
@@ -109,33 +114,36 @@ not a focus cursor.
 
 ## Transactional view replacement
 
-Navigation, reloads, hidden filtering, deletion refreshes, and watcher refreshes
+Navigation, rebuilds, hidden filtering, deletion refreshes, and watcher refreshes
 can require several listings and previews to change together. Installing those
 pieces one at a time would allow allocation or filesystem failures to leave the
 panes describing different paths. `PendingView` provides the transaction.
 
-It stages newly owned content and records borrowed live listings:
+Each pane owns exactly one tagged `Pane.Content`: empty, a directory listing, or
+a preview. `PendingView` mirrors that ownership as three `PendingPane` values,
+keeping every staged payload beside the state and deferred mutation that apply
+to it:
 
-| Staged field | Purpose |
+| Staged state | Purpose |
 |---|---|
-| `listings[3]` | Prepared directory listings for each pane role |
-| `previews[3]` | Prepared metadata or placeholder content |
-| `cursors[3]` | Cursor to install with each pane |
-| `cwd_indices[3]` | Stable PARENT marker |
-| `preview_error_name` | Non-fatal side-preview error to report after commit |
-| `listing_sources[3]` | Live source role borrowed by each target role |
-| `directory_empty_transfers[3]` | Deferred emptiness updates for borrowed listings |
+| `panes[3].content` | One tagged payload for each pane role |
+| `panes[3].cursor` / `cwd_index` | Framework cursor and stable PARENT marker installed with that payload |
+| `panes[3].listing_source` | Live source role when a listing is borrowed for transfer |
+| `panes[3].directory_empty_transfer` | Deferred mutation kept beside its borrowed listing |
+| `cursor_status` / `preview_error_name` | Model-level CHILDREN state committed with the panes |
 
 The replacement flow is:
 
 ```text
-navigation / reload / refresh request
+navigation / rebuild / refresh request
         │
+        ├─ derive transfer and restoration mechanics from `ViewTransition`
         ├─ prepare an inotify watch for the candidate HERE path
         ├─ construct required listings and previews
         ├─ validate every proposed listing transfer
         ├─ restore HERE cursor and selections when requested
         ├─ allocate row widgets and the next status message
+        ├─ reserve retired-row tracking capacity
         │
         └─ no fallible work remains; commit
                  │
@@ -150,7 +158,8 @@ Before commit, an error deinitializes the pending view, cancels its prepared
 watch, and leaves the live view untouched. During commit, ownership is moved,
 not copied. A transferred source pane is detached before replacement, and an
 installed staging slot is cleared so deferred cleanup cannot free its new
-owner's listing.
+owner's listing. Row retirement uses capacity reserved during preparation, so
+commit cannot free widget userdata still referenced by vxfw's previous frame.
 
 ### Listing transfers
 
@@ -174,9 +183,18 @@ Listings moving from HERE into a side pane retain their selection bits. When an
 ascend must reread a potentially stale parent snapshot as the new HERE,
 selection is restored by entry name.
 
-Cursor movement is intentionally smaller than a full view transaction. It
-updates HERE immediately, leaves the last committed CHILDREN content visible,
+Cursor movement is intentionally smaller than a full view transaction. The
+model owns one `HereCursor` (`up`, `entry`, or `none`) and projects it into
+vxfw's HERE `ListView` through one application boundary. Movement updates that
+logical cursor immediately, leaves the last committed CHILDREN content visible,
 and schedules `syncRight` to replace only CHILDREN after input settles.
+
+Both full replacement and `syncRight` use the same `PreparedChildren` result.
+Content, row widgets, compact cursor status, status text, directory-emptiness
+annotation, and row-retirement capacity are prepared before the live CHILDREN
+pane changes. The scheduler is also tagged: dirty work always has an already
+queued servicing tick, while an obsolete queued tick is represented explicitly
+as harmless stale work.
 
 ## Filesystem snapshots and ownership
 
@@ -217,6 +235,11 @@ placeholder message. Binary files keep the metadata sheet under a dimmed
 italic notice reading "non-text files are not rendered", styled like the
 empty-directory placeholder. The read is bounded and debounced like all
 children work, so oversized or slow files cannot affect cursor movement.
+
+Preview rows carry their render meaning directly as `text`, `notice`, `spacer`,
+or `field { label, value }`. Rendering switches on that tag; it never infers a
+metadata field from a row index or a colon in display text. Tests can therefore
+query fields by label while a separate layout test protects their order.
 
 Symbolic links render like their targets: content reads and the sheet's
 `statx` resolve through the link (the bottom status bar keeps describing the
@@ -414,7 +437,16 @@ root ──capture──▶ focused target ──bubble──▶ root
 Propagation stops when a handler consumes the event. HERE's focused `ListView`
 consumes its built-in movement keys at the target phase, so `Model` handles
 movement in its root capture handler when it must also invalidate CHILDREN.
-Unconsumed browse commands bubble to the model.
+Unconsumed browse commands bubble to the model. `input.browseAction` decodes a
+key once and tags the resulting action as capture- or bubble-owned, so the two
+framework phases do not maintain separate key maps. Event adapters own event
+consumption, redraw, and the single action-level error report.
+
+Mouse adapters use shared interaction predicates to accept only actionable
+presses. One `DoubleClickTracker` covers HERE entries and `..`; it tags the
+target and invalidates its view generation after every committed replacement,
+so releases, motion, different targets, and presses from an old view cannot
+complete an action.
 
 `requestFocus` queues a command rather than changing focus immediately. vxfw
 sends focus-out/focus-in and applies the new target before the next layout.
@@ -597,17 +629,22 @@ deliberately not attempted.
 ## Verification
 
 `zig build test` runs parser, filesystem, watcher, model, headless rendering,
-navigation, selection, deletion, timestamp, and command-completion coverage.
-`zig build profile-check` guards the performance budgets above. Tests that draw
-widgets directly create and deinitialize their own arenas; multi-frame profile
-workloads reset theirs before each frame to mirror vxfw's production lifetime.
+navigation, selection, deletion, timestamp, command-completion, transition,
+mixed-input invariant, and allocation-failure coverage. `Model.assertValid`
+checks committed pane ownership, row/cursor bounds, anchored paths, projections,
+and selection counts throughout integration sequences. `zig build
+profile-check` guards the performance budgets above. Tests that draw widgets
+directly create and deinitialize their own arenas; multi-frame profile workloads
+reset theirs before each frame to mirror vxfw's production lifetime.
 
-The architecture is built around three boundaries:
+The architecture is built around four boundaries:
 
-1. HERE is the single navigation anchor.
-2. `PendingView` is the failure-atomic ownership boundary for pane and watcher
-   replacement.
-3. The vxfw frame arena is the lifetime boundary for everything produced by
+1. HERE has one model-owned logical cursor and one mutation boundary.
+2. `Pane.Content` and `PendingPane` make live and staged payload ownership
+   explicit.
+3. `PendingView` and `PreparedChildren` are failure-atomic prepare/commit
+   boundaries for full and CHILDREN-only replacement.
+4. The vxfw frame arena is the lifetime boundary for everything produced by
    drawing.
 
 Keeping those boundaries explicit is what allows pane reuse, live refresh, and
