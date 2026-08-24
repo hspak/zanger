@@ -51,9 +51,9 @@ last_click: ?LastClick = null,
 /// detection.
 up_click_at_ns: ?i128 = null,
 
-/// True while the HERE cursor rests on the `..` row. The listing cursor
-/// keeps pointing at its last real entry; every consumer branches on this.
-up_selected: bool = false,
+/// Authoritative logical cursor for HERE. The vxfw and listing cursors are
+/// projections updated only by `applyHereCursor` and view commit.
+here_cursor: HereCursor = .none,
 /// Transient blocked-input notice rendered beside the header path until
 /// `error_deadline`, then cleared on a watcher tick.
 error_message: ?[]u8 = null,
@@ -89,6 +89,12 @@ const preview_debounce_ms = 12;
 const wheel_coalesce_ms = 12;
 
 const WheelDirection = Pane.WheelDirection;
+
+const CursorScroll = enum {
+    none,
+    ensure_visible,
+    jump,
+};
 
 const LastClick = struct {
     index: usize,
@@ -301,6 +307,66 @@ fn centerListing(self: *Model) *file_system.Listing {
     return &self.getPane(.here).listing.?;
 }
 
+fn normalizeHereCursor(self: *Model, target: HereCursor) HereCursor {
+    const pane = self.getPane(.here);
+    const listing = &(pane.listing orelse return .none);
+    return switch (target) {
+        .none => HereCursor.fromEntryCount(listing.entries.len, 0),
+        .entry => |index| HereCursor.fromEntryCount(listing.entries.len, index),
+        .up => |remembered| if (pane.showsUpRow())
+            .{ .up = if (listing.entries.len == 0)
+                null
+            else
+                @min(remembered orelse 0, listing.entries.len - 1) }
+        else
+            HereCursor.fromEntryCount(listing.entries.len, remembered orelse 0),
+    };
+}
+
+/// Applies HERE's logical cursor to its vxfw and temporary listing mirrors.
+/// Returns whether the logical target changed.
+fn applyHereCursor(
+    self: *Model,
+    target: HereCursor,
+    scroll: CursorScroll,
+) bool {
+    const normalized = self.normalizeHereCursor(target);
+    if (self.here_cursor.eql(normalized)) return false;
+
+    self.here_cursor = normalized;
+    const pane = self.getPane(.here);
+    const numeric_index = normalized.rememberedEntry() orelse 0;
+    pane.list_view.cursor = @intCast(numeric_index);
+    if (pane.listing) |*listing| listing.cursor = numeric_index;
+    if (!normalized.isUp()) switch (scroll) {
+        .none => {},
+        .ensure_visible => pane.list_view.ensureScroll(),
+        .jump => pane.list_view.jumpToItem(@intCast(numeric_index)),
+    };
+    return true;
+}
+
+fn setHereCursor(
+    self: *Model,
+    ctx: *vxfw.EventContext,
+    target: HereCursor,
+    scroll: CursorScroll,
+) Allocator.Error!bool {
+    const changed = self.applyHereCursor(target, scroll);
+    if (changed) try self.deferRightSync(ctx);
+    return changed;
+}
+
+/// Selects HERE's pinned `..` row while remembering the current real entry.
+pub fn selectUp(self: *Model, ctx: *vxfw.EventContext) Allocator.Error!void {
+    if (!self.getPane(.here).showsUpRow()) return;
+    _ = try self.setHereCursor(
+        ctx,
+        .{ .up = self.here_cursor.rememberedEntry() },
+        .none,
+    );
+}
+
 /// Asserts the model's structural invariants without allocating or touching
 /// the filesystem. Kept in production builds so Debug callers can validate
 /// every commit boundary; tests also call it after mixed action sequences.
@@ -334,7 +400,22 @@ pub fn assertValid(self: *const Model) void {
         }
     }
 
-    if (self.up_selected) std.debug.assert(here.showsUpRow());
+    switch (self.here_cursor) {
+        .none => std.debug.assert(center.entries.len == 0),
+        .up => |remembered| {
+            std.debug.assert(here.showsUpRow());
+            if (remembered) |index| {
+                std.debug.assert(index < center.entries.len);
+                std.debug.assert(index == center.cursor);
+            } else {
+                std.debug.assert(center.entries.len == 0);
+            }
+        },
+        .entry => |index| {
+            std.debug.assert(index < center.entries.len);
+            std.debug.assert(index == center.cursor);
+        },
+    }
     if (self.panes[PaneRole.parent.toIndex()].listing) |parent| {
         const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
         std.debug.assert(cwd_index < parent.entries.len);
@@ -351,7 +432,7 @@ pub fn assertValid(self: *const Model) void {
     }
 
     const children = &self.panes[PaneRole.children.toIndex()];
-    if (!self.preview_dirty and !self.up_selected and children.listing != null) {
+    if (!self.preview_dirty and !self.here_cursor.isUp() and children.listing != null) {
         std.debug.assert(center.entries.len > 0);
         const entry = center.entries[center.cursor];
         const child = children.listing.?;
@@ -881,7 +962,11 @@ fn replaceAnchoredView(
     // it: row indices belong to different listings.
     self.last_click = null;
     self.up_click_at_ns = null;
-    self.up_selected = false;
+    const committed_center = self.centerListing();
+    self.here_cursor = HereCursor.fromEntryCount(
+        committed_center.entries.len,
+        committed_center.cursor,
+    );
     self.assertValid();
 }
 
@@ -961,7 +1046,7 @@ fn syncRight(self: *Model) !void {
     var replacement_preview: ?Preview = null;
     errdefer if (replacement_preview) |*preview| preview.deinit();
 
-    if (self.up_selected and self.getPane(.here).showsUpRow()) {
+    if (self.here_cursor.isUp() and self.getPane(.here).showsUpRow()) {
         // Highlighting `..`: hint at what it does instead of previewing the
         // remembered entry.
         self.cursor_status = null;
@@ -1207,27 +1292,13 @@ pub fn ascend(self: *Model) !void {
 
 fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
-    // Step between the real entries and the `..` row above them.
-    if (down and self.up_selected) {
-        self.up_selected = false;
-        try self.deferRightSync(ctx);
-        return;
-    }
-    if (!down) {
-        // Already on `..`: nothing exists above it, so further ups are
-        // no-ops and must not clear the selection back onto entry zero.
-        if (self.up_selected) return;
-        if (pane.list_view.cursor == 0 and pane.showsUpRow()) {
-            self.up_selected = true;
-            try self.deferRightSync(ctx);
-            return;
-        }
-    }
-
-    const before = pane.list_view.cursor;
-    if (down) pane.list_view.nextItem(ctx) else pane.list_view.prevItem(ctx);
-    if (pane.listing) |*listing| listing.cursor = pane.list_view.cursor;
-    if (pane.list_view.cursor != before) try self.deferRightSync(ctx);
+    const listing = &(pane.listing orelse return);
+    const target = self.here_cursor.step(
+        down,
+        listing.entries.len,
+        pane.showsUpRow(),
+    );
+    _ = try self.setHereCursor(ctx, target, .ensure_visible);
 }
 
 /// Handles a left press on a HERE row. A single press moves the cursor; a
@@ -1238,12 +1309,7 @@ pub fn handleRowClick(
     ctx: *vxfw.EventContext,
     index: usize,
 ) Allocator.Error!void {
-    const pane = self.getPane(.here);
-    self.up_selected = false;
-    const previous_cursor = pane.list_view.cursor;
-    pane.list_view.cursor = @intCast(index);
-    if (pane.listing) |*listing| listing.cursor = index;
-    if (previous_cursor != index) try self.deferRightSync(ctx);
+    _ = try self.setHereCursor(ctx, .{ .entry = index }, .none);
 
     const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
     const is_double = if (self.last_click) |click|
@@ -1326,40 +1392,29 @@ pub fn handleWheel(
 fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
-    if (listing.entries.len == 0 or self.up_selected and !down) {
+    if (listing.entries.len == 0 or self.here_cursor.isUp() and !down) {
         ctx.consumeEvent();
         return;
     }
-    self.up_selected = false;
 
     const distance = @max(@as(usize, 1), @as(usize, self.cwd_visible_rows) / 2);
-    const current: usize = pane.list_view.cursor;
-    const target = if (down)
-        @min(current +| distance, listing.entries.len - 1)
-    else
-        current -| distance;
-    if (target == current) {
+    const target = self.here_cursor.halfPage(
+        down,
+        listing.entries.len,
+        distance,
+    );
+    if (!try self.setHereCursor(ctx, target, .ensure_visible)) {
         ctx.consumeEvent();
         return;
     }
-
-    pane.list_view.cursor = @intCast(target);
-    pane.list_view.ensureScroll();
-    listing.cursor = target;
-    try self.deferRightSync(ctx);
     ctx.consumeAndRedraw();
 }
 
 fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
-    if (listing.entries.len == 0) return;
-    self.up_selected = false;
-    const target: u32 = if (bottom) @intCast(listing.entries.len - 1) else 0;
-    const previous_cursor = pane.list_view.cursor;
-    pane.list_view.jumpToItem(target);
-    listing.cursor = target;
-    if (previous_cursor != target) try self.deferRightSync(ctx);
+    const target = HereCursor.jump(listing.entries.len, bottom);
+    _ = try self.setHereCursor(ctx, target, .jump);
 }
 
 fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
@@ -1369,10 +1424,8 @@ fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
     listing.toggleSelected();
     try self.setMessage("", .{});
 
-    const previous_cursor = pane.list_view.cursor;
-    pane.list_view.nextItem(ctx);
-    listing.cursor = pane.list_view.cursor;
-    if (pane.list_view.cursor != previous_cursor) try self.deferRightSync(ctx);
+    const target = self.here_cursor.step(true, listing.entries.len, pane.showsUpRow());
+    _ = try self.setHereCursor(ctx, target, .ensure_visible);
 }
 
 fn selectedCount(self: *const Model) usize {
@@ -1493,7 +1546,8 @@ fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
 
 /// Whether the HERE cursor currently highlights the `..` row.
 pub fn hereCursorOnUp(self: *const Model) bool {
-    return self.up_selected and self.panes[PaneRole.here.toIndex()].showsUpRow();
+    return self.here_cursor.isUp() and
+        self.panes[PaneRole.here.toIndex()].showsUpRow();
 }
 
 /// Drops any active flash immediately in response to user input.
@@ -2186,9 +2240,7 @@ test "ctrl-d and ctrl-u move half the visible cwd rows" {
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
-    const pane = model.getPane(.here);
-    pane.list_view.cursor = 18;
-    model.centerListing().cursor = 18;
+    _ = model.applyHereCursor(.{ .entry = 18 }, .none);
     ctx.consume_event = false;
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = ctrl_d });
@@ -2442,10 +2494,10 @@ test "delete recursively removes selected directories and their children" {
 
     const listing = model.centerListing();
     const directory_index = file_system.indexOfName(listing, "selected").?;
-    listing.cursor = directory_index;
+    _ = model.applyHereCursor(.{ .entry = directory_index }, .none);
     listing.toggleSelected();
     const file_index = file_system.indexOfName(listing, "selected.txt").?;
-    listing.cursor = file_index;
+    _ = model.applyHereCursor(.{ .entry = file_index }, .none);
     listing.toggleSelected();
 
     try model.executeDelete();
@@ -2501,8 +2553,7 @@ test "delete keeps the cursor row and clamps it at the end" {
 
     var listing = model.centerListing();
     const middle_index = file_system.indexOfName(listing, "b.txt").?;
-    listing.cursor = middle_index;
-    model.getPane(.here).list_view.cursor = @intCast(middle_index);
+    _ = model.applyHereCursor(.{ .entry = middle_index }, .none);
 
     try model.executeDelete();
 
@@ -2558,8 +2609,7 @@ test "enter on a file opens it through the system opener" {
     model.open_recorder = &opened;
 
     const index = file_system.indexOfName(model.centerListing(), "f.txt").?;
-    model.centerListing().cursor = index;
-    model.getPane(.here).list_view.cursor = @intCast(index);
+    _ = model.applyHereCursor(.{ .entry = index }, .none);
 
     const enter: Key = .{ .codepoint = Key.enter };
     var ctx: vxfw.EventContext = .{
@@ -2581,8 +2631,7 @@ test "enter on a file opens it through the system opener" {
 
     // Directories still descend and are never sent to the opener.
     const dir_index = file_system.indexOfName(model.centerListing(), "sub").?;
-    model.centerListing().cursor = dir_index;
-    model.getPane(.here).list_view.cursor = @intCast(dir_index);
+    _ = model.applyHereCursor(.{ .entry = dir_index }, .none);
     ctx.cmds.clearRetainingCapacity();
     try model.handleEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqual(@as(usize, 1), opened.items.len);
@@ -2649,8 +2698,7 @@ test "executable files are excluded from the system opener" {
     // The keyboard path refuses executables, including behind a symlink.
     for ([_][]const u8{ "run.sh", "linked.sh" }) |name| {
         const index = file_system.indexOfName(model.centerListing(), name).?;
-        model.centerListing().cursor = index;
-        model.getPane(.here).list_view.cursor = @intCast(index);
+        _ = model.applyHereCursor(.{ .entry = index }, .none);
         ctx.cmds.clearRetainingCapacity();
         try model.handleEvent(&ctx, .{ .key_press = enter });
         try testing.expectEqualStrings(
@@ -2732,8 +2780,7 @@ test "flashed errors render red beside the path and expire" {
     // Rebuild HERE so run.sh is visible.
     try model.replaceAnchoredView(path, .{});
     const index = file_system.indexOfName(model.centerListing(), "run.sh").?;
-    model.centerListing().cursor = index;
-    model.getPane(.here).list_view.cursor = @intCast(index);
+    _ = model.applyHereCursor(.{ .entry = index }, .none);
     try model.openCenter();
 
     try testing.expectEqualStrings(
@@ -2812,8 +2859,7 @@ test "a failed system open reports the spawn error" {
     model.open_program = "/nonexistent/opener-for-tests";
 
     const index = file_system.indexOfName(model.centerListing(), "f.txt").?;
-    model.centerListing().cursor = index;
-    model.getPane(.here).list_view.cursor = @intCast(index);
+    _ = model.applyHereCursor(.{ .entry = index }, .none);
 
     const enter: Key = .{ .codepoint = Key.enter };
     var ctx: vxfw.EventContext = .{
@@ -2868,7 +2914,7 @@ test "stepping onto dotdot hints and enter ascends" {
     // k from the first entry steps up onto '..'.
     const up_key: Key = .{ .codepoint = 'k' };
     try model.captureEvent(&ctx, .{ .key_press = up_key });
-    try testing.expect(model.up_selected);
+    try testing.expect(model.hereCursorOnUp());
 
     // The children pane hints instead of previewing a stale entry.
     try model.syncRight();
@@ -2898,13 +2944,13 @@ test "stepping onto dotdot hints and enter ascends" {
     const enter: Key = .{ .codepoint = Key.enter };
     try model.handleEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqualStrings(root_path, model.centerListing().path);
-    try testing.expect(!model.up_selected);
+    try testing.expect(!model.hereCursorOnUp());
 
     // j steps back off '..' and the children pane resumes normally.
     const down_key: Key = .{ .codepoint = 'j' };
-    model.up_selected = true;
+    _ = model.applyHereCursor(.{ .up = model.here_cursor.rememberedEntry() }, .none);
     try model.captureEvent(&ctx, .{ .key_press = down_key });
-    try testing.expect(!model.up_selected);
+    try testing.expect(!model.hereCursorOnUp());
     try model.syncRight();
     try testing.expect(model.cursor_status != null);
 }
@@ -3020,8 +3066,7 @@ test "repeated up keys hold the dotdot selection" {
 
     // Start below the top so the first press is an ordinary move.
     const z_index = file_system.indexOfName(model.centerListing(), "z.txt").?;
-    model.centerListing().cursor = z_index;
-    model.getPane(.here).list_view.cursor = @intCast(z_index);
+    _ = model.applyHereCursor(.{ .entry = z_index }, .none);
 
     var ctx: vxfw.EventContext = .{
         .io = testing.io,
@@ -3042,7 +3087,7 @@ test "repeated up keys hold the dotdot selection" {
     }
 
     // The selection must rest on `..`, with nothing else highlighted.
-    try testing.expect(model.up_selected);
+    try testing.expect(model.hereCursorOnUp());
     try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3097,7 +3142,7 @@ test "dotdot selection blocks entry-scoped input and jumps clear it" {
 
     const up_key: Key = .{ .codepoint = 'k' };
     try model.captureEvent(&ctx, .{ .key_press = up_key });
-    try testing.expect(model.up_selected);
+    try testing.expect(model.hereCursorOnUp());
 
     // Space has nothing to toggle.
     const space: Key = .{ .codepoint = Key.space };
@@ -3115,7 +3160,7 @@ test "dotdot selection blocks entry-scoped input and jumps clear it" {
     // Jumping to the bottom clears the '..' selection.
     const jump_key: Key = .{ .codepoint = 'G' };
     try model.handleEvent(&ctx, .{ .key_press = jump_key });
-    try testing.expect(!model.up_selected);
+    try testing.expect(!model.hereCursorOnUp());
     try testing.expectEqualStrings(
         "b.txt",
         model.centerListing().entries[model.centerListing().cursor].name,
@@ -3192,7 +3237,7 @@ test "clicking the dotdot row ascends and it hides at the root" {
     defer ctx.cmds.deinit(ctx.alloc);
 
     try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
-    try testing.expect(model.up_selected);
+    try testing.expect(model.hereCursorOnUp());
     try testing.expectEqualStrings(d_path, model.centerListing().path);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
@@ -3689,8 +3734,7 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     ctx.consume_event = false;
     ctx.redraw = false;
     const cwd_here = file_system.indexOfName(model.centerListing(), "cwd").?;
-    model.centerListing().cursor = cwd_here;
-    model.getPane(.here).list_view.cursor = @intCast(cwd_here);
+    _ = model.applyHereCursor(.{ .entry = cwd_here }, .none);
     try model.openCenter();
     try testing.expectEqualStrings(path, model.centerListing().path);
     ctx.redraw = false;
@@ -3799,8 +3843,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
 
     var center = model.centerListing();
     const beta_index = file_system.indexOfName(center, "beta.txt").?;
-    center.cursor = beta_index;
-    model.getPane(.here).list_view.cursor = @intCast(beta_index);
+    _ = model.applyHereCursor(.{ .entry = beta_index }, .none);
     center.toggleSelected();
     center.rebuildRows();
     try model.setMessage("keep this message", .{});
@@ -4142,8 +4185,7 @@ test "children preview shows empty directories and file metadata" {
 
     const current_center = model.centerListing();
     const file_index = file_system.indexOfName(current_center, "notes.txt").?;
-    current_center.cursor = file_index;
-    model.getPane(.here).list_view.cursor = @intCast(file_index);
+    _ = model.applyHereCursor(.{ .entry = file_index }, .none);
     try model.syncRight();
 
     child_pane = model.getPane(.children);
@@ -4347,8 +4389,7 @@ test "text file preview renders contents without metadata styling" {
     defer model.deinit();
 
     const index = file_system.indexOfName(model.centerListing(), "readme.txt").?;
-    model.centerListing().cursor = index;
-    model.getPane(.here).list_view.cursor = @intCast(index);
+    _ = model.applyHereCursor(.{ .entry = index }, .none);
     try model.syncRight();
 
     const child_pane = model.getPane(.children);
@@ -4415,8 +4456,7 @@ test "directory symlinks list targets and file symlinks render them" {
     const dir_link_index = file_system.indexOfName(center, "dir-link").?;
     try testing.expect(center.entries[dir_link_index].is_sym);
     try testing.expect(center.entries[dir_link_index].is_dir);
-    center.cursor = dir_link_index;
-    model.getPane(.here).list_view.cursor = @intCast(dir_link_index);
+    _ = model.applyHereCursor(.{ .entry = dir_link_index }, .none);
     try model.syncRight();
 
     const link_path = try file_system.joinPath(testing.allocator, path, "dir-link");
@@ -4449,8 +4489,7 @@ test "directory symlinks list targets and file symlinks render them" {
     const file_link_index = file_system.indexOfName(center, "file-link").?;
     try testing.expect(center.entries[file_link_index].is_sym);
     try testing.expect(!center.entries[file_link_index].is_dir);
-    center.cursor = file_link_index;
-    model.getPane(.here).list_view.cursor = @intCast(file_link_index);
+    _ = model.applyHereCursor(.{ .entry = file_link_index }, .none);
     try model.syncRight();
     const link_child = model.getPane(.children);
     try testing.expect(link_child.listing == null);

@@ -48,7 +48,7 @@ pub const UpRow = struct {
                 else
                     false;
                 model.up_click_at_ns = if (is_double) null else now_ns;
-                model.up_selected = true;
+                try model.selectUp(ctx);
                 if (!is_double) return;
 
                 model.ascend() catch |err| {
