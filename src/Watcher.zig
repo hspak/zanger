@@ -5,10 +5,11 @@ const Watcher = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const linux = std.os.linux;
 const log = std.log.scoped(.watcher);
+
+const test_support = @import("test_support.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("Zanger's watcher requires Linux");
@@ -203,66 +204,39 @@ fn remove(self: *Watcher, descriptor: i32) void {
     };
 }
 
-fn tmpAbsPath(alloc: Allocator, temp: *std.testing.TmpDir) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
-    defer alloc.free(cwd);
-    return std.fs.path.join(alloc, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-}
-
 test "reports changes only for the current directory" {
     const testing = std.testing;
-    var first = testing.tmpDir(.{});
-    defer first.cleanup();
-    var second = testing.tmpDir(.{});
-    defer second.cleanup();
-
-    const first_path = try tmpAbsPath(testing.allocator, &first);
-    defer testing.allocator.free(first_path);
-    const second_path = try tmpAbsPath(testing.allocator, &second);
-    defer testing.allocator.free(second_path);
+    var first = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer first.deinit();
+    var second = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer second.deinit();
 
     var watcher = try Watcher.init(testing.io);
     defer watcher.deinit();
-    watcher.commit(try watcher.prepare(first_path));
-    try Io.Dir.writeFile(first.dir, testing.io, .{
-        .sub_path = "first.txt",
-        .data = "first",
-    });
+    watcher.commit(try watcher.prepare(first.path));
+    try first.writeFile("first.txt", "first");
     try testing.expectEqual(Refresh.content, try watcher.drain(true));
     try testing.expectEqual(Refresh.none, try watcher.drain(true));
 
-    watcher.commit(try watcher.prepare(second_path));
-    try Io.Dir.writeFile(first.dir, testing.io, .{
-        .sub_path = "retired.txt",
-        .data = "retired",
-    });
-    try Io.Dir.writeFile(second.dir, testing.io, .{
-        .sub_path = "second.txt",
-        .data = "second",
-    });
+    watcher.commit(try watcher.prepare(second.path));
+    try first.writeFile("retired.txt", "retired");
+    try second.writeFile("second.txt", "second");
     try testing.expectEqual(Refresh.content, try watcher.drain(true));
 }
 
 test "clears a watch invalidated by directory deletion" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.createDir(temp.dir, testing.io, "watched", .default_dir);
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("watched");
 
-    const root_path = try tmpAbsPath(testing.allocator, &temp);
-    defer testing.allocator.free(root_path);
-    const watched_path = try std.fs.path.join(testing.allocator, &.{ root_path, "watched" });
+    const watched_path = try tree.absolutePath("watched");
     defer testing.allocator.free(watched_path);
 
     var watcher = try Watcher.init(testing.io);
     defer watcher.deinit();
     watcher.commit(try watcher.prepare(watched_path));
-    try Io.Dir.deleteDir(temp.dir, testing.io, "watched");
+    try Io.Dir.deleteDir(tree.temp.dir, testing.io, "watched");
 
     try testing.expectEqual(Refresh.rearm, try watcher.drain(true));
     try testing.expect(!watcher.hasCurrent());
@@ -270,25 +244,16 @@ test "clears a watch invalidated by directory deletion" {
 
 test "ignores hidden entry changes when hidden files are excluded" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-
-    const path = try tmpAbsPath(testing.allocator, &temp);
-    defer testing.allocator.free(path);
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
 
     var watcher = try Watcher.init(testing.io);
     defer watcher.deinit();
-    watcher.commit(try watcher.prepare(path));
+    watcher.commit(try watcher.prepare(tree.path));
 
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = ".hidden",
-        .data = "hidden",
-    });
+    try tree.writeFile(".hidden", "hidden");
     try testing.expectEqual(Refresh.none, try watcher.drain(false));
 
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "visible",
-        .data = "visible",
-    });
+    try tree.writeFile("visible", "visible");
     try testing.expectEqual(Refresh.content, try watcher.drain(false));
 }

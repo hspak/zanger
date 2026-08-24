@@ -9,6 +9,8 @@ const Dir = Io.Dir;
 const Path = std.fs.path;
 const log = std.log.scoped(.file_system);
 
+const test_support = @import("test_support.zig");
+
 /// A directory entry whose name is owned by its containing `Listing`.
 pub const Entry = struct {
     /// Owned by the containing `Listing`.
@@ -483,25 +485,6 @@ test "all declarations compile" {
     std.testing.refAllDecls(@This());
 }
 
-fn tmpAbsPath(alloc: Allocator, temp: *std.testing.TmpDir) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(testing_io, alloc);
-    defer alloc.free(cwd);
-    return Path.join(alloc, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-}
-
-fn makeDir(temp: *std.testing.TmpDir, name: []const u8) !void {
-    try Dir.createDir(temp.dir, testing_io, name, .default_dir);
-}
-
-fn makeFile(temp: *std.testing.TmpDir, name: []const u8, data: []const u8) !void {
-    try Dir.writeFile(temp.dir, testing_io, .{ .sub_path = name, .data = data });
-}
-
 test "parentPath returns owned normalized parents" {
     const alloc = testing.allocator;
     const nested_parent = try parentPath(alloc, "/a/b");
@@ -530,19 +513,16 @@ test "joinPath returns an owned joined path" {
 
 test "sort order: dirs then case-insensitive names" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, "b.txt", "b");
-    try makeFile(&temp, "a.txt", "a");
-    try makeFile(&temp, ".hidden", "h");
-    try makeDir(&temp, "zdir");
-    try makeDir(&temp, "A_dir");
+    try tree.writeFile("b.txt", "b");
+    try tree.writeFile("a.txt", "a");
+    try tree.writeFile(".hidden", "h");
+    try tree.createDir("zdir");
+    try tree.createDir("A_dir");
 
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-
-    var listing = try readDir(alloc, testing_io, path, .{});
+    var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
 
     try testing.expectEqual(@as(usize, 4), listing.entries.len);
@@ -555,21 +535,18 @@ test "sort order: dirs then case-insensitive names" {
 
 test "hidden files filtered" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, "a.txt", "a");
-    try makeFile(&temp, ".hidden", "h");
+    try tree.writeFile("a.txt", "a");
+    try tree.writeFile(".hidden", "h");
 
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-
-    var listing = try readDir(alloc, testing_io, path, .{});
+    var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
     try testing.expectEqual(@as(usize, 1), listing.entries.len);
     try testing.expectEqualStrings("a.txt", listing.entries[0].name);
 
-    var hidden_listing = try readDir(alloc, testing_io, path, .{ .show_hidden = true });
+    var hidden_listing = try readDir(alloc, testing_io, tree.path, .{ .show_hidden = true });
     defer hidden_listing.deinit();
     try testing.expectEqual(@as(usize, 2), hidden_listing.entries.len);
     try testing.expect(indexOfName(&hidden_listing, ".hidden") != null);
@@ -577,37 +554,32 @@ test "hidden files filtered" {
 
 test "directory emptiness follows hidden visibility" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, ".hidden", "h");
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
+    try tree.writeFile(".hidden", "h");
 
-    try testing.expect(try isDirEmpty(testing_io, path, .{}));
-    try testing.expect(!try isDirEmpty(testing_io, path, .{ .show_hidden = true }));
+    try testing.expect(try isDirEmpty(testing_io, tree.path, .{}));
+    try testing.expect(!try isDirEmpty(testing_io, tree.path, .{ .show_hidden = true }));
 
-    try makeFile(&temp, "visible", "v");
-    try testing.expect(!try isDirEmpty(testing_io, path, .{}));
+    try tree.writeFile("visible", "v");
+    try testing.expect(!try isDirEmpty(testing_io, tree.path, .{}));
 }
 
 test "symlinks display targets and classify directory targets" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, "target.txt", "12345");
-    try makeDir(&temp, "target-dir");
-    try Dir.symLink(temp.dir, testing_io, "target.txt", "link.txt", .{});
-    try Dir.symLink(temp.dir, testing_io, "target-dir", "link-dir", .{
+    try tree.writeFile("target.txt", "12345");
+    try tree.createDir("target-dir");
+    try tree.symLink("target.txt", "link.txt");
+    try Dir.symLink(tree.temp.dir, testing_io, "target-dir", "link-dir", .{
         .is_directory = true,
     });
-    try Dir.symLink(temp.dir, testing_io, "missing", "dangling", .{});
+    try tree.symLink("missing", "dangling");
 
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-
-    var listing = try readDir(alloc, testing_io, path, .{});
+    var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
 
     const file_link_index = indexOfName(&listing, "link.txt").?;
@@ -639,16 +611,13 @@ test "symlinks display targets and classify directory targets" {
 
 test "restoreCursor prefers names and clamps fallback indices" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, "a.txt", "a");
-    try makeFile(&temp, "b.txt", "b");
+    try tree.writeFile("a.txt", "a");
+    try tree.writeFile("b.txt", "b");
 
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-
-    var listing = try readDir(alloc, testing_io, path, .{});
+    var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
 
     listing.cursor = 0;
@@ -664,15 +633,12 @@ test "restoreCursor prefers names and clamps fallback indices" {
 
 test "selection toggle and count" {
     const alloc = testing.allocator;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeFile(&temp, "a.txt", "a");
+    try tree.writeFile("a.txt", "a");
 
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-
-    var listing = try readDir(alloc, testing_io, path, .{});
+    var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
 
     const row_storage_pointer = listing.row_storage.ptr;
@@ -694,14 +660,12 @@ test "selection toggle and count" {
 }
 
 test "deleteEntry file" {
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-
-    try makeFile(&temp, "gone.txt", "x");
     const alloc = testing.allocator;
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-    const file_path = try joinPath(alloc, path, "gone.txt");
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
+
+    try tree.writeFile("gone.txt", "x");
+    const file_path = try tree.absolutePath("gone.txt");
     defer alloc.free(file_path);
 
     try deleteEntry(testing_io, file_path, false);
@@ -709,28 +673,26 @@ test "deleteEntry file" {
 }
 
 test "deleteEntry recursively deletes a directory tree" {
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
+    const alloc = testing.allocator;
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
 
-    try makeDir(&temp, "sub");
-    try makeDir(&temp, "sub/nested");
-    try makeDir(&temp, "outside");
-    try makeFile(&temp, "sub/inner.txt", "x");
-    try makeFile(&temp, "sub/nested/deep.txt", "x");
-    try makeFile(&temp, "outside/kept.txt", "kept");
+    try tree.createDir("sub");
+    try tree.createDir("sub/nested");
+    try tree.createDir("outside");
+    try tree.writeFile("sub/inner.txt", "x");
+    try tree.writeFile("sub/nested/deep.txt", "x");
+    try tree.writeFile("outside/kept.txt", "kept");
     try Dir.symLink(
-        temp.dir,
+        tree.temp.dir,
         testing_io,
         "../../outside",
         "sub/nested/outside-link",
         .{ .is_directory = true },
     );
-    const alloc = testing.allocator;
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-    const directory_path = try joinPath(alloc, path, "sub");
+    const directory_path = try tree.absolutePath("sub");
     defer alloc.free(directory_path);
-    const outside_path = try joinPath(alloc, path, "outside/kept.txt");
+    const outside_path = try tree.absolutePath("outside/kept.txt");
     defer alloc.free(outside_path);
 
     try deleteEntry(testing_io, directory_path, true);
@@ -742,19 +704,19 @@ test "deleteEntry recursively deletes a directory tree" {
 }
 
 test "deleteEntry unlinks a directory symlink without touching its target" {
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-
-    try makeDir(&temp, "target");
-    try makeFile(&temp, "target/kept.txt", "kept");
-    try Dir.symLink(temp.dir, testing_io, "target", "link", .{ .is_directory = true });
-
     const alloc = testing.allocator;
-    const path = try tmpAbsPath(alloc, &temp);
-    defer alloc.free(path);
-    const link_path = try joinPath(alloc, path, "link");
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
+
+    try tree.createDir("target");
+    try tree.writeFile("target/kept.txt", "kept");
+    try Dir.symLink(tree.temp.dir, testing_io, "target", "link", .{
+        .is_directory = true,
+    });
+
+    const link_path = try tree.absolutePath("link");
     defer alloc.free(link_path);
-    const target_path = try joinPath(alloc, path, "target/kept.txt");
+    const target_path = try tree.absolutePath("target/kept.txt");
     defer alloc.free(target_path);
 
     try deleteEntry(testing_io, link_path, false);

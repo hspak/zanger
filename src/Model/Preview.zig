@@ -10,6 +10,7 @@ const Io = std.Io;
 const FileMetadata = @import("FileMetadata.zig");
 const IdentityCache = @import("IdentityCache.zig");
 const format = @import("format.zig");
+const test_support = @import("../test_support.zig");
 
 /// Upper bound on bytes read from one file for a content preview. Files at or
 /// below this size render fully; larger files show a truncation marker.
@@ -272,22 +273,11 @@ fn appendTextLine(
 
 test "text file preview splits sanitized lines" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "notes.txt",
-        .data = "alpha\r\nbe\tta\nga\x01mma\nfinal",
-    });
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("notes.txt", "alpha\r\nbe\tta\nga\x01mma\nfinal");
 
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-        "notes.txt",
-    });
+    const path = try tree.absolutePath("notes.txt");
     defer testing.allocator.free(path);
 
     var preview = try initTextContent(
@@ -310,28 +300,12 @@ test "text file preview splits sanitized lines" {
 
 test "binary and invalid utf-8 files decline text preview" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "blob.bin",
-        .data = "ok\x00not ok",
-    });
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "mojibake.txt",
-        .data = "\xff\xfe broken",
-    });
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("blob.bin", "ok\x00not ok");
+    try tree.writeFile("mojibake.txt", "\xff\xfe broken");
 
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const dir_path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(dir_path);
-
-    const binary_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "blob.bin" });
+    const binary_path = try tree.absolutePath("blob.bin");
     defer testing.allocator.free(binary_path);
     try testing.expect(try initTextContent(
         testing.allocator,
@@ -341,7 +315,7 @@ test "binary and invalid utf-8 files decline text preview" {
         max_preview_bytes,
     ) == null);
 
-    const invalid_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "mojibake.txt" });
+    const invalid_path = try tree.absolutePath("mojibake.txt");
     defer testing.allocator.free(invalid_path);
     try testing.expect(try initTextContent(
         testing.allocator,
@@ -354,19 +328,11 @@ test "binary and invalid utf-8 files decline text preview" {
 
 test "empty file previews as a placeholder message" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "hollow.txt", .data = "" });
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("hollow.txt", "");
 
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-        "hollow.txt",
-    });
+    const path = try tree.absolutePath("hollow.txt");
     defer testing.allocator.free(path);
 
     var preview = try initTextContent(
@@ -385,22 +351,11 @@ test "empty file previews as a placeholder message" {
 
 test "oversized files truncate with a marker line" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "long.txt",
-        .data = "0123456789\nabcdefghij\nklmnopqrst\n",
-    });
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("long.txt", "0123456789\nabcdefghij\nklmnopqrst\n");
 
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-        "long.txt",
-    });
+    const path = try tree.absolutePath("long.txt");
     defer testing.allocator.free(path);
 
     var preview = try initTextContent(testing.allocator, testing.io, path, null, 16);
@@ -417,23 +372,12 @@ test "oversized files truncate with a marker line" {
 
 test "file symlink sheets follow targets behind the notice" {
     const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{
-        .sub_path = "blob.dat",
-        .data = "bin\x00ary",
-    });
-    try Io.Dir.symLink(temp.dir, testing.io, "blob.dat", "link.dat", .{});
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("blob.dat", "bin\x00ary");
+    try tree.symLink("blob.dat", "link.dat");
 
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-        "link.dat",
-    });
+    const path = try tree.absolutePath("link.dat");
     defer testing.allocator.free(path);
 
     var identities: IdentityCache = .{};
