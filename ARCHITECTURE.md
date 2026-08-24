@@ -16,7 +16,7 @@ The executable is split into a small entry point and focused modules:
 | [`src/Model/PendingView.zig`](src/Model/PendingView.zig) | Stages all-or-nothing pane content and related model state |
 | [`src/Model/Row.zig`](src/Model/Row.zig) | Stable row widgets for click identity, clipping, and metadata styling |
 | [`src/Model/Preview.zig`](src/Model/Preview.zig) | Structured text, notice, spacer, and metadata rows for the children pane |
-| [`src/Model/cursor.zig`](src/Model/cursor.zig) | Pure HERE cursor transitions, including the pinned `..` state |
+| [`src/Model/cursor.zig`](src/Model/cursor.zig) | Pure HERE cursor transitions |
 | [`src/Model/input.zig`](src/Model/input.zig) | One key-to-browse-action policy shared by capture and bubble handlers |
 | [`src/Model/interaction.zig`](src/Model/interaction.zig) | Actionable mouse-event recognition and double-click tracking |
 | [`src/Model/scheduler.zig`](src/Model/scheduler.zig) | Pure deferred-preview scheduling state |
@@ -86,11 +86,7 @@ The model maintains these invariants after every committed operation:
    clicking a parent row ascends into the parent directory with the clicked row
    selected as HERE's cursor (any row kind qualifies), and single-clicking a
    row in a CHILDREN directory listing promotes that listing to HERE with the
-   clicked row selected. Keyboard browse interaction remains HERE-only. HERE
-   also renders a `..` line above its listing except at `/`; a single click or
-   a cursor step onto it highlights it (the children pane then shows a `go up
-   one level` hint, and entry-scoped input like space or deletion is refused
-   until the cursor steps back off), while a double click ascends directly.
+   clicked row selected. Keyboard browse interaction remains HERE-only.
 4. Every non-empty pane has a valid `ListView` cursor and a row-widget array
    parallel to its displayed content.
 5. Selection bitsets have one bit per listing entry. Selection follows a
@@ -289,12 +285,10 @@ visible entries. A no-op click or jump does not rebuild CHILDREN. Side-pane
 clicks navigate: a parent row ascends into the parent directory with that row
 picked as the center cursor, and a row click in a CHILDREN directory listing
 promotes that listing to HERE with the clicked row selected. Preview rows
-consume left presses but do not navigate. HERE renders a cursor-selectable `..`
-line above its listing except at `/`; a single click or cursor step highlights
-it, and a double click ascends. A second left press on the same HERE row within
-400 ms descends when that row is a directory and otherwise applies the same
-regular-file opener policy. Every view transaction clears pending-click state
-so presses cannot pair across listings.
+consume left presses but do not navigate. A second left press on the same HERE
+row within 400 ms descends when that row is a directory and otherwise applies
+the same regular-file opener policy. Every view transaction clears
+pending-click state so presses cannot pair across listings.
 Blocked input — refused opens, empty directory descents, ascent past `/`, or
 deletion with nothing selected — flashes a red notice beside the header path
 for three seconds, cleared on a recurring model tick. Any key press or mouse press
@@ -462,7 +456,7 @@ framework phases do not maintain separate key maps. Event adapters own event
 consumption, redraw, and the single action-level error report.
 
 Mouse adapters use shared interaction predicates to accept only actionable
-presses. One `DoubleClickTracker` covers HERE entries and `..`; it tags the
+presses. One `DoubleClickTracker` covers HERE rows; it tags the
 target and invalidates its view generation after every committed replacement,
 so releases, motion, different targets, and presses from an old view cannot
 complete an action.

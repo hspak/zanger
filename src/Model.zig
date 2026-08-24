@@ -47,7 +47,7 @@ watch_refresh: WatchRefresh = .none,
 // Cursor movement leaves committed CHILDREN content visible until this
 // debounce scheduler commits its replacement.
 preview_schedule: scheduler.Preview = .idle,
-// Left-press bookkeeping shared by HERE entries and the pinned `..` row.
+// Left-press bookkeeping for double-click detection on HERE rows.
 clicks: interaction.DoubleClickTracker = .{},
 
 /// Authoritative logical cursor for HERE. The vxfw `ListView` cursor is
@@ -398,18 +398,10 @@ fn hereEntryIndex(self: *const Model) ?usize {
 }
 
 fn normalizeHereCursor(self: *Model, target: HereCursor) HereCursor {
-    const pane = self.getPane(.here);
-    const listing = pane.listing() orelse return .none;
+    const listing = self.getPane(.here).listing() orelse return .none;
     return switch (target) {
         .none => HereCursor.fromEntryCount(listing.entries.len, 0),
         .entry => |index| HereCursor.fromEntryCount(listing.entries.len, index),
-        .up => |remembered| if (pane.showsUpRow())
-            .{ .up = if (listing.entries.len == 0)
-                null
-            else
-                @min(remembered orelse 0, listing.entries.len - 1) }
-        else
-            HereCursor.fromEntryCount(listing.entries.len, remembered orelse 0),
     };
 }
 
@@ -425,13 +417,13 @@ fn applyHereCursor(
 
     self.here_cursor = normalized;
     const pane = self.getPane(.here);
-    const numeric_index = normalized.rememberedEntry() orelse 0;
+    const numeric_index = normalized.selectedEntry() orelse 0;
     pane.list_view.cursor = @intCast(numeric_index);
-    if (!normalized.isUp()) switch (scroll) {
+    switch (scroll) {
         .none => {},
         .ensure_visible => pane.list_view.ensureScroll(),
         .jump => pane.list_view.jumpToItem(@intCast(numeric_index)),
-    };
+    }
     return true;
 }
 
@@ -445,17 +437,6 @@ fn setHereCursor(
     if (changed) try self.deferRightSync(ctx);
     return changed;
 }
-
-/// Selects HERE's pinned `..` row while remembering the current real entry.
-pub fn selectUp(self: *Model, ctx: *vxfw.EventContext) Allocator.Error!void {
-    if (!self.getPane(.here).showsUpRow()) return;
-    _ = try self.setHereCursor(
-        ctx,
-        .{ .up = self.here_cursor.rememberedEntry() },
-        .none,
-    );
-}
-
 /// Asserts the model's structural invariants without allocating or touching
 /// the filesystem. Kept in production builds so Debug callers can validate
 /// every commit boundary; tests also call it after mixed action sequences.
@@ -488,15 +469,6 @@ pub fn assertValid(self: *const Model) void {
 
     switch (self.here_cursor) {
         .none => std.debug.assert(center.entries.len == 0),
-        .up => |remembered| {
-            std.debug.assert(here.showsUpRow());
-            if (remembered) |index| {
-                std.debug.assert(index < center.entries.len);
-                std.debug.assert(index == here.list_view.cursor);
-            } else {
-                std.debug.assert(center.entries.len == 0);
-            }
-        },
         .entry => |index| {
             std.debug.assert(index < center.entries.len);
             std.debug.assert(index == here.list_view.cursor);
@@ -518,7 +490,7 @@ pub fn assertValid(self: *const Model) void {
     }
 
     const children = &self.panes[PaneRole.children.toIndex()];
-    if (!self.preview_schedule.isDirty() and !self.here_cursor.isUp()) {
+    if (!self.preview_schedule.isDirty()) {
         if (children.listingConst()) |child| {
             std.debug.assert(center.entries.len > 0);
             const entry = center.entries[self.hereEntryIndex().?];
@@ -866,12 +838,6 @@ fn prepareChildren(
     var prepared: PreparedChildren = .{};
     errdefer prepared.deinit();
 
-    if (target.isUp()) {
-        prepared.content = .{
-            .preview = try Preview.initMessage(self.alloc, "go up one level"),
-        };
-        return prepared;
-    }
     if (center.entries.len == 0) {
         prepared.content = .{
             .preview = try Preview.initMessage(self.alloc, "empty directory"),
@@ -1277,10 +1243,6 @@ fn reapChildren() void {
 }
 
 fn openCenter(self: *Model) !void {
-    if (self.hereCursorOnUp()) {
-        try self.ascend();
-        return;
-    }
     const listing = self.centerListing();
     const center_cursor = self.hereEntryIndex() orelse return;
     const entry = listing.entries[center_cursor];
@@ -1314,13 +1276,8 @@ pub fn ascend(self: *Model) !void {
 }
 
 fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
-    const pane = self.getPane(.here);
-    const listing = pane.listing() orelse return;
-    const target = self.here_cursor.step(
-        down,
-        listing.entries.len,
-        pane.showsUpRow(),
-    );
+    const listing = self.getPane(.here).listing() orelse return;
+    const target = self.here_cursor.step(down, listing.entries.len);
     _ = try self.setHereCursor(ctx, target, .ensure_visible);
 }
 
@@ -1336,7 +1293,7 @@ pub fn handleRowClick(
 
     const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
     const is_double = self.clicks.press(
-        .{ .entry = index },
+        index,
         now_ns,
         double_click_interval_ms * std.time.ns_per_ms,
     );
@@ -1353,19 +1310,6 @@ pub fn handleRowClick(
         return;
     }
     try self.openCenter();
-}
-
-/// Handles a left press on HERE's pinned `..` row. One press selects it and a
-/// second press within the shared double-click window ascends.
-pub fn handleUpClick(self: *Model, ctx: *vxfw.EventContext) !void {
-    try self.selectUp(ctx);
-    const is_double = self.clicks.press(
-        .up,
-        Io.Clock.awake.now(self.io).nanoseconds,
-        double_click_interval_ms * std.time.ns_per_ms,
-    );
-    if (!is_double) return;
-    try self.ascend();
 }
 
 /// Navigates HERE into the parent directory with the clicked row selected
@@ -1415,7 +1359,7 @@ pub fn handleWheel(
 fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !bool {
     const pane = self.getPane(.here);
     const listing = pane.listing() orelse return false;
-    if (listing.entries.len == 0 or self.here_cursor.isUp() and !down) {
+    if (listing.entries.len == 0) {
         return false;
     }
 
@@ -1442,7 +1386,7 @@ fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
     listing.toggleSelected(center_cursor);
     try self.setMessage("", .{});
 
-    const target = self.here_cursor.step(true, listing.entries.len, pane.showsUpRow());
+    const target = self.here_cursor.step(true, listing.entries.len);
     _ = try self.setHereCursor(ctx, target, .ensure_visible);
 }
 
@@ -1466,10 +1410,6 @@ fn deleteCount(self: *const Model) usize {
 }
 
 fn beginDelete(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.hereCursorOnUp()) {
-        try self.flashError("nothing safe to delete", .{});
-        return;
-    }
     const count = self.deleteCount();
     if (count == 0) {
         try self.returnToBrowse(ctx);
@@ -1558,12 +1498,6 @@ fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
             .fromMilliseconds(error_flash_ms),
         ),
     };
-}
-
-/// Whether the HERE cursor currently highlights the `..` row.
-pub fn hereCursorOnUp(self: *const Model) bool {
-    return self.here_cursor.isUp() and
-        self.panes[PaneRole.here.toIndex()].showsUpRow();
 }
 
 /// Drops any active flash immediately in response to user input.
@@ -2932,85 +2866,6 @@ test "a failed system open reports the spawn error" {
     reapChildren();
 }
 
-test "stepping onto dotdot hints and enter ascends" {
-    const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.createDir(temp.dir, testing.io, "d", .default_dir);
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "d/inner.txt", .data = "i" });
-
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const root_path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(root_path);
-    const d_path = try std.fs.path.join(testing.allocator, &.{ root_path, "d" });
-    defer testing.allocator.free(d_path);
-
-    var model: Model = undefined;
-    try model.init(testing.allocator, testing.io, .{
-        .start_path = d_path,
-        .user = "tester",
-        .hostname = "host",
-    });
-    defer model.deinit();
-
-    var ctx: vxfw.EventContext = .{
-        .io = testing.io,
-        .alloc = testing.allocator,
-        .cmds = .empty,
-        .redraw = false,
-    };
-    defer ctx.cmds.deinit(ctx.alloc);
-
-    // k from the first entry steps up onto '..'.
-    const up_key: Key = .{ .codepoint = 'k' };
-    try model.captureEvent(&ctx, .{ .key_press = up_key });
-    try testing.expect(model.hereCursorOnUp());
-
-    // The children pane hints instead of previewing a stale entry.
-    try model.syncRight();
-    const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.rows[0] == .notice);
-    try testing.expectEqualStrings("go up one level", child_pane.preview().?.displayTextAt(0).?);
-    try testing.expect(model.cursor_status == null);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const draw_ctx: vxfw.DrawContext = .{
-        .arena = arena.allocator(),
-        .min = .{ .width = 20, .height = 1 },
-        .max = .{ .width = 20, .height = 1 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    };
-    const up_surface = try model.getPane(.here).up_row.widget().draw(draw_ctx);
-    try testing.expect(up_surface.buffer[0].style.reverse);
-
-    // The first real entry must drop its highlight while '..' is selected.
-    const first_row = try model.getPane(.here).rows[0].widget().draw(draw_ctx);
-    try testing.expect(!first_row.buffer[0].style.reverse);
-
-    // Enter on '..' ascends.
-    const enter: Key = .{ .codepoint = Key.enter };
-    try model.handleEvent(&ctx, .{ .key_press = enter });
-    try testing.expectEqualStrings(root_path, model.centerListing().path);
-    try testing.expect(!model.hereCursorOnUp());
-
-    // j steps back off '..' and the children pane resumes normally.
-    const down_key: Key = .{ .codepoint = 'j' };
-    _ = model.applyHereCursor(.{ .up = model.here_cursor.rememberedEntry() }, .none);
-    try model.captureEvent(&ctx, .{ .key_press = down_key });
-    try testing.expect(!model.hereCursorOnUp());
-    try model.syncRight();
-    try testing.expect(model.cursor_status != null);
-}
-
 test "mouse releases do not dismiss a fresh flash" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
@@ -3090,260 +2945,6 @@ test "mouse releases do not dismiss a fresh flash" {
     press.type = .press;
     try model.captureEvent(&ctx, .{ .mouse = press });
     try testing.expect(model.flash == null);
-}
-
-test "repeated up keys hold the dotdot selection" {
-    // Regression: key repeat spamming `k` toggled the highlight between
-    // `..` and the first entry because a redundant clear ran after the
-    // boundary step.
-    const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "z.txt", .data = "z" });
-
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(path);
-
-    var model: Model = undefined;
-    try model.init(testing.allocator, testing.io, .{
-        .start_path = path,
-        .user = "tester",
-        .hostname = "host",
-    });
-    defer model.deinit();
-
-    // Start below the top so the first press is an ordinary move.
-    const z_index = file_system.indexOfName(model.centerListing(), "z.txt").?;
-    _ = model.applyHereCursor(.{ .entry = z_index }, .none);
-
-    var ctx: vxfw.EventContext = .{
-        .io = testing.io,
-        .alloc = testing.allocator,
-        .cmds = .empty,
-        .redraw = false,
-    };
-    defer ctx.cmds.deinit(ctx.alloc);
-    const up_key: Key = .{ .codepoint = 'k' };
-
-    // Hold-the-key spam: three presses in a row.
-    var press: usize = 0;
-    while (press < 3) : (press += 1) {
-        ctx.consume_event = false;
-        ctx.redraw = false;
-        try model.captureEvent(&ctx, .{ .key_press = up_key });
-        try testing.expect(ctx.consume_event);
-    }
-
-    // The selection must rest on `..`, with nothing else highlighted.
-    try testing.expect(model.hereCursorOnUp());
-    try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const draw_ctx: vxfw.DrawContext = .{
-        .arena = arena.allocator(),
-        .min = .{ .width = 20, .height = 1 },
-        .max = .{ .width = 20, .height = 1 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    };
-    const up_surface = try model.getPane(.here).up_row.widget().draw(draw_ctx);
-    try testing.expect(up_surface.buffer[0].style.reverse);
-    for (model.getPane(.here).rows) |row| {
-        const surface = try row.widget().draw(draw_ctx);
-        try testing.expect(!surface.buffer[0].style.reverse);
-    }
-}
-
-test "dotdot selection blocks entry-scoped input and jumps clear it" {
-    const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "b.txt", .data = "b" });
-
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(path);
-
-    var model: Model = undefined;
-    try model.init(testing.allocator, testing.io, .{
-        .start_path = path,
-        .user = "tester",
-        .hostname = "host",
-    });
-    defer model.deinit();
-
-    var ctx: vxfw.EventContext = .{
-        .io = testing.io,
-        .alloc = testing.allocator,
-        .cmds = .empty,
-        .redraw = false,
-    };
-    defer ctx.cmds.deinit(ctx.alloc);
-
-    const up_key: Key = .{ .codepoint = 'k' };
-    try model.captureEvent(&ctx, .{ .key_press = up_key });
-    try testing.expect(model.hereCursorOnUp());
-
-    // Space has nothing to toggle.
-    const space: Key = .{ .codepoint = Key.space };
-    try model.handleEvent(&ctx, .{ .key_press = space });
-    try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
-
-    // Deletion is refused with the standard flash.
-    try model.beginDelete(&ctx);
-    try testing.expect(model.mode != .confirm);
-    try testing.expectEqualStrings(
-        "nothing safe to delete",
-        model.flash.?.text,
-    );
-
-    // Jumping to the bottom clears the '..' selection.
-    const jump_key: Key = .{ .codepoint = 'G' };
-    try model.handleEvent(&ctx, .{ .key_press = jump_key });
-    try testing.expect(!model.hereCursorOnUp());
-    try testing.expectEqualStrings(
-        "b.txt",
-        model.centerListing().entries[model.hereEntryIndex().?].name,
-    );
-}
-
-test "clicking the dotdot row ascends and it hides at the root" {
-    const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try Io.Dir.createDir(temp.dir, testing.io, "d", .default_dir);
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "d/inner.txt", .data = "i" });
-
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
-    const root_path = try std.fs.path.join(testing.allocator, &.{
-        cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(root_path);
-    const d_path = try std.fs.path.join(testing.allocator, &.{ root_path, "d" });
-    defer testing.allocator.free(d_path);
-
-    var model: Model = undefined;
-    try model.init(testing.allocator, testing.io, .{
-        .start_path = d_path,
-        .user = "tester",
-        .hostname = "host",
-    });
-    defer model.deinit();
-
-    // The row exists only for HERE panes below the root.
-    try testing.expect(model.getPane(.here).showsUpRow());
-    try testing.expect(!model.getPane(.parent).showsUpRow());
-    try testing.expect(!model.getPane(.children).showsUpRow());
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const pane_surface = try model.getPane(.here).widget().draw(.{
-        .arena = arena.allocator(),
-        .min = .{ .width = 40, .height = 8 },
-        .max = .{ .width = 40, .height = 8 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    });
-    // Top band renders "..", styled like a directory.
-    const up_band = pane_surface.children[0].surface;
-    // Marker layout matches an unselected directory row: "  ▸  ..".
-    try testing.expectEqualStrings(" ", up_band.buffer[0].char.grapheme);
-    try testing.expectEqualStrings(" ", up_band.buffer[1].char.grapheme);
-    try testing.expectEqualStrings("▸", up_band.buffer[2].char.grapheme);
-    try testing.expectEqualStrings(".", up_band.buffer[5].char.grapheme);
-    try testing.expectEqualStrings(".", up_band.buffer[6].char.grapheme);
-    for (up_band.buffer[2..7]) |cell| {
-        try testing.expect(cell.style.bold);
-    }
-
-    // First press highlights; a second press inside the window ascends.
-    const press: vaxis.Mouse = .{
-        .col = 0,
-        .row = 0,
-        .button = .left,
-        .mods = .{},
-        .type = .press,
-    };
-    var ctx: vxfw.EventContext = .{
-        .io = testing.io,
-        .alloc = testing.allocator,
-        .cmds = .empty,
-        .redraw = false,
-    };
-    defer ctx.cmds.deinit(ctx.alloc);
-
-    // Browse-only adapters leave the event untouched in command mode.
-    model.mode = .command;
-    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
-    try testing.expect(!model.hereCursorOnUp());
-    try testing.expect(!ctx.consume_event);
-    try testing.expect(!ctx.redraw);
-    model.mode = .browse;
-
-    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
-    try testing.expect(model.hereCursorOnUp());
-    try testing.expectEqualStrings(d_path, model.centerListing().path);
-    try testing.expect(ctx.consume_event);
-    try testing.expect(ctx.redraw);
-
-    // The trailing hardware release is not an action and cannot complete the
-    // pending click pair.
-    var ignored = press;
-    inline for (.{ .release, .motion, .drag }) |event_type| {
-        ignored.type = event_type;
-        ctx.consume_event = false;
-        ctx.redraw = false;
-        try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = ignored });
-        try testing.expect(model.hereCursorOnUp());
-        try testing.expectEqualStrings(d_path, model.centerListing().path);
-        try testing.expect(!ctx.consume_event);
-        try testing.expect(!ctx.redraw);
-    }
-    ignored.type = .press;
-    ignored.button = .right;
-    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = ignored });
-    try testing.expectEqualStrings(d_path, model.centerListing().path);
-    try testing.expect(!ctx.consume_event);
-    try testing.expect(!ctx.redraw);
-
-    ctx.consume_event = false;
-    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
-    try testing.expectEqualStrings(root_path, model.centerListing().path);
-    try testing.expect(ctx.consume_event);
-    try testing.expect(ctx.redraw);
-}
-
-test "the dotdot row hides at the filesystem root" {
-    const testing = std.testing;
-    var model: Model = undefined;
-    try model.init(testing.allocator, testing.io, .{
-        .start_path = "/",
-        .user = "tester",
-        .hostname = "host",
-    });
-    defer model.deinit();
-
-    try testing.expect(!model.getPane(.here).showsUpRow());
 }
 
 test "parent clicks ascend and select an empty picked row" {
@@ -3633,7 +3234,7 @@ test "a view transaction invalidates pending double clicks" {
     defer model.deinit();
 
     _ = model.clicks.press(
-        .{ .entry = 0 },
+        0,
         Io.Clock.awake.now(testing.io).nanoseconds,
         double_click_interval_ms * std.time.ns_per_ms,
     );

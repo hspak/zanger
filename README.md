@@ -45,8 +45,8 @@ minimum, median, and p95 timings. Add `-- --quick` for a smaller local run or
 | `:` | Open command mode |
 | `q` | Quit |
 
-In CWD, one left click selects a row and a double click enters or opens it. The
-`..` row selects on one click and ascends on a double click. Clicking a PARENT
+In CWD, one left click selects a row and a double click enters or opens it.
+Clicking a PARENT
 row ascends with that row selected; clicking a CHILDREN row promotes that
 listing to CWD with the clicked row selected. Mouse-wheel navigation belongs to
 CWD and moves one row, including on terminals that emit duplicate reports;

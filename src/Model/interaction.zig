@@ -3,20 +3,8 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-pub const ClickTarget = union(enum) {
-    up,
-    entry: usize,
-
-    fn eql(a: ClickTarget, b: ClickTarget) bool {
-        return switch (a) {
-            .up => b == .up,
-            .entry => |a_index| switch (b) {
-                .entry => |b_index| a_index == b_index,
-                else => false,
-            },
-        };
-    }
-};
+/// Which HERE row a press landed on: its listing index.
+pub const ClickTarget = usize;
 
 pub const DoubleClickTracker = struct {
     const Press = struct {
@@ -39,7 +27,7 @@ pub const DoubleClickTracker = struct {
         const is_double = if (self.last) |last| double: {
             const elapsed = now_ns - last.at_ns;
             break :double last.generation == self.generation and
-                last.target.eql(target) and
+                last.target == target and
                 elapsed >= 0 and
                 elapsed <= interval_ns;
         } else false;
@@ -72,15 +60,15 @@ test "double clicks require target interval and view generation" {
     const interval = 400 * std.time.ns_per_ms;
     var tracker: DoubleClickTracker = .{};
 
-    try testing.expect(!tracker.press(.{ .entry = 1 }, 1_000, interval));
-    try testing.expect(!tracker.press(.{ .entry = 2 }, 2_000, interval));
-    try testing.expect(tracker.press(.{ .entry = 2 }, 2_000 + interval, interval));
-    try testing.expect(!tracker.press(.up, 3_000, interval));
-    try testing.expect(!tracker.press(.up, 3_001 + interval, interval));
-    try testing.expect(!tracker.press(.{ .entry = 1 }, 8_000, interval));
+    try testing.expect(!tracker.press(1, 1_000, interval));
+    try testing.expect(!tracker.press(2, 2_000, interval));
+    try testing.expect(tracker.press(2, 2_000 + interval, interval));
+    try testing.expect(!tracker.press(1, 3_000, interval));
+    try testing.expect(!tracker.press(1, 3_001 + interval, interval));
+    try testing.expect(!tracker.press(1, 8_000, interval));
     tracker.invalidateView();
-    try testing.expect(!tracker.press(.{ .entry = 1 }, 8_001, interval));
-    try testing.expect(tracker.press(.{ .entry = 1 }, 8_002, interval));
+    try testing.expect(!tracker.press(1, 8_001, interval));
+    try testing.expect(tracker.press(1, 8_002, interval));
 }
 
 test "mouse policy accepts only matching presses" {
