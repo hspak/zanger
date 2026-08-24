@@ -15,6 +15,7 @@ const command = @import("command.zig");
 const file_system = @import("file_system.zig");
 const format = @import("Model/format.zig");
 const interaction = @import("Model/interaction.zig");
+const scheduler = @import("Model/scheduler.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
 pub const IdentityCache = @import("Model/IdentityCache.zig");
 pub const Preview = @import("Model/Preview.zig");
@@ -40,11 +41,9 @@ local_time_zone: zeit.TimeZone,
 cursor_status: ?CursorStatus = null,
 show_hidden: bool = false,
 watch_refresh: WatchRefresh = .none,
-// Cursor movement leaves committed CHILDREN content visible and defers its
-// replacement until input has been idle for `preview_debounce_ms`.
-preview_dirty: bool = false,
-preview_tick_pending: bool = false,
-preview_due: Io.Timestamp = .zero,
+// Cursor movement leaves committed CHILDREN content visible until this
+// debounce scheduler commits its replacement.
+preview_schedule: scheduler.Preview = .idle,
 // Left-press bookkeeping shared by HERE entries and the pinned `..` row.
 clicks: interaction.DoubleClickTracker = .{},
 
@@ -60,9 +59,8 @@ open_program: []const u8 = "xdg-open",
 /// Test seam: when set, open requests append the target path here instead
 /// of spawning a process. Borrowed for the model's lifetime.
 open_recorder: ?*std.ArrayList([]const u8) = null,
-// Terminals may encode one physical wheel notch as a burst of reports.
-wheel_tick_pending: bool = false,
-wheel_direction: ?WheelDirection = null,
+// Non-null while one coalescing tick covers wheel reports in this direction.
+wheel_pending: ?WheelDirection = null,
 // Updated during layout; HERE has one item per terminal row.
 cwd_visible_rows: u16 = 1,
 // Owned and replaced transactionally by `setMessage`.
@@ -416,7 +414,7 @@ pub fn assertValid(self: *const Model) void {
     }
 
     const children = &self.panes[PaneRole.children.toIndex()];
-    if (!self.preview_dirty and !self.here_cursor.isUp()) {
+    if (!self.preview_schedule.isDirty() and !self.here_cursor.isUp()) {
         if (children.listingConst()) |child| {
             std.debug.assert(center.entries.len > 0);
             const entry = center.entries[self.hereEntryIndex().?];
@@ -503,8 +501,7 @@ fn typeErasedWheelTimerHandler(
     const self: *Model = @ptrCast(@alignCast(ptr));
     switch (event) {
         .tick => {
-            self.wheel_tick_pending = false;
-            self.wheel_direction = null;
+            self.wheel_pending = null;
         },
         else => {},
     }
@@ -968,7 +965,7 @@ fn replaceAnchoredView(
     self.alloc.free(self.message);
     self.message = next_message;
     self.cursor_status = pending_view.cursor_status;
-    self.preview_dirty = false;
+    self.preview_schedule.markClean();
     // A press from before this transaction must not pair with a press after
     // it: row indices belong to different listings.
     self.clicks.invalidateView();
@@ -980,41 +977,31 @@ fn replaceAnchoredView(
     self.assertValid();
 }
 
-fn armPreviewTimer(
-    self: *Model,
-    ctx: *vxfw.EventContext,
-    delay_ms: u32,
-) Allocator.Error!void {
-    if (self.preview_tick_pending) return;
-    try ctx.tick(delay_ms, self.previewTimerWidget());
-    self.preview_tick_pending = true;
-}
-
 pub fn deferRightSync(self: *Model, ctx: *vxfw.EventContext) Allocator.Error!void {
-    self.preview_dirty = true;
-    self.preview_due = Io.Clock.awake.now(self.io).addDuration(
+    const due = Io.Clock.awake.now(self.io).addDuration(
         .fromMilliseconds(preview_debounce_ms),
     );
-    try self.armPreviewTimer(ctx, preview_debounce_ms);
+    if (!self.preview_schedule.request(due)) return;
+    try ctx.tick(preview_debounce_ms, self.previewTimerWidget());
+    self.preview_schedule.publishQueued(due);
 }
 
 fn handlePreviewTimer(self: *Model, ctx: *vxfw.EventContext) !void {
-    self.preview_tick_pending = false;
-    if (!self.preview_dirty) return;
+    const due = self.preview_schedule.takeTick() orelse return;
 
     const now = Io.Clock.awake.now(self.io);
-    if (now.nanoseconds < self.preview_due.nanoseconds) {
-        const remaining_ns = self.preview_due.nanoseconds - now.nanoseconds;
+    if (now.nanoseconds < due.nanoseconds) {
+        const remaining_ns = due.nanoseconds - now.nanoseconds;
         const remaining_ms = @divTrunc(
             remaining_ns + std.time.ns_per_ms - 1,
             std.time.ns_per_ms,
         );
-        try self.armPreviewTimer(ctx, @intCast(remaining_ms));
+        try ctx.tick(@intCast(remaining_ms), self.previewTimerWidget());
+        self.preview_schedule.publishQueued(due);
         return;
     }
 
     self.syncRight() catch |err| {
-        self.preview_dirty = false;
         try self.reportError("preview", @errorName(err));
     };
     ctx.redraw = true;
@@ -1063,7 +1050,7 @@ fn syncRight(self: *Model) !void {
         self.message = message;
         next_message = null;
     }
-    self.preview_dirty = false;
+    self.preview_schedule.markClean();
     self.assertValid();
 }
 
@@ -1075,7 +1062,9 @@ fn reconcileWatcher(self: *Model) !bool {
         },
         .rearm => self.watch_refresh = .rearm,
     }
-    if (self.watch_refresh == .none or self.mode == .confirm or self.preview_dirty)
+    if (self.watch_refresh == .none or
+        self.mode == .confirm or
+        self.preview_schedule.isDirty())
         return false;
 
     const center = self.centerListing();
@@ -1347,16 +1336,15 @@ pub fn handleWheel(
     ctx: *vxfw.EventContext,
     direction: WheelDirection,
 ) !void {
-    if (self.wheel_tick_pending and self.wheel_direction == direction) {
+    if (self.wheel_pending == direction) {
         ctx.consumeEvent();
         return;
     }
 
-    self.wheel_direction = direction;
-    if (!self.wheel_tick_pending) {
+    if (self.wheel_pending == null) {
         try ctx.tick(wheel_coalesce_ms, self.wheelTimerWidget());
-        self.wheel_tick_pending = true;
     }
+    self.wheel_pending = direction;
     try self.moveCenter(ctx, direction == .down);
     ctx.consumeAndRedraw();
 }
@@ -2368,8 +2356,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expect(center.selected.isSet(0));
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
-    try testing.expect(model.preview_dirty);
-    try testing.expect(model.preview_tick_pending);
+    try testing.expect(model.preview_schedule.isDirty());
     try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
     var pending_arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2389,11 +2376,11 @@ test "space toggles consecutive selections and advances the cursor" {
         .cell_size = .{ .width = 8, .height = 16 },
     }, 160);
     try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
-    model.preview_due = .zero;
+    model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
     try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
-    try testing.expect(!model.preview_dirty);
+    try testing.expect(!model.preview_schedule.isDirty());
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
@@ -2423,6 +2410,43 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expect(center.selected.isSet(2));
     try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 3), center.selectedCount());
+}
+
+test "deferred input work stays idle when its first tick cannot queue" {
+    const testing = std.testing;
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = cwd });
+    defer model.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(testing.allocator);
+
+    var preview_failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    ctx.alloc = preview_failing.allocator();
+    try testing.expectError(error.OutOfMemory, model.deferRightSync(&ctx));
+    try testing.expect(model.preview_schedule == .idle);
+    try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
+
+    const cursor = model.here_cursor;
+    var wheel_failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    ctx.alloc = wheel_failing.allocator();
+    try testing.expectError(error.OutOfMemory, model.handleWheel(&ctx, .down));
+    try testing.expect(model.wheel_pending == null);
+    try testing.expect(model.here_cursor.eql(cursor));
+    try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
+    ctx.alloc = testing.allocator;
 }
 
 test "delete recursively removes selected directories and their children" {
@@ -3615,9 +3639,9 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     ctx.consume_event = false;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
-    try testing.expect(model.preview_dirty);
+    try testing.expect(model.preview_schedule.isDirty());
     try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
-    model.preview_due = .zero;
+    model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
     try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqual(@as(u8, 0), model.getPane(.here).list_view.wheel_scroll);
@@ -3662,9 +3686,9 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     mouse.button = .wheel_up;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
-    try testing.expect(model.preview_dirty);
+    try testing.expect(model.preview_schedule.isDirty());
     try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
-    model.preview_due = .zero;
+    model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
     try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
     try testing.expect(ctx.consume_event);
@@ -3914,7 +3938,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
         .redraw = false,
     };
     defer ctx.cmds.deinit(ctx.alloc);
-    model.preview_dirty = true;
+    model.preview_schedule = .{ .dirty = .zero };
     try model.handleEvent(&ctx, .tick);
 
     center = model.centerListing();
@@ -3922,7 +3946,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
     try testing.expectEqual(WatchRefresh.refresh, model.watch_refresh);
     try testing.expect(!ctx.redraw);
 
-    model.preview_dirty = false;
+    model.preview_schedule = .idle;
     ctx.cmds.clearRetainingCapacity();
     try model.handleEvent(&ctx, .tick);
 
@@ -4028,7 +4052,7 @@ test "children sync allocation failures preserve the committed projection" {
 
         const b_index = file_system.indexOfName(model.centerListing(), "b.txt").?;
         _ = model.applyHereCursor(.{ .entry = b_index }, .none);
-        model.preview_dirty = true;
+        model.preview_schedule = .{ .dirty = .zero };
         const committed_line = model.getPane(.children).preview().?.lines[0].ptr;
         try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
 
@@ -4043,7 +4067,7 @@ test "children sync allocation failures preserve the committed projection" {
             reached_success = true;
             try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
             try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
-            try testing.expect(!model.preview_dirty);
+            try testing.expect(!model.preview_schedule.isDirty());
             model.assertValid();
             break;
         } else |err| {
@@ -4054,7 +4078,7 @@ test "children sync allocation failures preserve the committed projection" {
                 model.getPane(.children).preview().?.lines[0].ptr,
             );
             try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
-            try testing.expect(model.preview_dirty);
+            try testing.expect(model.preview_schedule.isDirty());
             model.assertValid();
         }
     }
