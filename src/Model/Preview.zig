@@ -329,6 +329,45 @@ fn appendTextRow(
     try rows.append(alloc, .{ .text = owned });
 }
 
+fn checkTextAllocationFailures(
+    alloc: Allocator,
+    io: Io,
+    path: []const u8,
+) !void {
+    var preview = (try initTextContent(alloc, io, path, null, max_preview_bytes)).?;
+    defer preview.deinit();
+}
+
+fn checkSheetAllocationFailures(
+    alloc: Allocator,
+    path: []const u8,
+) !void {
+    var identities: IdentityCache = .{};
+    defer identities.deinit(alloc);
+    var preview = try initFile(alloc, &identities, path, null);
+    defer preview.deinit();
+}
+
+test "preview builders release every allocation failure" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("notes.txt", "alpha\nbeta\ngamma");
+
+    const path = try tree.absolutePath("notes.txt");
+    defer testing.allocator.free(path);
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkTextAllocationFailures,
+        .{ testing.io, path },
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkSheetAllocationFailures,
+        .{path},
+    );
+}
+
 test "text file preview splits sanitized lines" {
     const testing = std.testing;
     var tree = try test_support.TempTree.init(testing.allocator, testing.io);

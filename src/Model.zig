@@ -17,6 +17,7 @@ const format = @import("Model/format.zig");
 const input = @import("Model/input.zig");
 const interaction = @import("Model/interaction.zig");
 const scheduler = @import("Model/scheduler.zig");
+const test_support = @import("test_support.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
 pub const IdentityCache = @import("Model/IdentityCache.zig");
 pub const Preview = @import("Model/Preview.zig");
@@ -4145,6 +4146,63 @@ test "children sync allocation failures preserve the committed projection" {
     try testing.expect(reached_success);
 }
 
+test "preview error formatting failure preserves children and status" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("a.txt", "a");
+
+    var failure_count: usize = 0;
+    var reached_success = false;
+    for (0..32) |fail_index| {
+        try tree.writeFile("b.txt", "b");
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+        defer model.deinit();
+        try Io.Dir.deleteFile(tree.temp.dir, testing.io, "b.txt");
+
+        const b_index = file_system.indexOfName(model.centerListing(), "b.txt").?;
+        _ = model.applyHereCursor(.{ .entry = b_index }, .none);
+        model.preview_schedule = .{ .dirty = .zero };
+        const committed_line = model.getPane(.children).preview().?.displayTextAt(0).?.ptr;
+        const committed_message = model.message.ptr;
+        model.retired_rows.deinit(testing.allocator);
+        model.retired_rows = .empty;
+
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        model.alloc = failing.allocator();
+        const result = model.syncRight();
+        model.alloc = testing.allocator;
+
+        if (result) |_| {
+            reached_success = true;
+            try testing.expect(model.getPane(.children).content == .empty);
+            try testing.expect(model.cursor_status == null);
+            try testing.expectEqualStrings(
+                "preview unavailable: FileNotFound",
+                model.message,
+            );
+            model.assertValid();
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failure_count += 1;
+            try testing.expectEqual(
+                committed_line,
+                model.getPane(.children).preview().?.displayTextAt(0).?.ptr,
+            );
+            try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
+            try testing.expectEqual(committed_message, model.message.ptr);
+            try testing.expect(model.preview_schedule.isDirty());
+            model.assertValid();
+        }
+    }
+    try testing.expect(failure_count > 0);
+    try testing.expect(reached_success);
+}
+
 test "view transition planner derives the legal transfer matrix" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
@@ -4228,6 +4286,137 @@ test "view transition planner derives the legal transfer matrix" {
     model.getPane(.children).content.deinit();
     plan = model.planViewTransition(child_path, .descend);
     try testing.expectEqual(@as(usize, 1), plan.transfer_count);
+}
+
+test "mixed input and refresh sequence preserves model invariants" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("a-dir");
+    try tree.createDir("b-dir");
+    try tree.writeFile("a-dir/alpha.txt", "alpha");
+    try tree.writeFile("b-dir/beta.txt", "beta");
+    try tree.writeFile("z.txt", "z");
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var harness = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer harness.deinit();
+    const ctx = &harness.ctx;
+    model.assertValid();
+
+    // Capture-owned keyboard movement leaves the previous CHILDREN projection
+    // visible but explicitly dirty.
+    try model.captureEvent(ctx, .{ .key_press = test_support.keyPress('j', .{}) });
+    try testing.expectEqualStrings(
+        "b-dir",
+        model.centerListing().entries[model.hereEntryIndex().?].name,
+    );
+    model.assertValid();
+
+    model.preview_schedule = .{ .dirty = .zero };
+    try model.previewTimerWidget().handleEvent(ctx, .tick);
+    try testing.expectEqualStrings(
+        "b-dir",
+        std.fs.path.basename(model.getPane(.children).listing().?.path),
+    );
+    model.assertValid();
+
+    // A side-pane mouse press promotes CHILDREN to HERE, then a bubble-owned
+    // key ascends back to the original directory.
+    try model.getPane(.children).rows[0].widget().handleEvent(
+        ctx,
+        .{ .mouse = test_support.leftMouse(.press) },
+    );
+    try testing.expectEqualStrings("b-dir", std.fs.path.basename(model.centerListing().path));
+    model.assertValid();
+
+    const up = test_support.keyPress('h', .{});
+    try model.captureEvent(ctx, .{ .key_press = up });
+    try model.handleEvent(ctx, .{ .key_press = up });
+    try testing.expectEqualStrings(tree.path, model.centerListing().path);
+    model.assertValid();
+
+    // A HERE row click plus its release exercises pointer policy while the
+    // deferred projection remains structurally valid.
+    const z_index = file_system.indexOfName(model.centerListing(), "z.txt").?;
+    try model.getPane(.here).rows[z_index].widget().handleEvent(
+        ctx,
+        .{ .mouse = test_support.leftMouse(.press) },
+    );
+    model.assertValid();
+    try model.getPane(.here).rows[z_index].widget().handleEvent(
+        ctx,
+        .{ .mouse = test_support.leftMouse(.release) },
+    );
+    model.assertValid();
+
+    // A watcher refresh waits behind dirty CHILDREN work, then commits after
+    // the projection catches up.
+    model.watch_refresh = .refresh;
+    try model.handleEvent(ctx, .tick);
+    try testing.expectEqual(WatchRefresh.refresh, model.watch_refresh);
+    model.assertValid();
+    model.preview_schedule = .{ .dirty = .zero };
+    try model.previewTimerWidget().handleEvent(ctx, .tick);
+    model.assertValid();
+    try model.handleEvent(ctx, .tick);
+    try testing.expectEqual(WatchRefresh.none, model.watch_refresh);
+    model.assertValid();
+}
+
+test "anchored view allocation failures retain the old watch and panes" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("a-current");
+    try tree.createDir("b-target");
+    try tree.writeFile("a-current/a.txt", "a");
+    try tree.writeFile("b-target/b.txt", "b");
+    const target_path = try tree.absolutePath("b-target");
+    defer testing.allocator.free(target_path);
+
+    var failure_count: usize = 0;
+    var reached_success = false;
+    for (0..128) |fail_index| {
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+        defer model.deinit();
+
+        const committed_center = model.centerListing().path.ptr;
+        const committed_children = model.getPane(.children).listing().?.path.ptr;
+        const committed_watch = model.watcher.current_descriptor;
+        try testing.expectEqual(@as(usize, 0), model.retired_rows.items.len);
+        model.retired_rows.deinit(testing.allocator);
+        model.retired_rows = .empty;
+
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        model.alloc = failing.allocator();
+        const result = model.replaceAnchoredView(target_path, .descend);
+        model.alloc = testing.allocator;
+
+        if (result) |_| {
+            reached_success = true;
+            try testing.expectEqualStrings(target_path, model.centerListing().path);
+            model.assertValid();
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failure_count += 1;
+            try testing.expectEqual(committed_center, model.centerListing().path.ptr);
+            try testing.expectEqual(
+                committed_children,
+                model.getPane(.children).listing().?.path.ptr,
+            );
+            try testing.expectEqual(committed_watch, model.watcher.current_descriptor);
+            model.assertValid();
+        }
+    }
+    try testing.expect(failure_count > 0);
+    try testing.expect(reached_success);
 }
 
 test "replaced rows stay readable until the next draw" {
