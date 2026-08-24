@@ -634,13 +634,6 @@ fn prepareView(
         }
     }
 
-    if (center.entries.len > 0) {
-        const entry = center.entries[center_cursor];
-        const cursor_path = try file_system.joinPath(self.alloc, center.path, entry.name);
-        defer self.alloc.free(cursor_path);
-        pending_view.cursor_status = try self.loadCursorStatus(cursor_path, entry.name);
-    }
-
     const children_transfer = transferTo(transfers, .children);
     const reused_children = if (children_transfer) |transfer|
         self.getPane(transfer.source).listing()
@@ -658,6 +651,17 @@ fn prepareView(
                 std.fs.path.basename(candidate.path),
             );
         if (matches_selected) {
+            const entry = center.entries[center_cursor];
+            const child_path = try file_system.joinPath(
+                self.alloc,
+                center.path,
+                entry.name,
+            );
+            defer self.alloc.free(child_path);
+            pending_view.cursor_status = try self.loadCursorStatus(
+                child_path,
+                entry.name,
+            );
             center_pending.setDirectoryEmpty(
                 center_cursor,
                 candidate.entries.len == 0,
@@ -686,35 +690,25 @@ fn prepareView(
     }
 
     if (!reused_applied) {
-        if (center.entries.len == 0) {
-            _ = pending_view.stageOwned(
-                .children,
-                .{ .preview = try Preview.initMessage(
-                    self.alloc,
-                    "empty directory",
-                ) },
-            );
+        var prepared = try self.prepareChildren(
+            center,
+            HereCursor.fromEntryCount(center.entries.len, center_cursor),
+            null,
+        );
+        defer prepared.deinit();
+        pending_view.cursor_status = prepared.cursor_status;
+        if (prepared.directory_empty) |update| {
+            center_pending.setDirectoryEmpty(update.index, update.is_empty);
+        }
+        if (prepared.error_name) |error_name| {
+            pending_view.rememberErrorName(error_name);
         } else {
-            const entry = center.entries[center_cursor];
-            var outcome = try self.buildChildrenOutcome(
-                center.path,
-                entry,
-                if (pending_view.cursor_status) |status| status.metadata else null,
-            );
-            defer outcome.content.deinit();
-            if (outcome.error_name) |error_name| {
-                pending_view.rememberErrorName(error_name);
-            } else {
-                if (outcome.dir_is_empty) |is_empty| {
-                    center_pending.setDirectoryEmpty(center_cursor, is_empty);
-                }
-                switch (outcome.content) {
-                    .empty => {},
-                    else => {
-                        _ = pending_view.stageOwned(.children, outcome.content);
-                        outcome.content = .empty;
-                    },
-                }
+            switch (prepared.content) {
+                .empty => {},
+                else => _ = pending_view.stageOwned(
+                    .children,
+                    prepared.takeContent(),
+                ),
             }
         }
     }
@@ -734,15 +728,95 @@ const ChildrenOutcome = struct {
     error_name: ?[]const u8 = null,
 };
 
+const DirectoryEmptyUpdate = struct {
+    index: usize,
+    is_empty: bool,
+};
+
+/// A complete fallible preparation result for the CHILDREN projection. Its
+/// content remains owned here until a caller moves it into pending or live
+/// pane state. `keep_current` is the zero-rebuild path for an already matching
+/// live CHILDREN listing.
+const PreparedChildren = struct {
+    content: Pane.Content = .empty,
+    cursor_status: ?CursorStatus = null,
+    directory_empty: ?DirectoryEmptyUpdate = null,
+    error_name: ?[]const u8 = null,
+    keep_current: bool = false,
+
+    fn deinit(self: *PreparedChildren) void {
+        self.content.deinit();
+        self.* = undefined;
+    }
+
+    fn takeContent(self: *PreparedChildren) Pane.Content {
+        const content = self.content;
+        self.content = .empty;
+        return content;
+    }
+};
+
+fn prepareChildren(
+    self: *Model,
+    center: *file_system.Listing,
+    target: HereCursor,
+    current_children: ?*const file_system.Listing,
+) Allocator.Error!PreparedChildren {
+    var prepared: PreparedChildren = .{};
+    errdefer prepared.deinit();
+
+    if (target.isUp()) {
+        prepared.content = .{
+            .preview = try Preview.initMessage(self.alloc, "go up one level"),
+        };
+        return prepared;
+    }
+    if (center.entries.len == 0) {
+        prepared.content = .{
+            .preview = try Preview.initMessage(self.alloc, "empty directory"),
+        };
+        return prepared;
+    }
+
+    const center_cursor = target.selectedEntry() orelse unreachable;
+    std.debug.assert(center_cursor < center.entries.len);
+    const entry = center.entries[center_cursor];
+    const child_path = try file_system.joinPath(self.alloc, center.path, entry.name);
+    defer self.alloc.free(child_path);
+    prepared.cursor_status = try self.loadCursorStatus(child_path, entry.name);
+
+    if (entry.is_dir) {
+        if (current_children) |current| {
+            if (std.mem.eql(u8, current.path, child_path)) {
+                prepared.directory_empty = .{
+                    .index = center_cursor,
+                    .is_empty = false,
+                };
+                prepared.keep_current = true;
+                return prepared;
+            }
+        }
+    }
+
+    const metadata_hint = if (prepared.cursor_status) |status| status.metadata else null;
+    var outcome = try self.buildChildrenOutcome(child_path, entry, metadata_hint);
+    defer outcome.content.deinit();
+    prepared.directory_empty = if (outcome.dir_is_empty) |is_empty| .{
+        .index = center_cursor,
+        .is_empty = is_empty,
+    } else null;
+    prepared.error_name = outcome.error_name;
+    prepared.content = outcome.content;
+    outcome.content = .empty;
+    return prepared;
+}
+
 fn buildChildrenOutcome(
     self: *Model,
-    center_path: []const u8,
+    child_path: []const u8,
     entry: file_system.Entry,
     metadata_hint: ?FileMetadata,
 ) Allocator.Error!ChildrenOutcome {
-    const child_path = try file_system.joinPath(self.alloc, center_path, entry.name);
-    defer self.alloc.free(child_path);
-
     if (!entry.is_dir) {
         // Symbolic links render like their targets: reads and stats resolve
         // through the link, so a linked text file shows its contents and a
@@ -906,32 +980,6 @@ fn replaceAnchoredView(
     self.assertValid();
 }
 
-fn installPane(
-    self: *Model,
-    role: PaneRole,
-    content: *Pane.Content,
-    cursor: u32,
-    cwd_index: ?usize,
-) !void {
-    const count = content.itemCount();
-    const target = self.getPane(role);
-    const rows = try self.makeRows(target, count);
-    errdefer self.alloc.free(rows);
-    try self.retired_rows.ensureUnusedCapacity(self.alloc, 1);
-    target.replace(.{
-        .content = content.*,
-        .rows = rows,
-        .cursor = cursor,
-        .cwd_index = cwd_index,
-    });
-    content.* = .empty;
-}
-
-fn clearPane(self: *Model, role: PaneRole) !void {
-    var content: Pane.Content = .empty;
-    try self.installPane(role, &content, 0, null);
-}
-
 fn armPreviewTimer(
     self: *Model,
     ctx: *vxfw.EventContext,
@@ -975,59 +1023,46 @@ fn handlePreviewTimer(self: *Model, ctx: *vxfw.EventContext) !void {
 fn syncRight(self: *Model) !void {
     const center = self.centerListing();
     const right = self.getPane(.children);
-    var replacement: Pane.Content = .empty;
-    errdefer replacement.deinit();
+    var prepared = try self.prepareChildren(
+        center,
+        self.here_cursor,
+        right.listingConst(),
+    );
+    defer prepared.deinit();
 
-    if (self.here_cursor.isUp() and self.getPane(.here).showsUpRow()) {
-        // Highlighting `..`: hint at what it does instead of previewing the
-        // remembered entry.
-        self.cursor_status = null;
-        replacement = .{
-            .preview = try Preview.initMessage(self.alloc, "go up one level"),
-        };
-    } else if (center.entries.len == 0) {
-        self.cursor_status = null;
-        replacement = .{
-            .preview = try Preview.initMessage(self.alloc, "empty directory"),
-        };
-    } else {
-        const center_cursor = self.hereEntryIndex().?;
-        const entry = center.entries[center_cursor];
-        const desired = try file_system.joinPath(self.alloc, center.path, entry.name);
-        defer self.alloc.free(desired);
-        self.cursor_status = try self.loadCursorStatus(desired, entry.name);
-        if (entry.is_dir) {
-            if (right.listing()) |listing| {
-                if (std.mem.eql(u8, listing.path, desired)) {
-                    center.setDirectoryEmpty(center_cursor, false);
-                    self.preview_dirty = false;
-                    self.assertValid();
-                    return;
-                }
-            }
-        }
-
-        var outcome = try self.buildChildrenOutcome(
-            center.path,
-            entry,
-            if (self.cursor_status) |status| status.metadata else null,
-        );
-        defer outcome.content.deinit();
-        if (outcome.error_name) |error_name| {
-            try self.clearPane(.children);
-            try self.setMessage("preview unavailable: {s}", .{error_name});
-            self.preview_dirty = false;
-            self.assertValid();
-            return;
-        }
-        if (outcome.dir_is_empty) |is_empty| {
-            center.setDirectoryEmpty(center_cursor, is_empty);
-        }
-        replacement = outcome.content;
-        outcome.content = .empty;
+    var rows: ?[]Row = null;
+    errdefer if (rows) |owned| self.alloc.free(owned);
+    if (!prepared.keep_current) {
+        rows = try self.makeRows(right, prepared.content.itemCount());
+        try self.retired_rows.ensureUnusedCapacity(self.alloc, 1);
     }
 
-    try self.installPane(.children, &replacement, 0, null);
+    var next_message: ?[]u8 = if (prepared.error_name) |error_name|
+        try std.fmt.allocPrint(self.alloc, "preview unavailable: {s}", .{error_name})
+    else
+        null;
+    errdefer if (next_message) |message| self.alloc.free(message);
+
+    // Preparation, row allocation, message formatting, and retirement
+    // reservation have all succeeded. The commit below is infallible.
+    if (prepared.directory_empty) |update| {
+        center.setDirectoryEmpty(update.index, update.is_empty);
+    }
+    self.cursor_status = prepared.cursor_status;
+    if (!prepared.keep_current) {
+        right.replace(.{
+            .content = prepared.takeContent(),
+            .rows = rows.?,
+        });
+        rows = null;
+    } else {
+        std.debug.assert(std.meta.activeTag(prepared.content) == .empty);
+    }
+    if (next_message) |message| {
+        self.alloc.free(self.message);
+        self.message = message;
+        next_message = null;
+    }
     self.preview_dirty = false;
     self.assertValid();
 }
@@ -3961,6 +3996,70 @@ test "init stages children for a directory of only file symlinks" {
     try testing.expect(model.getPane(.children).listing() == null);
     try testing.expect(model.getPane(.children).preview().?.kind == .text);
     try testing.expectEqualStrings("t", model.getPane(.children).preview().?.lines[0]);
+}
+
+test "children sync allocation failures preserve the committed projection" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "b.txt", .data = "b" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var failure_count: usize = 0;
+    var reached_success = false;
+    for (0..64) |fail_index| {
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{
+            .start_path = path,
+            .user = "tester",
+            .hostname = "host",
+        });
+        defer model.deinit();
+
+        const b_index = file_system.indexOfName(model.centerListing(), "b.txt").?;
+        _ = model.applyHereCursor(.{ .entry = b_index }, .none);
+        model.preview_dirty = true;
+        const committed_line = model.getPane(.children).preview().?.lines[0].ptr;
+        try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
+
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        model.alloc = failing.allocator();
+        const result = model.syncRight();
+        model.alloc = testing.allocator;
+
+        if (result) |_| {
+            reached_success = true;
+            try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
+            try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
+            try testing.expect(!model.preview_dirty);
+            model.assertValid();
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failure_count += 1;
+            try testing.expectEqual(
+                committed_line,
+                model.getPane(.children).preview().?.lines[0].ptr,
+            );
+            try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
+            try testing.expect(model.preview_dirty);
+            model.assertValid();
+        }
+    }
+    try testing.expect(failure_count > 0);
+    try testing.expect(reached_success);
 }
 
 test "replaced rows stay readable until the next draw" {
