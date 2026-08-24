@@ -1189,27 +1189,21 @@ pub fn handleRowClick(
     self.openCenter() catch |err| try self.reportError("open", @errorName(err));
 }
 
-/// Navigates HERE to the parent-pane entry at `index`: a directory becomes
-/// the new HERE, with the clicked name restored as its cursor. Anything else
-/// is refused with a flash.
+/// Navigates HERE into the parent directory with the clicked row selected
+/// as its cursor: like `h`, except the user picks the row. Every row kind
+/// qualifies — the click only chooses where the cursor lands.
 pub fn handleParentClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.parent);
     const listing = &(pane.listing orelse return);
     if (index >= listing.entries.len) return;
     const entry = listing.entries[index];
-    if (!entry.is_dir) {
-        try self.flashError("not a directory: {s}", .{entry.name});
-        return;
-    }
-    const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
-    defer self.alloc.free(target);
 
-    // Clicking the entry that is already HERE is a no-op.
-    if (std.mem.eql(u8, self.centerListing().path, target)) return;
-
-    // An explicit click expresses intent, so empty directories are entered
-    // like any other.
-    try self.replaceAnchoredView(target, .{ .preferred_name = entry.name });
+    // Ascending transfers the old HERE listing to CHILDREN, which is exact:
+    // the new HERE is the old children's parent directory.
+    try self.replaceAnchoredView(listing.path, .{
+        .preferred_name = entry.name,
+        .transfers = &.{.{ .source = .here, .target = .children }},
+    });
 }
 
 /// Navigates HERE into the children-pane entry at `index`: a directory
@@ -2992,7 +2986,7 @@ test "the dotdot row hides at the filesystem root" {
     try testing.expect(!model.getPane(.here).showsUpRow());
 }
 
-test "parent clicks enter empty directories" {
+test "parent clicks ascend and select an empty picked row" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
@@ -3011,8 +3005,6 @@ test "parent clicks enter empty directories" {
     defer testing.allocator.free(root_path);
     const home_path = try std.fs.path.join(testing.allocator, &.{ root_path, "home" });
     defer testing.allocator.free(home_path);
-    const target_path = try std.fs.path.join(testing.allocator, &.{ root_path, "target" });
-    defer testing.allocator.free(target_path);
 
     var model: Model = undefined;
     try model.init(testing.allocator, testing.io, .{
@@ -3022,17 +3014,64 @@ test "parent clicks enter empty directories" {
     });
     defer model.deinit();
 
+    // An empty directory row is as pickable as any other: clicking it
+    // ascends into the parent with that row highlighted.
     const index = file_system.indexOfName(
         &model.getPane(.parent).listing.?,
         "target",
     ).?;
     try model.handleParentClick(index);
+    try testing.expectEqualStrings(root_path, model.centerListing().path);
+    try testing.expectEqual(index, model.centerListing().cursor);
 
-    // An explicit click expresses intent: empty directories are entered.
-    try testing.expectEqualStrings(target_path, model.centerListing().path);
+    // CHILDREN mirrors the picked empty directory.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
     try testing.expect(child_pane.preview.?.kind == .placeholder);
+    try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
+}
+
+test "parent clicks ascend and select a picked file row" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "home", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "notes.txt", .data = "n" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const root_path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(root_path);
+    const home_path = try std.fs.path.join(testing.allocator, &.{ root_path, "home" });
+    defer testing.allocator.free(home_path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = home_path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    // Files are pickable too — the click only chooses the cursor target.
+    const index = file_system.indexOfName(
+        &model.getPane(.parent).listing.?,
+        "notes.txt",
+    ).?;
+    try model.handleParentClick(index);
+    try testing.expectEqualStrings(root_path, model.centerListing().path);
+    try testing.expectEqual(index, model.centerListing().cursor);
+
+    // CHILDREN mirrors the picked file with its rendered contents.
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .text);
+    try testing.expectEqualStrings("n", child_pane.preview.?.lines[0]);
 }
 
 test "double click on a directory descends into it" {
@@ -3378,54 +3417,41 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
-    // Clicking a parent row jumps HERE to that sibling directory, with the
-    // clicked name restored as the center cursor.
+    // Clicking a parent row ascends into the parent directory with that
+    // row selected — like `h`, but picking the row.
     ctx.consume_event = false;
     const parent = model.getPane(.parent);
     const sibling_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
     // The parent pane lists cwd's parent, so `sibling` is a sibling of cwd.
-    const sibling_expected = try std.fs.path.join(testing.allocator, &.{
+    const sub_expected = try std.fs.path.join(testing.allocator, &.{
         process_cwd,
         ".zig-cache",
         "tmp",
         &temp.sub_path,
-        "sibling",
     });
-    defer testing.allocator.free(sibling_expected);
+    defer testing.allocator.free(sub_expected);
     try parent.rows[sibling_index].widget().handleEvent(&ctx, .{ .mouse = click });
-    try testing.expectEqualStrings(sibling_expected, model.centerListing().path);
-    // The clicked directory is HERE itself now; its cursor rests on the
-    // first contained entry.
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqualStrings(sub_expected, model.centerListing().path);
+    try testing.expectEqual(
+        sibling_index,
+        model.centerListing().cursor,
+    );
+    // CHILDREN mirrors the picked row: its directory listing.
+    const sibling_listing = try std.fs.path.join(
+        testing.allocator,
+        &.{ sub_expected, "sibling" },
+    );
+    defer testing.allocator.free(sibling_listing);
+    try testing.expectEqualStrings(
+        sibling_listing,
+        model.getPane(.children).listing.?.path,
+    );
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
-    // Ascend lands at the shared parent; clicking the old cwd row in the
-    // parent pane returns home through the same feature.
+    // Return home for the focus-flow checks: select cwd, then descend.
     ctx.consume_event = false;
     ctx.redraw = false;
-    try model.ascend();
-    const sub_path = try std.fs.path.join(testing.allocator, &.{
-        process_cwd,
-        ".zig-cache",
-        "tmp",
-        &temp.sub_path,
-    });
-    defer testing.allocator.free(sub_path);
-    try testing.expectEqualStrings(sub_path, model.centerListing().path);
-
-    // Click back down into <sub>, then into cwd, to return home.
-    ctx.consume_event = false;
-    const sub_row = file_system.indexOfName(
-        &model.getPane(.parent).listing.?,
-        &temp.sub_path,
-    ).?;
-    try model.getPane(.parent).rows[sub_row].widget().handleEvent(
-        &ctx,
-        .{ .mouse = click },
-    );
-    try testing.expectEqualStrings(sub_path, model.centerListing().path);
-    // Return home with the keyboard path: select cwd, then descend.
     const cwd_here = file_system.indexOfName(model.centerListing(), "cwd").?;
     model.centerListing().cursor = cwd_here;
     model.getPane(.here).list_view.cursor = @intCast(cwd_here);
