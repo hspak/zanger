@@ -2817,13 +2817,18 @@ test "stepping onto dotdot hints and enter ascends" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     vxfw.DrawContext.init(.unicode);
-    const up_surface = try model.getPane(.here).up_row.widget().draw(.{
+    const draw_ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{ .width = 20, .height = 1 },
         .max = .{ .width = 20, .height = 1 },
         .cell_size = .{ .width = 8, .height = 16 },
-    });
+    };
+    const up_surface = try model.getPane(.here).up_row.widget().draw(draw_ctx);
     try testing.expect(up_surface.buffer[0].style.reverse);
+
+    // The first real entry must drop its highlight while '..' is selected.
+    const first_row = try model.getPane(.here).rows[0].widget().draw(draw_ctx);
+    try testing.expect(!first_row.buffer[0].style.reverse);
 
     // Enter on '..' ascends.
     const enter: Key = .{ .codepoint = Key.enter };

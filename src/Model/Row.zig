@@ -67,8 +67,10 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         else
             .default;
         style.bold = selected or entry.is_dir;
+        // While the cursor rests on `..`, no real entry is highlighted.
         const active_cursor = self.pane.role == .here and
             self.pane.model.mode != .command and
+            !self.pane.model.up_selected and
             self.pane.list_view.cursor == self.index;
         const parent_cwd_index = self.pane.role == .parent and
             self.pane.cwd_index == self.index;
