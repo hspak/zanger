@@ -79,9 +79,8 @@ The model maintains these invariants after every committed operation:
    by metadata for the resolved file. Side panes accept mouse navigation
    only: clicking a parent row ascends into the parent directory with the
    clicked row selected as HERE's cursor (any row kind qualifies), and
-   single-clicking a children row picks and highlights it, and double
-   clicking descends into it (non-directories open through the system
-   opener). Keyboard browse
+   single-clicking a children row promotes that pane to HERE with the clicked
+   row selected, so the children pane renders the row's listing or preview. Keyboard browse
    interaction remains HERE-only. HERE also renders a `..` line
    above its listing except at `/`; a single click or a cursor step onto it
    highlights it (the children pane then shows a `go up one level` hint, and
@@ -254,8 +253,8 @@ failure still aborts initialization.
 Empty directories remain previews and cannot become HERE. A no-op click or jump
 does not rebuild CHILDREN. Side-pane clicks navigate: a parent row ascends
 into the parent directory with that row picked as the center cursor, and a
-children rows are picked on single click and descend or open on double
-click. HERE renders a
+a children click promotes that pane to HERE with the clicked row selected.
+HERE renders a
 cursor-selectable `..` line above its listing except at `/`; single click or
 cursor step highlights it, double click ascends. A second left press on the same HERE row within
 400 ms descends when that row is a directory and opens any other non-executable

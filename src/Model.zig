@@ -49,9 +49,7 @@ last_click: ?LastClick = null,
 /// Timestamp of the last press on the `..` row, for its own double-click
 /// detection.
 up_click_at_ns: ?i128 = null,
-/// Timestamp of the last press on a children row, for its double-click
-/// detection.
-child_click_at_ns: ?i128 = null,
+
 /// True while the HERE cursor rests on the `..` row. The listing cursor
 /// keeps pointing at its last real entry; every consumer branches on this.
 up_selected: bool = false,
@@ -817,7 +815,6 @@ fn replaceAnchoredView(
     // it: row indices belong to different listings.
     self.last_click = null;
     self.up_click_at_ns = null;
-    self.child_click_at_ns = null;
     self.up_selected = false;
 }
 
@@ -1220,47 +1217,23 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
 /// becomes the new HERE (the children listing transfers to PARENT, which is
 /// its exact parent directory), and anything else opens through the system
 /// opener like `l` does.
-/// Handles a left press on a children row: a single press picks and
-/// highlights it, and a second press on the same row inside the double-click
-/// window triggers it (directories descend, other entries open through the
-/// system opener). Preview rows pick without triggering anything.
+/// Promotes the children pane to HERE with the clicked row selected as its
+/// cursor: the pane's listing transfers to HERE (zero-cost), the old HERE
+/// becomes PARENT, and the children pane renders the clicked entry's
+/// content â a directory listing, a text preview, or a metadata sheet.
 pub fn handleChildrenClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.children);
-
-    const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
-    const is_double = if (self.child_click_at_ns) |at|
-        index == pane.picked and
-            now_ns - at <= double_click_interval_ms * std.time.ns_per_ms
-    else
-        false;
-    self.child_click_at_ns = if (is_double) null else now_ns;
-    pane.picked = index;
-
-    // Only directory listings have something to trigger; preview rows are
-    // pickable but inert.
     const listing = &(pane.listing orelse return);
-    if (!is_double or index >= listing.entries.len) return;
-
+    if (index >= listing.entries.len) return;
     const entry = listing.entries[index];
-    const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
-    defer self.alloc.free(target);
-    pane.picked = null;
 
-    if (!entry.is_dir) {
-        try self.openWithSystem(target, entry.name);
-        return;
-    }
-    self.replaceAnchoredView(target, .{
+    try self.replaceAnchoredView(listing.path, .{
         .preferred_name = entry.name,
-        .transfers = &.{.{ .source = .children, .target = .parent }},
-        .reject_empty_center = true,
-    }) catch |err| switch (err) {
-        error.EmptyDirectory => {
-            listing.setDirectoryEmpty(index, true);
-            try self.flashError("empty directory: {s}", .{entry.name});
+        .transfers = &.{
+            .{ .source = .children, .target = .here },
+            .{ .source = .here, .target = .parent },
         },
-        else => return err,
-    };
+    });
 }
 
 pub fn handleWheel(
@@ -2869,13 +2842,18 @@ test "stepping onto dotdot hints and enter ascends" {
     try testing.expect(model.cursor_status != null);
 }
 
-test "mouse releases do not dismiss a fresh empty-directory flash" {
+test "mouse releases do not dismiss a fresh flash" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
-    try Io.Dir.createDir(temp.dir, testing.io, "c", .default_dir);
-    try Io.Dir.createDir(temp.dir, testing.io, "c/gc", .default_dir);
-    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "c/y.txt", .data = "y" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\n" });
+    try Io.Dir.setFilePermissions(
+        temp.dir,
+        testing.io,
+        "run.sh",
+        .fromMode(0o755),
+        .{},
+    );
 
     const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
     defer testing.allocator.free(cwd);
@@ -2895,12 +2873,6 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
     });
     defer model.deinit();
 
-    // HERE's cursor rests on `c`, so CHILDREN lists its entries.
-    const gc_index = file_system.indexOfName(
-        &model.getPane(.children).listing.?,
-        "gc",
-    ).?;
-
     var ctx: vxfw.EventContext = .{
         .io = testing.io,
         .alloc = testing.allocator,
@@ -2909,26 +2881,16 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
 
-    // A double click attempts descent... and is refused because `gc` is
-    // empty. The first press only picks the row.
-    const press: vaxis.Mouse = .{
-        .col = 0,
-        .row = 0,
-        .button = .left,
-        .mods = .{},
-        .type = .press,
-    };
-    const gc_widget = model.getPane(.children).rows[gc_index].widget();
-    try gc_widget.handleEvent(&ctx, .{ .mouse = press });
-    try testing.expect(model.getPane(.children).picked == gc_index);
-    try testing.expect(model.error_message == null);
-    try gc_widget.handleEvent(&ctx, .{ .mouse = press });
+    // Refuse an executable to raise the flash.
+    const enter: Key = .{ .codepoint = Key.enter };
+    try model.handleEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqualStrings(
-        "empty directory: gc",
+        "cannot open executables",
         model.error_message.?,
     );
+    ctx.consume_event = false;
 
-    // The hardware release that follows must not wipe the fresh flash.
+    // The hardware release that trails a click must not wipe it.
     const release: vaxis.Mouse = .{
         .col = 0,
         .row = 0,
@@ -2938,7 +2900,7 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
     };
     try model.captureEvent(&ctx, .{ .mouse = release });
     try testing.expectEqualStrings(
-        "empty directory: gc",
+        "cannot open executables",
         model.error_message.?,
     );
 
@@ -2947,6 +2909,18 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
         model.error_deadline.nanoseconds -
         Io.Clock.awake.now(testing.io).nanoseconds;
     try testing.expect(remaining_ns > 2 * std.time.ns_per_s);
+
+    // A press, by contrast, dismisses immediately.
+    var press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    press.type = .press;
+    try model.captureEvent(&ctx, .{ .mouse = press });
+    try testing.expect(model.error_message == null);
 }
 
 test "repeated up keys hold the dotdot selection" {
@@ -3592,47 +3566,48 @@ test "side pane clicks navigate and browse focus returns to cwd" {
         .type = .press,
     };
 
-    // Single click picks and highlights the row without opening anything.
+    // Clicking a children row promotes the children pane to HERE with the
+    // clicked row selected; the children pane then renders that entry.
     const children = model.getPane(.children);
     try testing.expect(children.rows.len >= 2);
     try children.rows[0].widget().handleEvent(&ctx, .{ .mouse = click });
-    try testing.expectEqual(@as(usize, 0), opened.items.len);
-    try testing.expectEqual(@as(usize, 0), children.picked.?);
-    try testing.expect(ctx.consume_event);
-    try testing.expect(ctx.redraw);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    vxfw.DrawContext.init(.unicode);
-    const picked_surface = try children.rows[0].widget().draw(.{
-        .arena = arena.allocator(),
-        .min = .{ .width = 30, .height = 1 },
-        .max = .{ .width = 30, .height = 1 },
-        .cell_size = .{ .width = 8, .height = 16 },
-    });
-    try testing.expect(picked_surface.buffer[0].style.reverse);
-
-    // Double click opens it like `l` would.
-    ctx.consume_event = false;
-    ctx.redraw = false;
-    try children.rows[0].widget().handleEvent(&ctx, .{ .mouse = click });
-    const a_expected = try std.fs.path.join(
+    const child_path = try std.fs.path.join(
         testing.allocator,
-        &.{ path, "child", "a.txt" },
+        &.{ path, "child" },
     );
-    defer testing.allocator.free(a_expected);
-    try testing.expectEqual(@as(usize, 1), opened.items.len);
-    try testing.expectEqualStrings(a_expected, opened.items[0]);
-    try testing.expectEqualStrings(path, model.centerListing().path);
+    defer testing.allocator.free(child_path);
+    try testing.expectEqualStrings(child_path, model.centerListing().path);
+    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    // The clicked file renders its text preview in the children pane.
+    const child_pane = model.getPane(.children);
+    try testing.expect(child_pane.listing == null);
+    try testing.expect(child_pane.preview.?.kind == .text);
+    try testing.expectEqualStrings("a", child_pane.preview.?.lines[0]);
+    // No opener involved for pane promotion.
+    try testing.expectEqual(@as(usize, 0), opened.items.len);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
     // Clicking a parent row ascends into the parent directory with that
     // row selected — like `h`, but picking the row.
     ctx.consume_event = false;
-    const parent = model.getPane(.parent);
-    const sibling_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
-    // The parent pane lists cwd's parent, so `sibling` is a sibling of cwd.
+    ctx.redraw = false;
+    var parent = model.getPane(.parent);
+    var pick_index = file_system.indexOfName(&parent.listing.?, "child").?;
+    try parent.rows[pick_index].widget().handleEvent(&ctx, .{ .mouse = click });
+    try testing.expectEqualStrings(path, model.centerListing().path);
+    try testing.expectEqual(pick_index, model.centerListing().cursor);
+    // The old HERE listing transferred to CHILDREN.
+    try testing.expectEqualStrings(
+        child_path,
+        model.getPane(.children).listing.?.path,
+    );
+
+    // A second parent click climbs again, this time picking `sibling`.
+    parent = model.getPane(.parent);
+    pick_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
+    try parent.rows[pick_index].widget().handleEvent(&ctx, .{ .mouse = click });
     const sub_expected = try std.fs.path.join(testing.allocator, &.{
         process_cwd,
         ".zig-cache",
@@ -3640,24 +3615,8 @@ test "side pane clicks navigate and browse focus returns to cwd" {
         &temp.sub_path,
     });
     defer testing.allocator.free(sub_expected);
-    try parent.rows[sibling_index].widget().handleEvent(&ctx, .{ .mouse = click });
     try testing.expectEqualStrings(sub_expected, model.centerListing().path);
-    try testing.expectEqual(
-        sibling_index,
-        model.centerListing().cursor,
-    );
-    // CHILDREN mirrors the picked row: its directory listing.
-    const sibling_listing = try std.fs.path.join(
-        testing.allocator,
-        &.{ sub_expected, "sibling" },
-    );
-    defer testing.allocator.free(sibling_listing);
-    try testing.expectEqualStrings(
-        sibling_listing,
-        model.getPane(.children).listing.?.path,
-    );
-    try testing.expect(ctx.consume_event);
-    try testing.expect(ctx.redraw);
+    try testing.expectEqual(pick_index, model.centerListing().cursor);
 
     // Return home for the focus-flow checks: select cwd, then descend.
     ctx.consume_event = false;

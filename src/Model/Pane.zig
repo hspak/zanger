@@ -86,9 +86,6 @@ listing: ?file_system.Listing,
 preview: ?Preview,
 // Owned widgets parallel to the active listing or preview lines.
 rows: []Row,
-// Row picked by mouse in the children pane, rendered highlighted until the
-// content is replaced. Null when nothing is picked.
-picked: ?usize = null,
 // Stable location marker for the center directory in the parent listing.
 cwd_index: ?usize,
 list_view: vxfw.ListView,
@@ -118,7 +115,6 @@ pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
         .preview = null,
         .rows = &.{},
         .cwd_index = null,
-        .picked = null,
         .list_view = undefined,
         .up_row = .{ .pane = self },
     };
@@ -262,8 +258,6 @@ pub fn replace(self: *Pane, replacement: Replacement) void {
     self.preview = replacement.preview;
     self.rows = replacement.rows;
     self.cwd_index = replacement.cwd_index;
-    // Picked rows belong to the replaced content.
-    self.picked = null;
     self.resetListView(replacement.cursor);
 }
 
