@@ -300,6 +300,70 @@ fn centerListing(self: *Model) *file_system.Listing {
     return &self.getPane(.here).listing.?;
 }
 
+/// Asserts the model's structural invariants without allocating or touching
+/// the filesystem. Kept in production builds so Debug callers can validate
+/// every commit boundary; tests also call it after mixed action sequences.
+pub fn assertValid(self: *const Model) void {
+    const here = &self.panes[PaneRole.here.toIndex()];
+    const center = &(here.listing orelse @panic("HERE must own a listing"));
+
+    for (&self.panes) |*pane| {
+        std.debug.assert(!(pane.listing != null and pane.preview != null));
+        const item_count = pane.itemCount();
+        std.debug.assert(pane.rows.len == item_count);
+        std.debug.assert(pane.list_view.item_count == @as(u32, @intCast(item_count)));
+        if (item_count == 0) {
+            std.debug.assert(pane.list_view.cursor == 0);
+        } else {
+            std.debug.assert(pane.list_view.cursor < item_count);
+        }
+        if (pane.listing) |listing| {
+            std.debug.assert(listing.rows.len == listing.entries.len);
+            std.debug.assert(listing.selected.capacity() == listing.entries.len);
+            std.debug.assert(listing.selected_count == listing.selected.count());
+            std.debug.assert(listing.cursor == pane.list_view.cursor);
+            if (listing.entries.len == 0) {
+                std.debug.assert(listing.cursor == 0);
+            } else {
+                std.debug.assert(listing.cursor < listing.entries.len);
+            }
+        }
+        if (pane.preview) |preview| {
+            std.debug.assert(preview.header_lines <= preview.lines.len);
+        }
+    }
+
+    if (self.up_selected) std.debug.assert(here.showsUpRow());
+    if (self.panes[PaneRole.parent.toIndex()].listing) |parent| {
+        const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
+        std.debug.assert(cwd_index < parent.entries.len);
+        std.debug.assert(std.mem.eql(
+            u8,
+            parent.path,
+            std.fs.path.dirname(center.path) orelse "/",
+        ));
+        std.debug.assert(std.mem.eql(
+            u8,
+            parent.entries[cwd_index].name,
+            std.fs.path.basename(center.path),
+        ));
+    }
+
+    const children = &self.panes[PaneRole.children.toIndex()];
+    if (!self.preview_dirty and !self.up_selected and children.listing != null) {
+        std.debug.assert(center.entries.len > 0);
+        const entry = center.entries[center.cursor];
+        const child = children.listing.?;
+        std.debug.assert(entry.is_dir);
+        std.debug.assert(std.mem.eql(
+            u8,
+            std.fs.path.dirname(child.path) orelse "/",
+            center.path,
+        ));
+        std.debug.assert(std.mem.eql(u8, std.fs.path.basename(child.path), entry.name));
+    }
+}
+
 /// Loads the bottom-bar metadata for one entry. Stat failures return null so
 /// the bar degrades to counts; allocation failure propagates because callers
 /// roll back transactionally on OOM.
@@ -817,6 +881,7 @@ fn replaceAnchoredView(
     self.last_click = null;
     self.up_click_at_ns = null;
     self.up_selected = false;
+    self.assertValid();
 }
 
 fn installPane(self: *Model, role: PaneRole, options: InstallOptions) !void {
@@ -913,6 +978,7 @@ fn syncRight(self: *Model) !void {
                 if (std.mem.eql(u8, listing.path, desired)) {
                     center.setDirectoryEmpty(center.cursor, false);
                     self.preview_dirty = false;
+                    self.assertValid();
                     return;
                 }
             }
@@ -927,6 +993,7 @@ fn syncRight(self: *Model) !void {
             try self.clearPane(.children);
             try self.setMessage("preview unavailable: {s}", .{error_name});
             self.preview_dirty = false;
+            self.assertValid();
             return;
         }
         if (outcome.dir_is_empty) |is_empty| {
@@ -949,6 +1016,7 @@ fn syncRight(self: *Model) !void {
         .cursor = cursor,
     });
     self.preview_dirty = false;
+    self.assertValid();
 }
 
 fn reconcileWatcher(self: *Model) !bool {
