@@ -14,6 +14,7 @@ const Watcher = @import("Watcher.zig");
 const command = @import("command.zig");
 const file_system = @import("file_system.zig");
 const format = @import("Model/format.zig");
+const input = @import("Model/input.zig");
 const interaction = @import("Model/interaction.zig");
 const scheduler = @import("Model/scheduler.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
@@ -25,6 +26,7 @@ pub const Row = @import("Model/Row.zig");
 pub const HereCursor = @import("Model/cursor.zig").Here;
 
 const ListingTransfer = PendingView.ListingTransfer;
+const BrowseAction = input.BrowseAction;
 
 const Model = @This();
 
@@ -94,6 +96,18 @@ const CursorScroll = enum {
     none,
     ensure_visible,
     jump,
+};
+
+const EventEffect = enum {
+    consume,
+    redraw,
+
+    fn apply(self: EventEffect, ctx: *vxfw.EventContext) void {
+        switch (self) {
+            .consume => ctx.consumeEvent(),
+            .redraw => ctx.consumeAndRedraw(),
+        }
+    }
 };
 
 pub const PaneRole = enum(u2) {
@@ -1315,7 +1329,7 @@ pub fn handleRowClick(
     self: *Model,
     ctx: *vxfw.EventContext,
     index: usize,
-) Allocator.Error!void {
+) !void {
     _ = try self.setHereCursor(ctx, .{ .entry = index }, .none);
 
     const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
@@ -1336,7 +1350,7 @@ pub fn handleRowClick(
         try self.openWithSystem(target, entry.name);
         return;
     }
-    self.openCenter() catch |err| try self.reportError("open", @errorName(err));
+    try self.openCenter();
 }
 
 /// Handles a left press on HERE's pinned `..` row. One press selects it and a
@@ -1349,7 +1363,7 @@ pub fn handleUpClick(self: *Model, ctx: *vxfw.EventContext) !void {
         double_click_interval_ms * std.time.ns_per_ms,
     );
     if (!is_double) return;
-    self.ascend() catch |err| try self.reportError("up", @errorName(err));
+    try self.ascend();
 }
 
 /// Navigates HERE into the parent directory with the clicked row selected
@@ -1383,10 +1397,9 @@ pub fn handleWheel(
     self: *Model,
     ctx: *vxfw.EventContext,
     direction: WheelDirection,
-) !void {
+) !bool {
     if (self.wheel_pending == direction) {
-        ctx.consumeEvent();
-        return;
+        return false;
     }
 
     if (self.wheel_pending == null) {
@@ -1394,15 +1407,14 @@ pub fn handleWheel(
     }
     self.wheel_pending = direction;
     try self.moveCenter(ctx, direction == .down);
-    ctx.consumeAndRedraw();
+    return true;
 }
 
-fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
+fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !bool {
     const pane = self.getPane(.here);
-    const listing = pane.listing() orelse return;
+    const listing = pane.listing() orelse return false;
     if (listing.entries.len == 0 or self.here_cursor.isUp() and !down) {
-        ctx.consumeEvent();
-        return;
+        return false;
     }
 
     const distance = @max(@as(usize, 1), @as(usize, self.cwd_visible_rows) / 2);
@@ -1411,11 +1423,7 @@ fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
         listing.entries.len,
         distance,
     );
-    if (!try self.setHereCursor(ctx, target, .ensure_visible)) {
-        ctx.consumeEvent();
-        return;
-    }
-    ctx.consumeAndRedraw();
+    return try self.setHereCursor(ctx, target, .ensure_visible);
 }
 
 fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
@@ -1636,16 +1644,69 @@ fn submitCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !void
     }
 }
 
-fn isDownKey(key: Key) bool {
-    return key.matches('j', .{}) or
-        key.matches('n', .{ .ctrl = true }) or
-        key.matches(Key.down, .{});
+fn performBrowseAction(
+    self: *Model,
+    ctx: *vxfw.EventContext,
+    action: BrowseAction,
+) !EventEffect {
+    return switch (action) {
+        .half_page_down => if (try self.halfJumpCenter(ctx, true)) .redraw else .consume,
+        .half_page_up => if (try self.halfJumpCenter(ctx, false)) .redraw else .consume,
+        .move_down => move: {
+            try self.moveCenter(ctx, true);
+            break :move .consume;
+        },
+        .move_up => move: {
+            try self.moveCenter(ctx, false);
+            break :move .consume;
+        },
+        .toggle_hidden => hidden: {
+            try self.changeHiddenVisibility();
+            break :hidden .redraw;
+        },
+        .open => open: {
+            try self.openCenter();
+            break :open .redraw;
+        },
+        .ascend => ascend: {
+            try self.ascend();
+            break :ascend .redraw;
+        },
+        .jump_first => jump: {
+            try self.jumpCenter(ctx, false);
+            break :jump .redraw;
+        },
+        .jump_last => jump: {
+            try self.jumpCenter(ctx, true);
+            break :jump .redraw;
+        },
+        .toggle_selection => selection: {
+            try self.toggleSelection(ctx);
+            break :selection .redraw;
+        },
+        .absorb_tab => .consume,
+        .command => command_mode: {
+            try self.openCommand(ctx);
+            break :command_mode .redraw;
+        },
+        .quit => quit: {
+            ctx.quit = true;
+            break :quit .consume;
+        },
+    };
 }
 
-fn isUpKey(key: Key) bool {
-    return key.matches('k', .{}) or
-        key.matches('p', .{ .ctrl = true }) or
-        key.matches(Key.up, .{});
+fn dispatchBrowseAction(
+    self: *Model,
+    ctx: *vxfw.EventContext,
+    action: BrowseAction,
+) !void {
+    const effect = self.performBrowseAction(ctx, action) catch |err| {
+        try self.reportError(action.errorLabel(), @errorName(err));
+        ctx.consumeAndRedraw();
+        return;
+    };
+    effect.apply(ctx);
 }
 
 fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
@@ -1667,31 +1728,11 @@ fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void 
 
     switch (self.mode) {
         .browse => {
-            if (key.matches('d', .{ .ctrl = true })) {
-                self.halfJumpCenter(ctx, true) catch |err|
-                    try self.reportError("half-page", @errorName(err));
-                return;
-            }
-            if (key.matches('u', .{ .ctrl = true })) {
-                self.halfJumpCenter(ctx, false) catch |err|
-                    try self.reportError("half-page", @errorName(err));
-                return;
-            }
-            if (isDownKey(key)) {
-                self.moveCenter(ctx, true) catch |err|
-                    try self.reportError("move", @errorName(err));
-                // Movement is fully handled here. Consuming stops propagation
-                // before the focused ListView's own movement handler would
-                // step the cursor a second time.
-                ctx.consumeEvent();
-                return;
-            }
-            if (isUpKey(key)) {
-                self.moveCenter(ctx, false) catch |err|
-                    try self.reportError("move", @errorName(err));
-                ctx.consumeEvent();
-                return;
-            }
+            const action = input.browseAction(key) orelse return;
+            if (action.phase() != .capture) return;
+            // Capture-owned movement must stop before the focused ListView's
+            // own movement handler can step the cursor a second time.
+            try self.dispatchBrowseAction(ctx, action);
         },
         .command => {
             if (key.matches(Key.escape, .{})) {
@@ -1743,40 +1784,9 @@ fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
         },
         .key_press => |key| {
             if (self.mode != .browse) return;
-
-            if (key.matches('h', .{ .ctrl = true })) {
-                self.changeHiddenVisibility() catch |err|
-                    try self.reportError("hidden", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches(Key.enter, .{}) or key.matches('l', .{})) {
-                self.openCenter() catch |err| try self.reportError("open", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches('h', .{}) or key.matches(Key.backspace, .{})) {
-                self.ascend() catch |err| try self.reportError("up", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches('g', .{})) {
-                self.jumpCenter(ctx, false) catch |err|
-                    try self.reportError("jump", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches('g', .{ .shift = true }) or key.matches('G', .{})) {
-                self.jumpCenter(ctx, true) catch |err|
-                    try self.reportError("jump", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches(Key.space, .{})) {
-                self.toggleSelection(ctx) catch |err|
-                    try self.reportError("select", @errorName(err));
-                ctx.consumeAndRedraw();
-            } else if (key.matches(Key.tab, .{ .shift = true }) or
-                key.matches(Key.tab, .{}))
-            {
-                ctx.consumeEvent();
-            } else if (key.matches(':', .{})) {
-                try self.openCommand(ctx);
-                ctx.consumeAndRedraw();
-            } else if (key.matches('q', .{})) {
-                ctx.quit = true;
-                ctx.consumeEvent();
-            }
+            const action = input.browseAction(key) orelse return;
+            if (action.phase() != .bubble) return;
+            try self.dispatchBrowseAction(ctx, action);
         },
         else => {},
     }

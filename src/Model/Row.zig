@@ -40,13 +40,17 @@ fn typeErasedEventHandler(
             if (!interaction.isLeftPress(mouse)) return;
             if (self.index >= self.pane.itemCount()) return;
             defer ctx.consumeAndRedraw();
-            switch (self.pane.role) {
-                .here => try self.pane.model.handleRowClick(ctx, self.index),
+            const result = switch (self.pane.role) {
+                .here => self.pane.model.handleRowClick(ctx, self.index),
                 // Side-pane clicks navigate instead of focusing: a parent row
                 // jumps HERE to that sibling, a children row descends into it.
-                .parent => try self.pane.model.handleParentClick(self.index),
-                .children => try self.pane.model.handleChildrenClick(self.index),
-            }
+                .parent => self.pane.model.handleParentClick(self.index),
+                .children => self.pane.model.handleChildrenClick(self.index),
+            };
+            result catch |err| {
+                const label = if (self.pane.role == .here) "open" else "navigate";
+                try self.pane.model.reportError(label, @errorName(err));
+            };
         },
         else => {},
     }

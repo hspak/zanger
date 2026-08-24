@@ -91,7 +91,9 @@ pub const UpRow = struct {
                 if (self.pane.model.mode != .browse) return;
                 if (!interaction.isLeftPress(mouse)) return;
                 defer ctx.consumeAndRedraw();
-                try self.pane.model.handleUpClick(ctx);
+                self.pane.model.handleUpClick(ctx) catch |err| {
+                    try self.pane.model.reportError("up", @errorName(err));
+                };
             },
             else => {},
         }
@@ -203,7 +205,16 @@ fn typeErasedCaptureHandler(
         return;
     }
 
-    try self.model.handleWheel(ctx, direction);
+    const moved = self.model.handleWheel(ctx, direction) catch |err| {
+        try self.model.reportError("move", @errorName(err));
+        ctx.consumeAndRedraw();
+        return;
+    };
+    if (moved) {
+        ctx.consumeAndRedraw();
+    } else {
+        ctx.consumeEvent();
+    }
 }
 
 /// Whether this pane renders the clickable `..` line: only a HERE pane that
