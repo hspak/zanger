@@ -244,7 +244,6 @@ pub fn resetListView(self: *Pane, cursor: u32) void {
         .wheel_scroll = 0,
         .item_count = count,
     };
-    if (self.listing) |*listing| listing.cursor = self.list_view.cursor;
 }
 
 /// Replaces the pane payload, moving ownership of every staged field and

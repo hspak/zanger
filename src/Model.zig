@@ -307,6 +307,10 @@ fn centerListing(self: *Model) *file_system.Listing {
     return &self.getPane(.here).listing.?;
 }
 
+fn hereEntryIndex(self: *const Model) ?usize {
+    return self.here_cursor.selectedEntry();
+}
+
 fn normalizeHereCursor(self: *Model, target: HereCursor) HereCursor {
     const pane = self.getPane(.here);
     const listing = &(pane.listing orelse return .none);
@@ -337,7 +341,6 @@ fn applyHereCursor(
     const pane = self.getPane(.here);
     const numeric_index = normalized.rememberedEntry() orelse 0;
     pane.list_view.cursor = @intCast(numeric_index);
-    if (pane.listing) |*listing| listing.cursor = numeric_index;
     if (!normalized.isUp()) switch (scroll) {
         .none => {},
         .ensure_visible => pane.list_view.ensureScroll(),
@@ -388,12 +391,6 @@ pub fn assertValid(self: *const Model) void {
             std.debug.assert(listing.rows.len == listing.entries.len);
             std.debug.assert(listing.selected.capacity() == listing.entries.len);
             std.debug.assert(listing.selected_count == listing.selected.count());
-            std.debug.assert(listing.cursor == pane.list_view.cursor);
-            if (listing.entries.len == 0) {
-                std.debug.assert(listing.cursor == 0);
-            } else {
-                std.debug.assert(listing.cursor < listing.entries.len);
-            }
         }
         if (pane.preview) |preview| {
             std.debug.assert(preview.header_lines <= preview.lines.len);
@@ -406,14 +403,14 @@ pub fn assertValid(self: *const Model) void {
             std.debug.assert(here.showsUpRow());
             if (remembered) |index| {
                 std.debug.assert(index < center.entries.len);
-                std.debug.assert(index == center.cursor);
+                std.debug.assert(index == here.list_view.cursor);
             } else {
                 std.debug.assert(center.entries.len == 0);
             }
         },
         .entry => |index| {
             std.debug.assert(index < center.entries.len);
-            std.debug.assert(index == center.cursor);
+            std.debug.assert(index == here.list_view.cursor);
         },
     }
     if (self.panes[PaneRole.parent.toIndex()].listing) |parent| {
@@ -434,7 +431,7 @@ pub fn assertValid(self: *const Model) void {
     const children = &self.panes[PaneRole.children.toIndex()];
     if (!self.preview_dirty and !self.here_cursor.isUp() and children.listing != null) {
         std.debug.assert(center.entries.len > 0);
-        const entry = center.entries[center.cursor];
+        const entry = center.entries[self.hereEntryIndex().?];
         const child = children.listing.?;
         std.debug.assert(entry.is_dir);
         std.debug.assert(std.mem.eql(
@@ -615,8 +612,8 @@ fn prepareView(
         .{ .show_hidden = self.show_hidden },
     )) return error.EmptyDirectory;
     if (reject_empty_center and center.entries.len == 0) return error.EmptyDirectory;
-    center.restoreCursor(preferred_name, fallback_cursor);
-    pending_view.cursors[center_index] = @intCast(center.cursor);
+    const center_cursor = center.cursorFor(preferred_name, fallback_cursor);
+    pending_view.cursors[center_index] = @intCast(center_cursor);
 
     if (!std.mem.eql(u8, center.path, "/")) {
         const parent_path = try file_system.parentPath(self.alloc, center.path);
@@ -630,11 +627,11 @@ fn prepareView(
             if (!std.mem.eql(u8, candidate.path, parent_path))
                 break :parent_reused false;
             const parent = pending_view.borrowListing(transfer.source, .parent, candidate);
-            parent.restoreCursor(std.fs.path.basename(center.path), null);
-            pending_view.cursors[parent_index] = @intCast(parent.cursor);
-            pending_view.cwd_indices[parent_index] = parent.cursor;
+            const parent_cursor = parent.cursorFor(std.fs.path.basename(center.path), null);
+            pending_view.cursors[parent_index] = @intCast(parent_cursor);
+            pending_view.cwd_indices[parent_index] = parent_cursor;
             pending_view.directory_empty_transfers[parent_index] = .{
-                .index = parent.cursor,
+                .index = parent_cursor,
                 .is_empty = center.entries.len == 0,
             };
             break :parent_reused true;
@@ -653,16 +650,19 @@ fn prepareView(
                 },
             };
             if (pending_view.listings[parent_index]) |*parent| {
-                parent.restoreCursor(std.fs.path.basename(center.path), null);
-                parent.setDirectoryEmpty(parent.cursor, center.entries.len == 0);
-                pending_view.cursors[parent_index] = @intCast(parent.cursor);
-                pending_view.cwd_indices[parent_index] = parent.cursor;
+                const parent_cursor = parent.cursorFor(
+                    std.fs.path.basename(center.path),
+                    null,
+                );
+                parent.setDirectoryEmpty(parent_cursor, center.entries.len == 0);
+                pending_view.cursors[parent_index] = @intCast(parent_cursor);
+                pending_view.cwd_indices[parent_index] = parent_cursor;
             }
         }
     }
 
     if (center.entries.len > 0) {
-        const entry = center.entries[center.cursor];
+        const entry = center.entries[center_cursor];
         const cursor_path = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(cursor_path);
         pending_view.cursor_status = try self.loadCursorStatus(cursor_path, entry.name);
@@ -677,11 +677,11 @@ fn prepareView(
     if (reused_children) |candidate| {
         const children_parent = std.fs.path.dirname(candidate.path) orelse "/";
         const matches_selected = center.entries.len > 0 and
-            center.entries[center.cursor].is_dir and
+            center.entries[center_cursor].is_dir and
             std.mem.eql(u8, center.path, children_parent) and
             std.mem.eql(
                 u8,
-                center.entries[center.cursor].name,
+                center.entries[center_cursor].name,
                 std.fs.path.basename(candidate.path),
             );
         if (matches_selected) {
@@ -689,7 +689,7 @@ fn prepareView(
                 &pending_view,
                 .here,
                 center,
-                center.cursor,
+                center_cursor,
                 candidate.entries.len == 0,
             );
             if (candidate.entries.len == 0) {
@@ -704,7 +704,9 @@ fn prepareView(
                     .children,
                     candidate,
                 );
-                pending_view.cursors[PaneRole.children.toIndex()] = @intCast(children.cursor);
+                _ = children;
+                pending_view.cursors[PaneRole.children.toIndex()] =
+                    self.getPane(transfer.source).list_view.cursor;
             }
             reused_applied = true;
         }
@@ -718,7 +720,7 @@ fn prepareView(
                 "empty directory",
             );
         } else {
-            const entry = center.entries[center.cursor];
+            const entry = center.entries[center_cursor];
             const outcome = try self.buildChildrenOutcome(
                 center.path,
                 entry,
@@ -732,7 +734,7 @@ fn prepareView(
                         &pending_view,
                         .here,
                         center,
-                        center.cursor,
+                        center_cursor,
                         is_empty,
                     );
                 }
@@ -741,7 +743,7 @@ fn prepareView(
                 if (outcome.content) |content| switch (content) {
                     .listing => |listing| {
                         pending_view.listings[child_index] = listing;
-                        pending_view.cursors[child_index] = @intCast(listing.cursor);
+                        pending_view.cursors[child_index] = 0;
                     },
                     .preview => |preview| pending_view.previews[child_index] = preview,
                     .none => {},
@@ -871,13 +873,11 @@ fn replaceAnchoredView(
     }
     errdefer if (pending_watch) |watch| self.watcher.cancel(watch);
 
-    const fallback_cursor = options.fallback_cursor orelse
-        if (options.restore_here_from) |listing| listing.cursor else null;
     var pending_view = try self.prepareView(
         center_path,
         options.preferred_name,
         options.transfers,
-        fallback_cursor,
+        options.fallback_cursor,
         options.reject_empty_center,
     );
     defer pending_view.deinit();
@@ -965,7 +965,7 @@ fn replaceAnchoredView(
     const committed_center = self.centerListing();
     self.here_cursor = HereCursor.fromEntryCount(
         committed_center.entries.len,
-        committed_center.cursor,
+        self.getPane(.here).list_view.cursor,
     );
     self.assertValid();
 }
@@ -1055,14 +1055,15 @@ fn syncRight(self: *Model) !void {
         self.cursor_status = null;
         replacement_preview = try Preview.initMessage(self.alloc, "empty directory");
     } else {
-        const entry = center.entries[center.cursor];
+        const center_cursor = self.hereEntryIndex().?;
+        const entry = center.entries[center_cursor];
         const desired = try file_system.joinPath(self.alloc, center.path, entry.name);
         defer self.alloc.free(desired);
         self.cursor_status = try self.loadCursorStatus(desired, entry.name);
         if (entry.is_dir) {
             if (right.listing) |listing| {
                 if (std.mem.eql(u8, listing.path, desired)) {
-                    center.setDirectoryEmpty(center.cursor, false);
+                    center.setDirectoryEmpty(center_cursor, false);
                     self.preview_dirty = false;
                     self.assertValid();
                     return;
@@ -1083,7 +1084,7 @@ fn syncRight(self: *Model) !void {
             return;
         }
         if (outcome.dir_is_empty) |is_empty| {
-            center.setDirectoryEmpty(center.cursor, is_empty);
+            center.setDirectoryEmpty(center_cursor, is_empty);
         }
         if (outcome.content) |content| switch (content) {
             .listing => |listing| replacement_listing = listing,
@@ -1092,14 +1093,10 @@ fn syncRight(self: *Model) !void {
         };
     }
 
-    const cursor: u32 = if (replacement_listing) |listing|
-        @intCast(listing.cursor)
-    else
-        0;
     try self.installPane(.children, .{
         .listing = &replacement_listing,
         .preview = &replacement_preview,
-        .cursor = cursor,
+        .cursor = 0,
     });
     self.preview_dirty = false;
     self.assertValid();
@@ -1117,13 +1114,12 @@ fn reconcileWatcher(self: *Model) !bool {
         return false;
 
     const center = self.centerListing();
-    const preferred = if (center.entries.len > 0)
-        center.entries[center.cursor].name
-    else
-        null;
+    const center_cursor = self.hereEntryIndex();
+    const preferred = if (center_cursor) |index| center.entries[index].name else null;
     const rearm_watcher = self.watch_refresh == .rearm;
     self.replaceAnchoredView(center.path, .{
         .preferred_name = preferred,
+        .fallback_cursor = center_cursor,
         .transfers = &.{.{ .source = .parent, .target = .parent }},
         .restore_here_from = center,
         .preserve_message = true,
@@ -1234,8 +1230,8 @@ fn openCenter(self: *Model) !void {
         return;
     }
     const listing = self.centerListing();
-    if (listing.entries.len == 0) return;
-    const entry = listing.entries[listing.cursor];
+    const center_cursor = self.hereEntryIndex() orelse return;
+    const entry = listing.entries[center_cursor];
     if (!entry.is_dir) {
         const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
         defer self.alloc.free(target);
@@ -1259,7 +1255,7 @@ fn openCenter(self: *Model) !void {
         .reject_empty_center = true,
     }) catch |err| switch (err) {
         error.EmptyDirectory => {
-            listing.setDirectoryEmpty(listing.cursor, true);
+            listing.setDirectoryEmpty(center_cursor, true);
             try self.flashError("empty directory: {s}", .{entry.name});
         },
         else => return err,
@@ -1322,8 +1318,8 @@ pub fn handleRowClick(
 
     self.last_click = null;
     const listing = self.centerListing();
-    if (listing.entries.len == 0) return;
-    const entry = listing.entries[listing.cursor];
+    const center_cursor = self.hereEntryIndex() orelse return;
+    const entry = listing.entries[center_cursor];
     if (!entry.is_dir) {
         // Double-clicking anything but a directory opens it like `l` does.
         const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
@@ -1420,8 +1416,8 @@ fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
 fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
     const pane = self.getPane(.here);
     const listing = if (pane.listing) |*listing| listing else return;
-    if (listing.entries.len == 0 or self.hereCursorOnUp()) return;
-    listing.toggleSelected();
+    const center_cursor = self.hereEntryIndex() orelse return;
+    listing.toggleSelected(center_cursor);
     try self.setMessage("", .{});
 
     const target = self.here_cursor.step(true, listing.entries.len, pane.showsUpRow());
@@ -1436,12 +1432,12 @@ fn selectedCount(self: *const Model) usize {
 fn deleteCount(self: *const Model) usize {
     const pane = &self.panes[PaneRole.here.toIndex()];
     const listing = pane.listing orelse return 0;
-    if (listing.entries.len == 0) return 0;
+    const center_cursor = self.hereEntryIndex() orelse return 0;
     const use_selection = listing.selectedCount() > 0;
     var count: usize = 0;
     for (listing.entries, 0..) |_, index| {
         if (use_selection and !listing.selected.isSet(index)) continue;
-        if (!use_selection and index != listing.cursor) continue;
+        if (!use_selection and index != center_cursor) continue;
         count += 1;
     }
     return count;
@@ -1465,11 +1461,9 @@ fn beginDelete(self: *Model, ctx: *vxfw.EventContext) !void {
 
 fn executeDelete(self: *Model) !void {
     const listing = self.centerListing();
+    const center_cursor = self.hereEntryIndex() orelse return;
     const use_selection = listing.selectedCount() > 0;
-    const preferred = if (listing.entries.len > 0)
-        listing.entries[listing.cursor].name
-    else
-        null;
+    const preferred = listing.entries[center_cursor].name;
     const center_path = listing.path;
 
     var targets: std.ArrayList(DeleteTarget) = .empty;
@@ -1480,7 +1474,7 @@ fn executeDelete(self: *Model) !void {
     try targets.ensureTotalCapacity(self.alloc, self.deleteCount());
     for (listing.entries, 0..) |entry, index| {
         if (use_selection and !listing.selected.isSet(index)) continue;
-        if (!use_selection and index != listing.cursor) continue;
+        if (!use_selection and index != center_cursor) continue;
 
         const target_path = try file_system.joinPath(self.alloc, listing.path, entry.name);
         targets.appendAssumeCapacity(.{
@@ -1505,7 +1499,7 @@ fn executeDelete(self: *Model) !void {
 
     try self.replaceAnchoredView(center_path, .{
         .preferred_name = preferred,
-        .fallback_cursor = listing.cursor,
+        .fallback_cursor = center_cursor,
         .transfers = &.{.{ .source = .parent, .target = .parent }},
     });
     if (failed > 0) {
@@ -1587,8 +1581,8 @@ fn changeHiddenVisibility(self: *Model) !void {
     self.show_hidden = enabled;
 
     const center = self.centerListing();
-    const preferred = if (center.entries.len > 0)
-        center.entries[center.cursor].name
+    const preferred = if (self.hereEntryIndex()) |index|
+        center.entries[index].name
     else
         null;
     self.replaceAnchoredView(center.path, .{ .preferred_name = preferred }) catch |err| {
@@ -2229,14 +2223,14 @@ test "ctrl-d and ctrl-u move half the visible cwd rows" {
     const ctrl_u: Key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } };
 
     try model.captureEvent(&ctx, .{ .key_press = ctrl_d });
-    try testing.expectEqual(@as(usize, 5), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 5), model.hereEntryIndex().?);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
     ctx.consume_event = false;
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = ctrl_u });
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 
@@ -2244,12 +2238,12 @@ test "ctrl-d and ctrl-u move half the visible cwd rows" {
     ctx.consume_event = false;
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = ctrl_d });
-    try testing.expectEqual(@as(usize, 19), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 19), model.hereEntryIndex().?);
 
     ctx.consume_event = false;
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = ctrl_u });
-    try testing.expectEqual(@as(usize, 14), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 14), model.hereEntryIndex().?);
 }
 
 test "browse movement keys move one row and are consumed" {
@@ -2293,14 +2287,14 @@ test "browse movement keys move one row and are consumed" {
 
     const down: Key = .{ .codepoint = 'j' };
     try model.captureEvent(&ctx, .{ .key_press = down });
-    try testing.expectEqual(@as(usize, 1), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
     try testing.expect(ctx.consume_event);
     ctx.consume_event = false;
 
     const up: Key = .{ .codepoint = 'k' };
     try model.captureEvent(&ctx, .{ .key_press = up });
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
     try testing.expect(ctx.consume_event);
 }
@@ -2353,9 +2347,9 @@ test "ctrl-u saturates at the first entry instead of wrapping" {
     defer ctx.cmds.deinit(ctx.alloc);
     const ctrl_u: Key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } };
 
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try model.captureEvent(&ctx, .{ .key_press = ctrl_u });
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
 }
 
 test "space toggles consecutive selections and advances the cursor" {
@@ -2396,7 +2390,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try model.handleEvent(&ctx, .{ .key_press = space });
     var center = model.centerListing();
     try testing.expect(center.selected.isSet(0));
-    try testing.expectEqual(@as(usize, 1), center.cursor);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
     try testing.expect(model.preview_dirty);
     try testing.expect(model.preview_tick_pending);
@@ -2445,13 +2439,13 @@ test "space toggles consecutive selections and advances the cursor" {
     try model.handleEvent(&ctx, .{ .key_press = space });
     center = model.centerListing();
     try testing.expect(center.selected.isSet(1));
-    try testing.expectEqual(@as(usize, 2), center.cursor);
+    try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 2), center.selectedCount());
 
     try model.handleEvent(&ctx, .{ .key_press = space });
     center = model.centerListing();
     try testing.expect(center.selected.isSet(2));
-    try testing.expectEqual(@as(usize, 2), center.cursor);
+    try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 3), center.selectedCount());
 }
 
@@ -2495,10 +2489,10 @@ test "delete recursively removes selected directories and their children" {
     const listing = model.centerListing();
     const directory_index = file_system.indexOfName(listing, "selected").?;
     _ = model.applyHereCursor(.{ .entry = directory_index }, .none);
-    listing.toggleSelected();
+    listing.toggleSelected(directory_index);
     const file_index = file_system.indexOfName(listing, "selected.txt").?;
     _ = model.applyHereCursor(.{ .entry = file_index }, .none);
-    listing.toggleSelected();
+    listing.toggleSelected(file_index);
 
     try model.executeDelete();
 
@@ -2558,17 +2552,19 @@ test "delete keeps the cursor row and clamps it at the end" {
     try model.executeDelete();
 
     listing = model.centerListing();
-    try testing.expectEqual(@as(usize, 1), listing.cursor);
+    var center_cursor = model.hereEntryIndex().?;
+    try testing.expectEqual(@as(usize, 1), center_cursor);
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
-    try testing.expectEqualStrings("c.txt", listing.entries[listing.cursor].name);
+    try testing.expectEqualStrings("c.txt", listing.entries[center_cursor].name);
     try testing.expectEqualStrings("c.txt", model.cursor_status.?.entry_name);
 
     try model.executeDelete();
 
     listing = model.centerListing();
-    try testing.expectEqual(@as(usize, 0), listing.cursor);
+    center_cursor = model.hereEntryIndex().?;
+    try testing.expectEqual(@as(usize, 0), center_cursor);
     try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
-    try testing.expectEqualStrings("a.txt", listing.entries[listing.cursor].name);
+    try testing.expectEqualStrings("a.txt", listing.entries[center_cursor].name);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
 }
 
@@ -3163,7 +3159,7 @@ test "dotdot selection blocks entry-scoped input and jumps clear it" {
     try testing.expect(!model.hereCursorOnUp());
     try testing.expectEqualStrings(
         "b.txt",
-        model.centerListing().entries[model.centerListing().cursor].name,
+        model.centerListing().entries[model.hereEntryIndex().?].name,
     );
 }
 
@@ -3298,7 +3294,7 @@ test "parent clicks ascend and select an empty picked row" {
     ).?;
     try model.handleParentClick(index);
     try testing.expectEqualStrings(root_path, model.centerListing().path);
-    try testing.expectEqual(index, model.centerListing().cursor);
+    try testing.expectEqual(index, model.hereEntryIndex().?);
 
     // CHILDREN mirrors the picked empty directory.
     const child_pane = model.getPane(.children);
@@ -3341,7 +3337,7 @@ test "parent clicks ascend and select a picked file row" {
     ).?;
     try model.handleParentClick(index);
     try testing.expectEqualStrings(root_path, model.centerListing().path);
-    try testing.expectEqual(index, model.centerListing().cursor);
+    try testing.expectEqual(index, model.hereEntryIndex().?);
 
     // CHILDREN mirrors the picked file with its rendered contents.
     const child_pane = model.getPane(.children);
@@ -3397,7 +3393,7 @@ test "double click on a directory descends into it" {
     // First press only moves the cursor.
     try row_widget.handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqual(index, model.centerListing().cursor);
+    try testing.expectEqual(index, model.hereEntryIndex().?);
 
     // Second press inside the window descends.
     try row_widget.handleEvent(&ctx, .{ .mouse = press });
@@ -3473,7 +3469,7 @@ test "double click requires the same row within the interval" {
     try rows[a_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try rows[b_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqual(b_index, model.centerListing().cursor);
+    try testing.expectEqual(b_index, model.hereEntryIndex().?);
 
     // Double-clicking a regular file opens it through the system opener.
     const f_index = file_system.indexOfName(model.centerListing(), "f.txt").?;
@@ -3574,13 +3570,13 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     const parent_cursor = model.getPane(.parent).list_view.cursor;
     try model.getPane(.parent).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(parent_cursor, model.getPane(.parent).list_view.cursor);
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(ctx.consume_event);
     try testing.expect(!ctx.redraw);
 
     ctx.consume_event = false;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
-    try testing.expectEqual(@as(usize, 1), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expect(model.preview_dirty);
     try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
     model.preview_due = .zero;
@@ -3597,7 +3593,7 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     ctx.redraw = false;
     const command_count = ctx.cmds.items.len;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
-    try testing.expectEqual(@as(usize, 1), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(command_count, ctx.cmds.items.len);
     try testing.expect(ctx.consume_event);
     try testing.expect(!ctx.redraw);
@@ -3607,7 +3603,7 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     ctx.cmds.clearRetainingCapacity();
     mouse.button = .wheel_up;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(model.preview_dirty);
     try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
     model.preview_due = .zero;
@@ -3690,7 +3686,7 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     );
     defer testing.allocator.free(child_path);
     try testing.expectEqualStrings(child_path, model.centerListing().path);
-    try testing.expectEqual(@as(usize, 0), model.centerListing().cursor);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     // The clicked file renders its text preview in the children pane.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
@@ -3709,7 +3705,7 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     var pick_index = file_system.indexOfName(&parent.listing.?, "child").?;
     try parent.rows[pick_index].widget().handleEvent(&ctx, .{ .mouse = click });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqual(pick_index, model.centerListing().cursor);
+    try testing.expectEqual(pick_index, model.hereEntryIndex().?);
     // The old HERE listing transferred to CHILDREN.
     try testing.expectEqualStrings(
         child_path,
@@ -3728,7 +3724,7 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     });
     defer testing.allocator.free(sub_expected);
     try testing.expectEqualStrings(sub_expected, model.centerListing().path);
-    try testing.expectEqual(pick_index, model.centerListing().cursor);
+    try testing.expectEqual(pick_index, model.hereEntryIndex().?);
 
     // Return home for the focus-flow checks: select cwd, then descend.
     ctx.consume_event = false;
@@ -3844,7 +3840,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
     var center = model.centerListing();
     const beta_index = file_system.indexOfName(center, "beta.txt").?;
     _ = model.applyHereCursor(.{ .entry = beta_index }, .none);
-    center.toggleSelected();
+    center.toggleSelected(beta_index);
     center.rebuildRows();
     try model.setMessage("keep this message", .{});
     const parent_path_pointer = model.getPane(.parent).listing.?.path.ptr;
@@ -3874,8 +3870,9 @@ test "watcher refresh preserves cursor selection and parent listing" {
 
     center = model.centerListing();
     try testing.expect(file_system.indexOfName(center, "gamma.txt") != null);
-    try testing.expectEqualStrings("beta.txt", center.entries[center.cursor].name);
-    try testing.expect(center.selected.isSet(center.cursor));
+    var center_cursor = model.hereEntryIndex().?;
+    try testing.expectEqualStrings("beta.txt", center.entries[center_cursor].name);
+    try testing.expect(center.selected.isSet(center_cursor));
     try testing.expectEqual(@as(usize, 1), center.selectedCount());
     try testing.expectEqual(parent_path_pointer, model.getPane(.parent).listing.?.path.ptr);
     try testing.expectEqualStrings("keep this message", model.message);
@@ -3890,7 +3887,8 @@ test "watcher refresh preserves cursor selection and parent listing" {
 
     center = model.centerListing();
     try testing.expect(file_system.indexOfName(center, "beta.txt") == null);
-    try testing.expectEqualStrings("gamma.txt", center.entries[center.cursor].name);
+    center_cursor = model.hereEntryIndex().?;
+    try testing.expectEqualStrings("gamma.txt", center.entries[center_cursor].name);
     try testing.expectEqual(@as(usize, 0), center.selectedCount());
     try testing.expect(ctx.redraw);
 }
@@ -4023,8 +4021,9 @@ test "anchored model navigation" {
     defer model.deinit();
 
     const center = model.centerListing();
+    const center_cursor = model.hereEntryIndex().?;
     try testing.expectEqualStrings(path, center.path);
-    try testing.expectEqualStrings("child", center.entries[center.cursor].name);
+    try testing.expectEqualStrings("child", center.entries[center_cursor].name);
     const right = model.getPane(.children).listing.?;
     const expected_right = try file_system.joinPath(testing.allocator, path, "child");
     defer testing.allocator.free(expected_right);
@@ -4035,7 +4034,7 @@ test "anchored model navigation" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     vxfw.DrawContext.init(.unicode);
-    const row_surface = try model.getPane(.here).rows[center.cursor].widget().draw(.{
+    const row_surface = try model.getPane(.here).rows[center_cursor].widget().draw(.{
         .arena = arena.allocator(),
         .min = .{ .width = 30, .height = 1 },
         .max = .{ .width = 30, .height = 1 },
@@ -4059,7 +4058,7 @@ test "anchored model navigation" {
     });
     try testing.expect(parent_surface.buffer[0].style.reverse);
 
-    center.toggleSelected();
+    center.toggleSelected(center_cursor);
     try testing.expectEqual(@as(usize, 1), center.selectedCount());
     try model.openCenter();
     try testing.expectEqualStrings(expected_right, model.centerListing().path);
@@ -4068,17 +4067,18 @@ test "anchored model navigation" {
     try testing.expectEqual(@as(usize, 1), model.getPane(.parent).listing.?.selectedCount());
     try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
     const descended_path_pointer = model.centerListing().path.ptr;
-    model.centerListing().toggleSelected();
+    model.centerListing().toggleSelected(model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 1), model.centerListing().selectedCount());
 
     try model.ascend();
     const ascended = model.centerListing();
+    const ascended_cursor = model.hereEntryIndex().?;
     try testing.expectEqualStrings(path, ascended.path);
     try testing.expectEqualStrings(
         "child",
-        ascended.entries[ascended.cursor].name,
+        ascended.entries[ascended_cursor].name,
     );
-    try testing.expect(ascended.selected.isSet(ascended.cursor));
+    try testing.expect(ascended.selected.isSet(ascended_cursor));
     try testing.expectEqual(@as(usize, 1), ascended.selectedCount());
     try testing.expectEqual(
         descended_path_pointer,
@@ -4103,7 +4103,7 @@ test "anchored model navigation" {
     try model.openCenter();
     try testing.expectEqual(reascended_path_pointer, model.centerListing().path.ptr);
     try testing.expectEqualStrings("empty directory: child", model.error_message.?);
-    try testing.expect(model.centerListing().entries[model.centerListing().cursor].is_empty.?);
+    try testing.expect(model.centerListing().entries[model.hereEntryIndex().?].is_empty.?);
 }
 
 test "children preview shows empty directories and file metadata" {
@@ -4143,8 +4143,9 @@ test "children preview shows empty directories and file metadata" {
     defer model.deinit();
 
     const center = model.centerListing();
-    try testing.expectEqualStrings("empty", center.entries[center.cursor].name);
-    try testing.expectEqualStrings("     empty", center.rows[center.cursor]);
+    const center_cursor = model.hereEntryIndex().?;
+    try testing.expectEqualStrings("empty", center.entries[center_cursor].name);
+    try testing.expectEqualStrings("     empty", center.rows[center_cursor]);
     var child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing == null);
     try testing.expect(child_pane.preview.?.kind == .placeholder);
@@ -4170,17 +4171,17 @@ test "children preview shows empty directories and file metadata" {
 
     // Enter may arrive before the debounced CHILDREN preview has established
     // emptiness. The pending view must still be rejected before commit.
-    model.centerListing().entries[model.centerListing().cursor].is_empty = null;
+    model.centerListing().entries[model.hereEntryIndex().?].is_empty = null;
     try model.openCenter();
     try testing.expectEqual(original_center_path, model.centerListing().path.ptr);
-    try testing.expect(model.centerListing().entries[model.centerListing().cursor].is_empty.?);
+    try testing.expect(model.centerListing().entries[model.hereEntryIndex().?].is_empty.?);
 
     child_pane = model.getPane(.children);
     try testing.expect(child_pane.preview.?.kind == .placeholder);
     try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
     try testing.expectEqualStrings(
         "     empty",
-        model.centerListing().rows[model.centerListing().cursor],
+        model.centerListing().rows[model.hereEntryIndex().?],
     );
 
     const current_center = model.centerListing();

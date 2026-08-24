@@ -41,8 +41,6 @@ pub const Listing = struct {
     path: []const u8,
     /// Owned entries; names and optional link targets are backed by `strings`.
     entries: []Entry,
-    /// Zero for an empty listing; otherwise indexes `entries`.
-    cursor: usize = 0,
     /// Contains one bit per entry.
     selected: std.DynamicBitSetUnmanaged = .{},
     /// Cached population count for constant-time status rendering.
@@ -63,22 +61,19 @@ pub const Listing = struct {
         self.* = undefined;
     }
 
-    /// Restores a cursor by name, then by fallback index, and otherwise selects
-    /// the first entry. An empty listing always uses index zero.
-    pub fn restoreCursor(
-        self: *Listing,
+    /// Chooses a UI cursor by name, then by fallback index, and otherwise the
+    /// first entry. An empty listing uses index zero as the vxfw sentinel.
+    pub fn cursorFor(
+        self: *const Listing,
         preferred_name: ?[]const u8,
         fallback: ?usize,
-    ) void {
+    ) usize {
         if (preferred_name) |name| {
             for (self.entries, 0..) |entry, index| {
-                if (std.mem.eql(u8, entry.name, name)) {
-                    self.cursor = index;
-                    return;
-                }
+                if (std.mem.eql(u8, entry.name, name)) return index;
             }
         }
-        self.cursor = if (self.entries.len == 0)
+        return if (self.entries.len == 0)
             0
         else
             @min(fallback orelse 0, self.entries.len - 1);
@@ -89,17 +84,17 @@ pub const Listing = struct {
         return self.selected_count;
     }
 
-    /// Toggles the cursor entry. The cursor must identify an existing entry.
-    pub fn toggleSelected(self: *Listing) void {
-        std.debug.assert(self.cursor < self.entries.len);
-        if (self.selected.isSet(self.cursor)) {
-            self.selected.unset(self.cursor);
+    /// Toggles one entry's selection. `index` must identify an entry.
+    pub fn toggleSelected(self: *Listing, index: usize) void {
+        std.debug.assert(index < self.entries.len);
+        if (self.selected.isSet(index)) {
+            self.selected.unset(index);
             self.selected_count -= 1;
         } else {
-            self.selected.set(self.cursor);
+            self.selected.set(index);
             self.selected_count += 1;
         }
-        self.refreshRow(self.cursor);
+        self.refreshRow(index);
     }
 
     /// Clears every selected entry and updates their display rows.
@@ -609,7 +604,7 @@ test "symlinks display targets and classify directory targets" {
     try testing.expectEqualStrings("     dangling -> missing", listing.rows[dangling_index]);
 }
 
-test "restoreCursor prefers names and clamps fallback indices" {
+test "cursorFor prefers names and clamps fallback indices" {
     const alloc = testing.allocator;
     var tree = try test_support.TempTree.init(alloc, testing_io);
     defer tree.deinit();
@@ -620,15 +615,9 @@ test "restoreCursor prefers names and clamps fallback indices" {
     var listing = try readDir(alloc, testing_io, tree.path, .{});
     defer listing.deinit();
 
-    listing.cursor = 0;
-    listing.restoreCursor("b.txt", null);
-    try testing.expectEqual(@as(usize, 1), listing.cursor);
-
-    listing.restoreCursor("no-such-file", 1);
-    try testing.expectEqual(@as(usize, 1), listing.cursor);
-
-    listing.restoreCursor(null, 99);
-    try testing.expectEqual(@as(usize, 1), listing.cursor);
+    try testing.expectEqual(@as(usize, 1), listing.cursorFor("b.txt", null));
+    try testing.expectEqual(@as(usize, 1), listing.cursorFor("no-such-file", 1));
+    try testing.expectEqual(@as(usize, 1), listing.cursorFor(null, 99));
 }
 
 test "selection toggle and count" {
@@ -643,16 +632,16 @@ test "selection toggle and count" {
 
     const row_storage_pointer = listing.row_storage.ptr;
     try testing.expectEqual(@as(usize, 0), listing.selectedCount());
-    listing.toggleSelected();
+    listing.toggleSelected(0);
     try testing.expectEqual(@as(usize, 1), listing.selectedCount());
     try testing.expectEqualStrings("✓    a.txt", listing.rows[0]);
     try testing.expectEqual(row_storage_pointer, listing.row_storage.ptr);
-    listing.toggleSelected();
+    listing.toggleSelected(0);
     try testing.expectEqual(@as(usize, 0), listing.selectedCount());
     try testing.expectEqualStrings("     a.txt", listing.rows[0]);
     try testing.expectEqual(row_storage_pointer, listing.row_storage.ptr);
 
-    listing.toggleSelected();
+    listing.toggleSelected(0);
     listing.clearSelection();
     try testing.expectEqual(@as(usize, 0), listing.selectedCount());
     try testing.expectEqualStrings("     a.txt", listing.rows[0]);
