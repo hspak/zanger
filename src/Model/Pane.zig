@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -37,10 +38,21 @@ pub const UpRow = struct {
                 if (self.pane.model.mode != .browse) return;
                 if (mouse.button != .left or mouse.type != .press) return;
                 defer ctx.consumeAndRedraw();
-                // Highlight first so the click lands like a keyboard step.
-                self.pane.model.up_selected = true;
-                return self.pane.model.ascend() catch |err| {
-                    try self.pane.model.reportError("up", @errorName(err));
+
+                // Single press highlights; a second press inside the
+                // double-click window ascends.
+                const model = self.pane.model;
+                const now_ns = Io.Clock.awake.now(model.io).nanoseconds;
+                const is_double = if (model.up_click_at_ns) |at|
+                    now_ns - at <= Model.double_click_interval_ms * std.time.ns_per_ms
+                else
+                    false;
+                model.up_click_at_ns = if (is_double) null else now_ns;
+                model.up_selected = true;
+                if (!is_double) return;
+
+                model.ascend() catch |err| {
+                    try model.reportError("up", @errorName(err));
                 };
             },
             else => {},

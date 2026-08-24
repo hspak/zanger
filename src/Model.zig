@@ -46,6 +46,9 @@ preview_tick_pending: bool = false,
 preview_due: Io.Timestamp = .zero,
 // Left-press bookkeeping for double-click descent on HERE rows.
 last_click: ?LastClick = null,
+/// Timestamp of the last press on the `..` row, for its own double-click
+/// detection.
+up_click_at_ns: ?i128 = null,
 /// True while the HERE cursor rests on the `..` row. The listing cursor
 /// keeps pointing at its last real entry; every consumer branches on this.
 up_selected: bool = false,
@@ -78,7 +81,7 @@ hostname: []const u8 = "localhost",
 const Mode = enum { browse, command, confirm };
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
-const double_click_interval_ms = 400;
+pub const double_click_interval_ms = 400;
 const error_flash_ms = 3000;
 const preview_debounce_ms = 12;
 const wheel_coalesce_ms = 12;
@@ -810,6 +813,7 @@ fn replaceAnchoredView(
     // A press from before this transaction must not pair with a press after
     // it: row indices belong to different listings.
     self.last_click = null;
+    self.up_click_at_ns = null;
     self.up_selected = false;
 }
 
@@ -3107,7 +3111,7 @@ test "clicking the dotdot row ascends and it hides at the root" {
         try testing.expect(cell.style.bold);
     }
 
-    // Clicking it ascends one level.
+    // First press highlights; a second press inside the window ascends.
     const press: vaxis.Mouse = .{
         .col = 0,
         .row = 0,
@@ -3122,6 +3126,14 @@ test "clicking the dotdot row ascends and it hides at the root" {
         .redraw = false,
     };
     defer ctx.cmds.deinit(ctx.alloc);
+
+    try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
+    try testing.expect(model.up_selected);
+    try testing.expectEqualStrings(d_path, model.centerListing().path);
+    try testing.expect(ctx.consume_event);
+    try testing.expect(ctx.redraw);
+
+    ctx.consume_event = false;
     try model.getPane(.here).up_row.widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(root_path, model.centerListing().path);
     try testing.expect(ctx.consume_event);
