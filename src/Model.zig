@@ -143,14 +143,40 @@ const DeleteTarget = struct {
     is_dir: bool,
 };
 
-const ReplaceViewOptions = struct {
+const ViewTransition = union(enum) {
+    initial,
+    descend,
+    ascend,
+    pick_parent: []const u8,
+    promote_children: []const u8,
+    watch_refresh: bool,
+    deletion_refresh: struct {
+        preferred_name: []const u8,
+        fallback_cursor: usize,
+    },
+    rebuild: ?[]const u8,
+    recover_ancestor,
+};
+
+const ViewPlan = struct {
     preferred_name: ?[]const u8 = null,
     fallback_cursor: ?usize = null,
-    transfers: []const ListingTransfer = &.{},
+    transfer_storage: [2]ListingTransfer = undefined,
+    transfer_count: usize = 0,
     restore_here_from: ?*const file_system.Listing = null,
     preserve_message: bool = false,
     rearm_watcher: bool = false,
     reject_empty_center: bool = false,
+
+    fn addTransfer(self: *ViewPlan, transfer: ListingTransfer) void {
+        std.debug.assert(self.transfer_count < self.transfer_storage.len);
+        self.transfer_storage[self.transfer_count] = transfer;
+        self.transfer_count += 1;
+    }
+
+    fn transfers(self: *const ViewPlan) []const ListingTransfer {
+        return self.transfer_storage[0..self.transfer_count];
+    }
 };
 
 /// Owns a headless model used by the profiling executable.
@@ -244,7 +270,7 @@ pub fn init(self: *Model, alloc: Allocator, io: Io, options: InitOptions) InitEr
     self.text_field.onSubmit = typeErasedCommandSubmit;
 
     errdefer self.deinit();
-    try self.replaceAnchoredView(options.start_path, .{});
+    try self.replaceAnchoredView(options.start_path, .initial);
 }
 
 /// Frees all model-owned resources and poisons `self`.
@@ -289,6 +315,63 @@ fn wheelTimerWidget(self: *Model) vxfw.Widget {
 
 fn getPane(self: *Model, role: PaneRole) *Pane {
     return &self.panes[role.toIndex()];
+}
+
+fn planViewTransition(
+    self: *Model,
+    center_path: []const u8,
+    transition: ViewTransition,
+) ViewPlan {
+    var plan: ViewPlan = .{};
+    switch (transition) {
+        .initial, .recover_ancestor => {},
+        .descend => {
+            plan.reject_empty_center = true;
+            plan.addTransfer(.{ .source = .here, .target = .parent });
+            if (self.getPane(.children).listing()) |children| {
+                if (std.mem.eql(u8, children.path, center_path)) {
+                    plan.addTransfer(.{ .source = .children, .target = .here });
+                }
+            }
+        },
+        .ascend => {
+            const center = self.centerListing();
+            plan.preferred_name = std.fs.path.basename(center.path);
+            plan.addTransfer(.{ .source = .here, .target = .children });
+            // PARENT may be stale, so HERE is read afresh; its selection is
+            // restored by entry name from the side-pane snapshot.
+            plan.restore_here_from = self.getPane(.parent).listing();
+        },
+        .pick_parent => |preferred_name| {
+            plan.preferred_name = preferred_name;
+            plan.addTransfer(.{ .source = .here, .target = .children });
+        },
+        .promote_children => |preferred_name| {
+            plan.preferred_name = preferred_name;
+            plan.addTransfer(.{ .source = .children, .target = .here });
+            plan.addTransfer(.{ .source = .here, .target = .parent });
+        },
+        .watch_refresh => |rearm_watcher| {
+            const center = self.centerListing();
+            const center_cursor = self.hereEntryIndex();
+            plan.preferred_name = if (center_cursor) |index|
+                center.entries[index].name
+            else
+                null;
+            plan.fallback_cursor = center_cursor;
+            plan.addTransfer(.{ .source = .parent, .target = .parent });
+            plan.restore_here_from = center;
+            plan.preserve_message = true;
+            plan.rearm_watcher = rearm_watcher;
+        },
+        .deletion_refresh => |refresh| {
+            plan.preferred_name = refresh.preferred_name;
+            plan.fallback_cursor = refresh.fallback_cursor;
+            plan.addTransfer(.{ .source = .parent, .target = .parent });
+        },
+        .rebuild => |preferred_name| plan.preferred_name = preferred_name,
+    }
+    return plan;
 }
 
 fn centerListing(self: *Model) *file_system.Listing {
@@ -894,8 +977,9 @@ fn freeRetiredRows(self: *Model) void {
 fn replaceAnchoredView(
     self: *Model,
     center_path: []const u8,
-    options: ReplaceViewOptions,
+    transition: ViewTransition,
 ) !void {
+    var plan = self.planViewTransition(center_path, transition);
     const current_center_path = if (self.getPane(.here).listing()) |listing|
         listing.path
     else
@@ -905,23 +989,23 @@ fn replaceAnchoredView(
     else
         true;
     var pending_watch: ?Watcher.Pending = null;
-    if (options.rearm_watcher or path_changed or !self.watcher.hasCurrent()) {
+    if (plan.rearm_watcher or path_changed or !self.watcher.hasCurrent()) {
         pending_watch = try self.watcher.prepare(center_path);
     }
     errdefer if (pending_watch) |watch| self.watcher.cancel(watch);
 
     var pending_view = try self.prepareView(
         center_path,
-        options.preferred_name,
-        options.transfers,
-        options.fallback_cursor,
-        options.reject_empty_center,
+        plan.preferred_name,
+        plan.transfers(),
+        plan.fallback_cursor,
+        plan.reject_empty_center,
     );
     defer pending_view.deinit();
 
     const next_center_pending = pending_view.pane(.here);
     const next_center = next_center_pending.listing().?;
-    if (options.restore_here_from) |previous| {
+    if (plan.restore_here_from) |previous| {
         std.debug.assert(next_center_pending.listing_source == null);
         // Rewrite only rows whose selection bit changed; work is proportional
         // to restored selections, not to the size of the new listing.
@@ -945,7 +1029,7 @@ fn replaceAnchoredView(
 
     const next_message = if (pending_view.preview_error_name) |error_name|
         try std.fmt.allocPrint(self.alloc, "preview unavailable: {s}", .{error_name})
-    else if (options.preserve_message)
+    else if (plan.preserve_message)
         try self.alloc.dupe(u8, self.message)
     else
         try self.alloc.dupe(u8, "");
@@ -1072,18 +1156,11 @@ fn reconcileWatcher(self: *Model) !bool {
         self.preview_schedule.isDirty())
         return false;
 
-    const center = self.centerListing();
-    const center_cursor = self.hereEntryIndex();
-    const preferred = if (center_cursor) |index| center.entries[index].name else null;
     const rearm_watcher = self.watch_refresh == .rearm;
-    self.replaceAnchoredView(center.path, .{
-        .preferred_name = preferred,
-        .fallback_cursor = center_cursor,
-        .transfers = &.{.{ .source = .parent, .target = .parent }},
-        .restore_here_from = center,
-        .preserve_message = true,
-        .rearm_watcher = rearm_watcher,
-    }) catch |err| {
+    self.replaceAnchoredView(
+        self.centerListing().path,
+        .{ .watch_refresh = rearm_watcher },
+    ) catch |err| {
         // Clear the pending refresh either way: later filesystem events
         // schedule a fresh one, so retrying on a timer would only repeat the
         // failure every tick.
@@ -1122,7 +1199,7 @@ fn recoverMissingCenter(self: *Model, failure: anyerror) !void {
         candidate = next;
     }
 
-    self.replaceAnchoredView(candidate, .{}) catch |err| {
+    self.replaceAnchoredView(candidate, .recover_ancestor) catch |err| {
         try self.reportError("watcher", @errorName(failure));
         return err;
     };
@@ -1200,19 +1277,7 @@ fn openCenter(self: *Model) !void {
     const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
     defer self.alloc.free(target);
 
-    var transfers: [2]ListingTransfer = undefined;
-    transfers[0] = .{ .source = .here, .target = .parent };
-    var transfer_count: usize = 1;
-    if (self.getPane(.children).listing()) |children| {
-        if (std.mem.eql(u8, children.path, target)) {
-            transfers[1] = .{ .source = .children, .target = .here };
-            transfer_count = 2;
-        }
-    }
-    self.replaceAnchoredView(target, .{
-        .transfers = transfers[0..transfer_count],
-        .reject_empty_center = true,
-    }) catch |err| switch (err) {
+    self.replaceAnchoredView(target, .descend) catch |err| switch (err) {
         error.EmptyDirectory => {
             listing.setDirectoryEmpty(center_cursor, true);
             try self.flashError("empty directory: {s}", .{entry.name});
@@ -1229,20 +1294,7 @@ pub fn ascend(self: *Model) !void {
     }
     const target = try file_system.parentPath(self.alloc, center.path);
     defer self.alloc.free(target);
-    const previous_parent = if (self.getPane(.parent).listing()) |parent|
-        parent
-    else
-        null;
-    try self.replaceAnchoredView(target, .{
-        .preferred_name = std.fs.path.basename(center.path),
-        .transfers = &.{.{
-            .source = .here,
-            .target = .children,
-        }},
-        // PARENT may be stale, so HERE is still read afresh. Its selection is
-        // restored by entry name from the side-pane snapshot.
-        .restore_here_from = previous_parent,
-    });
+    try self.replaceAnchoredView(target, .ascend);
 }
 
 fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
@@ -1311,10 +1363,7 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
 
     // Ascending transfers the old HERE listing to CHILDREN, which is exact:
     // the new HERE is the old children's parent directory.
-    try self.replaceAnchoredView(listing.path, .{
-        .preferred_name = entry.name,
-        .transfers = &.{.{ .source = .here, .target = .children }},
-    });
+    try self.replaceAnchoredView(listing.path, .{ .pick_parent = entry.name });
 }
 
 /// Promotes the children pane to HERE with the clicked row selected as its
@@ -1327,13 +1376,7 @@ pub fn handleChildrenClick(self: *Model, index: usize) !void {
     if (index >= listing.entries.len) return;
     const entry = listing.entries[index];
 
-    try self.replaceAnchoredView(listing.path, .{
-        .preferred_name = entry.name,
-        .transfers = &.{
-            .{ .source = .children, .target = .here },
-            .{ .source = .here, .target = .parent },
-        },
-    });
+    try self.replaceAnchoredView(listing.path, .{ .promote_children = entry.name });
 }
 
 pub fn handleWheel(
@@ -1465,11 +1508,10 @@ fn executeDelete(self: *Model) !void {
         deleted += 1;
     }
 
-    try self.replaceAnchoredView(center_path, .{
+    try self.replaceAnchoredView(center_path, .{ .deletion_refresh = .{
         .preferred_name = preferred,
         .fallback_cursor = center_cursor,
-        .transfers = &.{.{ .source = .parent, .target = .parent }},
-    });
+    } });
     if (failed > 0) {
         try self.setMessage(
             "deleted {d}; {d} failed ({s})",
@@ -1554,7 +1596,7 @@ fn changeHiddenVisibility(self: *Model) !void {
         center.entries[index].name
     else
         null;
-    self.replaceAnchoredView(center.path, .{ .preferred_name = preferred }) catch |err| {
+    self.replaceAnchoredView(center.path, .{ .rebuild = preferred }) catch |err| {
         self.show_hidden = previous;
         return err;
     };
@@ -2780,7 +2822,7 @@ test "flashed errors render red beside the path and expire" {
         .{},
     );
     // Rebuild HERE so run.sh is visible.
-    try model.replaceAnchoredView(path, .{});
+    try model.replaceAnchoredView(path, .initial);
     const index = file_system.indexOfName(model.centerListing(), "run.sh").?;
     _ = model.applyHereCursor(.{ .entry = index }, .none);
     try model.openCenter();
@@ -4090,6 +4132,91 @@ test "children sync allocation failures preserve the committed projection" {
     }
     try testing.expect(failure_count > 0);
     try testing.expect(reached_success);
+}
+
+test "view transition planner derives the legal transfer matrix" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "child", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{
+        .sub_path = "child/inside.txt",
+        .data = "inside",
+    });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = path });
+    defer model.deinit();
+
+    const child_path = try testing.allocator.dupe(
+        u8,
+        model.getPane(.children).listing().?.path,
+    );
+    defer testing.allocator.free(child_path);
+    var plan = model.planViewTransition(child_path, .descend);
+    try testing.expect(plan.reject_empty_center);
+    try testing.expectEqual(@as(usize, 2), plan.transfer_count);
+    try testing.expectEqual(
+        ListingTransfer{ .source = .here, .target = .parent },
+        plan.transfers()[0],
+    );
+    try testing.expectEqual(
+        ListingTransfer{ .source = .children, .target = .here },
+        plan.transfers()[1],
+    );
+
+    plan = model.planViewTransition("/stale-target", .descend);
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
+    try testing.expectEqual(
+        ListingTransfer{ .source = .here, .target = .parent },
+        plan.transfers()[0],
+    );
+
+    plan = model.planViewTransition(path, .ascend);
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
+    try testing.expect(plan.restore_here_from != null);
+    try testing.expectEqual(
+        ListingTransfer{ .source = .here, .target = .children },
+        plan.transfers()[0],
+    );
+
+    plan = model.planViewTransition(path, .{ .promote_children = "inside.txt" });
+    try testing.expectEqual(@as(usize, 2), plan.transfer_count);
+    try testing.expectEqualStrings("inside.txt", plan.preferred_name.?);
+    try testing.expectEqual(
+        ListingTransfer{ .source = .children, .target = .here },
+        plan.transfers()[0],
+    );
+    try testing.expectEqual(
+        ListingTransfer{ .source = .here, .target = .parent },
+        plan.transfers()[1],
+    );
+
+    plan = model.planViewTransition(path, .{ .watch_refresh = true });
+    try testing.expect(plan.preserve_message);
+    try testing.expect(plan.rearm_watcher);
+    try testing.expect(plan.restore_here_from == model.centerListing());
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
+    try testing.expectEqual(
+        ListingTransfer{ .source = .parent, .target = .parent },
+        plan.transfers()[0],
+    );
+
+    // An unavailable side pane simply removes the optional reuse edge; the
+    // required fresh HERE read remains represented by the same intent.
+    model.getPane(.children).content.deinit();
+    plan = model.planViewTransition(child_path, .descend);
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
 }
 
 test "replaced rows stay readable until the next draw" {
