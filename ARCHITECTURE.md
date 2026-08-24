@@ -1,6 +1,6 @@
 # Zanger Architecture
 
-Zanger is written for Zig 0.16 and Linux. It uses libvaxis/vxfw 0.6.0 for the
+Zanger is written for Zig 0.16.0 and Linux. It uses libvaxis/vxfw 0.6.0 for the
 terminal UI, Linux inotify for live directory updates, and zeit 0.9.0 for local
 status-bar timestamps.
 
@@ -13,7 +13,7 @@ The executable is split into a small entry point and focused modules:
 | [`src/main.zig`](src/main.zig) | Creates the terminal app and stable heap-allocated model, then enters the vxfw loop |
 | [`src/Model.zig`](src/Model.zig) | Owns interactive state, navigation transactions, commands, deletion, and rendering |
 | [`src/Model/Pane.zig`](src/Model/Pane.zig) | One pane's owned listing or preview, its row widgets, and wheel capture |
-| [`src/Model/PendingView.zig`](src/Model/PendingView.zig) | Stages all-or-nothing pane and watcher replacement content |
+| [`src/Model/PendingView.zig`](src/Model/PendingView.zig) | Stages all-or-nothing pane content and related model state |
 | [`src/Model/Row.zig`](src/Model/Row.zig) | Stable row widgets for click identity, clipping, and metadata styling |
 | [`src/Model/Preview.zig`](src/Model/Preview.zig) | Structured text, notice, spacer, and metadata rows for the children pane |
 | [`src/Model/cursor.zig`](src/Model/cursor.zig) | Pure HERE cursor transitions, including the pinned `..` state |
@@ -65,7 +65,7 @@ its path and the model's logical `HereCursor`:
 PARENT                         CWD / HERE                      CHILDREN
 dirname(C)                 listing for path C          projection of C/entry
     │                              │                            │
-    └─ highlight basename(C)       └─ owns cursor               ├─ directory listing
+    └─ highlight basename(C)       └─ model cursor anchor       ├─ directory listing
                                                                ├─ text contents
                                                                ├─ notice + metadata
                                                                └─ empty placeholder
@@ -82,21 +82,21 @@ The model maintains these invariants after every committed operation:
    symbolic link to one — produces a listing or an empty-directory
    placeholder, a text file produces its rendered contents, and any other
    regular file or file symbolic link produces the non-text notice followed
-   by metadata for the resolved file. Side panes accept mouse navigation
-   only: clicking a parent row ascends into the parent directory with the
-   clicked row selected as HERE's cursor (any row kind qualifies), and
-   single-clicking a children row promotes that pane to HERE with the clicked
-   row selected, so the children pane renders the row's listing or preview. Keyboard browse
-   interaction remains HERE-only. HERE also renders a `..` line
-   above its listing except at `/`; a single click or a cursor step onto it
-   highlights it (the children pane then shows a `go up one level` hint, and
-   entry-scoped input like space or deletion is refused until the cursor
-   steps back off), while a double click ascends directly.
+   by metadata for the resolved file. Side panes accept mouse navigation only:
+   clicking a parent row ascends into the parent directory with the clicked row
+   selected as HERE's cursor (any row kind qualifies), and single-clicking a
+   row in a CHILDREN directory listing promotes that listing to HERE with the
+   clicked row selected. Keyboard browse interaction remains HERE-only. HERE
+   also renders a `..` line above its listing except at `/`; a single click or
+   a cursor step onto it highlights it (the children pane then shows a `go up
+   one level` hint, and entry-scoped input like space or deletion is refused
+   until the cursor steps back off), while a double click ascends directly.
 4. Every non-empty pane has a valid `ListView` cursor and a row-widget array
    parallel to its displayed content.
 5. Selection bitsets have one bit per listing entry. Selection follows a
    directory as its listing moves between pane roles.
-6. The watcher targets HERE, never whichever widget currently has focus.
+6. Any current watcher targets HERE, never whichever widget currently has
+   focus. It can be temporarily absent after an invalidation until re-arm.
 7. Drawing performs no filesystem I/O and no persistent allocation.
 
 ### Roles are ownership, not focus
@@ -107,17 +107,18 @@ destination of listing transfers. It does not represent an active pane.
 
 Browse-mode focus always belongs to HERE's `ListView`. Command mode temporarily
 focuses the persistent `TextField`; leaving command or confirmation mode queues
-a focus request back to HERE. Tab and Shift-Tab are consumed as no-ops, PARENT
-and CHILDREN never draw active cursors, and side-pane row clicks navigate
-without taking focus. PARENT's `cwd_index` is an independent location marker,
-not a focus cursor.
+a focus request back to HERE. In browse mode, Tab and Shift-Tab are consumed as
+no-ops. PARENT and CHILDREN never draw active cursors, and side-pane row clicks
+navigate without taking focus. PARENT's `cwd_index` is an independent location
+marker, not a focus cursor.
 
 ## Transactional view replacement
 
 Navigation, rebuilds, hidden filtering, deletion refreshes, and watcher refreshes
 can require several listings and previews to change together. Installing those
 pieces one at a time would allow allocation or filesystem failures to leave the
-panes describing different paths. `PendingView` provides the transaction.
+panes describing different paths. `Model` coordinates a `PendingView` with an
+optional `Watcher.Pending` to provide the transaction.
 
 Each pane owns exactly one tagged `Pane.Content`: empty, a directory listing, or
 a preview. `PendingView` mirrors that ownership as three `PendingPane` values,
@@ -127,7 +128,7 @@ to it:
 | Staged state | Purpose |
 |---|---|
 | `panes[3].content` | One tagged payload for each pane role |
-| `panes[3].cursor` / `cwd_index` | Framework cursor and stable PARENT marker installed with that payload |
+| `panes[3].cursor` / `panes[3].cwd_index` | Framework cursor and stable PARENT marker installed with that payload |
 | `panes[3].listing_source` | Live source role when a listing is borrowed for transfer |
 | `panes[3].directory_empty_transfer` | Deferred mutation kept beside its borrowed listing |
 | `cursor_status` / `preview_error_name` | Model-level CHILDREN state committed with the panes |
@@ -138,7 +139,7 @@ The replacement flow is:
 navigation / rebuild / refresh request
         │
         ├─ derive transfer and restoration mechanics from `ViewTransition`
-        ├─ prepare an inotify watch for the candidate HERE path
+        ├─ prepare an inotify watch when the path or re-arm policy requires it
         ├─ construct required listings and previews
         ├─ validate every proposed listing transfer
         ├─ restore HERE cursor and selections when requested
@@ -148,13 +149,13 @@ navigation / rebuild / refresh request
         └─ no fallible work remains; commit
                  │
                  ├─ apply deferred state to transferred listings
-                 ├─ commit the candidate watch
+                 ├─ commit the candidate watch, when present
                  ├─ detach reusable listings from their old panes
                  ├─ replace all three pane payloads
                  └─ release unused staged content
 ```
 
-Before commit, an error deinitializes the pending view, cancels its prepared
+Before commit, an error deinitializes the pending view, cancels any prepared
 watch, and leaves the live view untouched. During commit, ownership is moved,
 not copied. A transferred source pane is detached before replacement, and an
 installed staging slot is cleared so deferred cleanup cannot free its new
@@ -167,9 +168,9 @@ Many path changes can reuse a snapshot that the UI already owns:
 
 | Operation | Existing listing | New role |
 |---|---|---|
-| Descend | old HERE | PARENT |
-| Descend | current CHILDREN listing | HERE |
-| Ascend | old HERE | CHILDREN |
+| Descend or promote CHILDREN | old HERE | PARENT |
+| Descend or promote CHILDREN | matching CHILDREN listing | HERE |
+| Ascend or pick a PARENT row | old HERE | CHILDREN |
 | Watcher refresh | old PARENT | PARENT |
 | Deletion refresh | old PARENT | PARENT |
 
@@ -184,17 +185,21 @@ ascend must reread a potentially stale parent snapshot as the new HERE,
 selection is restored by entry name.
 
 Cursor movement is intentionally smaller than a full view transaction. The
-model owns one `HereCursor` (`up`, `entry`, or `none`) and projects it into
-vxfw's HERE `ListView` through one application boundary. Movement updates that
-logical cursor immediately, leaves the last committed CHILDREN content visible,
-and schedules `syncRight` to replace only CHILDREN after input settles.
+model owns one `HereCursor` (`up`, `entry`, or `none`); `up` can remember the
+real entry to restore when movement returns to the listing. The model projects
+that state into vxfw's HERE `ListView` through one application boundary.
+Movement updates the logical cursor immediately, leaves the last committed
+CHILDREN content visible, and schedules `syncRight` to replace only CHILDREN
+after input settles.
 
-Both full replacement and `syncRight` use the same `PreparedChildren` result.
-Content, row widgets, compact cursor status, status text, directory-emptiness
-annotation, and row-retirement capacity are prepared before the live CHILDREN
-pane changes. The scheduler is also tagged: dirty work always has an already
-queued servicing tick, while an obsolete queued tick is represented explicitly
-as harmless stale work.
+Whenever CHILDREN must be built, full replacement and `syncRight` call the same
+`prepareChildren` routine and receive a `PreparedChildren`; full replacement
+also has an explicit listing-transfer fast path. `syncRight` combines that
+result with staged row widgets, status text, and row-retirement capacity before
+the live CHILDREN pane or HERE's directory-emptiness annotation changes. The
+scheduler is also tagged: dirty work always has an already queued servicing
+tick, while an obsolete queued tick is represented explicitly as harmless
+stale work.
 
 ## Filesystem snapshots and ownership
 
@@ -205,8 +210,9 @@ Snapshot construction opens the directory once and consumes its iterator.
 Ordinary entry kinds come from that iterator and do not require a separate
 `stat`. Symbolic links require a relative `readlinkat` for their displayed
 target and a relative Linux `statx` to determine whether the target should be
-navigable as a directory. Overlong or otherwise unresolvable targets remain
-visible as non-navigable links instead of failing the entire scan.
+navigable as a directory. A target-resolution failure such as a dangling link
+leaves the entry visible but non-navigable; failure to read or store the target
+still fails snapshot construction.
 
 Each listing owns:
 
@@ -217,8 +223,8 @@ Each listing owns:
 
 The cached selected count keeps status rendering constant-time. Row strings are
 updated in place when selection or known directory emptiness changes. Listing
-teardown performs a constant number of allocator operations rather than one per
-entry.
+teardown bulk-frees its owned slices and arena chunks rather than freeing each
+entry separately.
 
 Directory rows contain names or `link -> target` text. Directories are blue and
 bold, symbolic links are teal, and selection overrides those styles with yellow
@@ -227,14 +233,14 @@ filled, so a long off-screen link target does not add work to every frame.
 
 ### Metadata previews and identity caching
 
-A regular-file preview first reads up to 128 KiB and classifies the contents:
-a NUL byte or invalid UTF-8 marks the file as binary. Text files render one
-preview line per source line instead, with tabs expanded, control characters
-dropped, and a truncation marker for oversized files; empty files preview as a
-placeholder message. Binary files keep the metadata sheet under a dimmed
-italic notice reading "non-text files are not rendered", styled like the
-empty-directory placeholder. The read is bounded and debounced like all
-children work, so oversized or slow files cannot affect cursor movement.
+A regular-file preview first reads up to 128 KiB and classifies that prefix: a
+NUL byte or invalid UTF-8 marks it as binary. Text files render one preview line
+per source line instead, with tabs expanded, control characters dropped, and a
+truncation marker for oversized files; empty files preview as a placeholder
+message. Binary files keep the metadata sheet under a dimmed italic notice
+reading "non-text files are not rendered", styled like the empty-directory
+placeholder. The read is bounded and debounced like all children work, so
+oversized or slow files cannot affect cursor movement.
 
 Preview rows carry their render meaning directly as `text`, `notice`, `spacer`,
 or `field { label, value }`. Rendering switches on that tag; it never infers a
@@ -245,8 +251,10 @@ Symbolic links render like their targets: content reads and the sheet's
 `statx` resolve through the link (the bottom status bar keeps describing the
 link itself). A dangling link therefore previews as an unavailable target.
 
-A binary file's metadata sheet performs one `statx` and formats type, Unix
-mode bits, owner/group, size, modification time, writability, and link count.
+A binary file's metadata sheet formats name, type, Unix mode bits, owner/group,
+size, modification time, writability, and link count. Ordinary files reuse
+metadata already loaded for the bottom status when available; symbolic links
+load the resolved target's metadata separately.
 User and group names are resolved through `getpwuid_r` and `getgrgid_r` and
 cached by numeric ID because NSS may consult services outside local files.
 
@@ -263,29 +271,33 @@ failure still aborts initialization.
 - `j`/`k`, Ctrl-N/Ctrl-P, and arrows move HERE.
 - Ctrl-D/Ctrl-U move by half of the visible HERE rows.
 - `g`/`G` jump directly to the first or last entry.
-- Enter or `l` descends into a non-empty directory. On any other entry they
-  hand the resolved path to `xdg-open`, detached, with the child collected on
-  a later watcher tick. Only regular files without execute bits qualify —
-  `xdg-open` may execute what it is given — and excluded entries flash a
-  `cannot open executables` notice instead. Failures surface as an `open:`
-  status message.
+- Enter or `l` descends into a non-empty directory. On any other entry it first
+  follows symlinks and accepts only a regular file without execute bits, because
+  `xdg-open` may execute what it is given. Accepted paths are spawned detached
+  and their children are collected on a later recurring model tick. Refused
+  entries flash `cannot open executables`; spawn failures flash `open:` plus the
+  error name, while action-level failures use the bottom status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
 - Space toggles HERE's cursor entry and advances for bulk selection.
 - Ctrl-H toggles hidden entries and performs a full anchored rebuild.
+- `q` exits from browse mode; `:` enters command mode.
 
-Empty directories remain previews and cannot become HERE. A no-op click or jump
-does not rebuild CHILDREN. Side-pane clicks navigate: a parent row ascends
-into the parent directory with that row picked as the center cursor, and a
-children click promotes that pane to HERE with the clicked row selected. HERE
-renders a cursor-selectable `..` line above its listing except at `/`; a single
-click or cursor step highlights it, and a double click ascends. A second left
-press on the same HERE row within 400 ms descends when that row is a directory
-and opens any other non-executable entry with the system opener. Every view
-transaction clears pending-click state so presses cannot pair across listings.
+An empty directory shown in CHILDREN remains a preview and cannot be entered or
+promoted; initialization, recovery, or filtering can still leave HERE with zero
+visible entries. A no-op click or jump does not rebuild CHILDREN. Side-pane
+clicks navigate: a parent row ascends into the parent directory with that row
+picked as the center cursor, and a row click in a CHILDREN directory listing
+promotes that listing to HERE with the clicked row selected. Preview rows
+consume left presses but do not navigate. HERE renders a cursor-selectable `..`
+line above its listing except at `/`; a single click or cursor step highlights
+it, and a double click ascends. A second left press on the same HERE row within
+400 ms descends when that row is a directory and otherwise applies the same
+regular-file opener policy. Every view transaction clears pending-click state
+so presses cannot pair across listings.
 Blocked input — refused opens, empty directory descents, ascent past `/`, or
 deletion with nothing selected — flashes a red notice beside the header path
-for three seconds, cleared on a watcher tick. Any key press or mouse press
+for three seconds, cleared on a recurring model tick. Any key press or mouse press
 dismisses the notice immediately; mouse releases and motion do not. Side
 listings can retain selections for later reuse, but selection and deletion
 operations always target HERE.
@@ -295,7 +307,7 @@ click-to-select support and its scroll type is private. A HERE row click moves
 the cursor. Pane wrappers capture wheel presses before `ListView` applies its
 own viewport-only scrolling; HERE moves by one item and side panes consume the
 input without changing state. Duplicate same-direction wheel reports from one
-physical notch are coalesced.
+physical notch are coalesced within a 12 ms window.
 
 ### Debounced CHILDREN preview
 
@@ -307,7 +319,7 @@ cursor event
     ├─ mark CHILDREN stale and retain its committed content
     ├─ retain the committed bottom-bar metadata and entry name
     ├─ move the preview deadline 12 ms forward
-    └─ request redraw immediately
+    └─ queue or revise the servicing timer
              │
              └─ timer after input settles
                     ├─ build only the final preview
@@ -322,10 +334,12 @@ same commit as CHILDREN, while entry and selection counts remain live.
 
 ### Commands and modes
 
-The model has three modes: `browse`, `command`, and `confirm`. Pressing `:`
-clears and focuses the persistent command `TextField`. Escape returns to browse
-mode. Enter gives the field's temporary owned value to `submitCommand`, after
-which vxfw frees it.
+The model has three modes: `browse`, `command`, and `confirm`. They are variants
+of one tagged `Mode`; only `confirm` carries the pending deletion count. Pressing
+`:` clears and focuses the persistent command `TextField`. Escape returns to
+browse mode. Enter gives the field's temporary owned value to `submitCommand`,
+after which vxfw frees it. Header flash state similarly keeps its owned text and
+deadline together in one optional value.
 
 The parser returns one of four closed commands: `help`, `hidden`, `delete`, or
 `quit`. Any unambiguous prefix is accepted, so `d`, `dele`, `he`, `hi`, and `q`
@@ -344,6 +358,9 @@ cursor entry when there is no selection. The model copies target paths before
 mutating the filesystem. Real directories are recursively removed; symbolic
 links are unlinked even when they resolve to directories, so their targets are
 never traversed.
+
+`y` or `Y` confirms; `n`, `N`, or Escape cancels. Confirmation is modal, so all
+other input is consumed and watcher refresh waits until the mode ends.
 
 Successful partial work is retained. After deletion, the anchored view is
 refreshed, the cursor keeps its row when possible, and the status reports the
@@ -367,14 +384,15 @@ to the strongest required action:
 
 Events from retired watch descriptors are ignored. Hidden-name events are
 drained without dirtying HERE when hidden files are disabled. Event storms are
-coalesced into one refresh, and refresh is postponed while a cursor preview is
-dirty so watcher work does not interrupt active scrolling. Queue overflow or a
-self-invalidating event forces a full refresh and re-arm.
+coalesced into one refresh, and refresh is postponed while confirmation is
+active or a cursor preview is dirty so watcher work does not interrupt either
+operation. Queue overflow or a self-invalidating event forces a full refresh
+and re-arm.
 
-Watcher ownership participates in `PendingView`: navigation first prepares the
-candidate directory watch, pane preparation runs, and only a successful view
-commit makes that watch current and retires the previous descriptor. Rollback
-cancels the candidate.
+The model coordinates watcher ownership with `PendingView`: navigation prepares
+a candidate directory watch when required, pane preparation runs, and only a
+successful view commit makes that watch current and retires the previous
+descriptor. Rollback cancels the candidate.
 
 When rebuilding the anchored view fails because HERE disappeared or became
 unwatchable, the pending refresh is dropped and the model re-anchors at the
@@ -427,8 +445,9 @@ builder only wraps them in frame-local surfaces.
 
 ### Event propagation and focus
 
-For each event, vxfw rebuilds the path from the root to the focused widget and
-dispatches in three phases:
+For keyboard and focus events, vxfw dispatches along the focused-widget path
+retained from the last rendered surface tree. Mouse events hit-test that same
+tree to derive their path. Both paths dispatch in three phases:
 
 ```text
 root ──capture──▶ focused target ──bubble──▶ root
@@ -540,7 +559,7 @@ not directory size.
 ### Filesystem-specific costs
 
 - **Many ordinary entries:** every name must be copied and sorted, affecting
-  startup, reload, and first preview but not later drawing.
+  startup, watcher refresh, and first preview but not later drawing.
 - **Many symbolic links:** every link needs `readlinkat` and `statx`; relative
   syscalls and snapshot reuse limit the overhead that can be avoided.
 - **Slow, remote, FUSE, or automounted directories:** an individual synchronous
@@ -568,11 +587,12 @@ zig build profile-check -- --json
 ```
 
 The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
-links, a 1 MiB text file preview, complete model initialization, top and
-bottom large-directory frames, cursor movement and pending-preview frames,
-combined input plus draw, and a viewport of 4,000-byte link targets. `--samples=N` changes the frame sample
-count; scan sample counts are derived from it. Fixture creation and cleanup are
-outside the measured regions.
+links, a 1 MiB text-file fixture, complete model initialization, top and bottom
+large-directory frames, cursor movement and pending-preview frames, combined
+input plus draw, and 100 long links with 4,000-byte targets. The preview itself
+still obeys the production 128 KiB read bound. `--samples=N` changes the frame
+sample count; scan sample counts are derived from it. Fixture creation and
+cleanup are outside the measured regions.
 
 Regression gates use these p95 budgets:
 
@@ -588,28 +608,16 @@ Regression gates use these p95 budgets:
 The rendering budget deliberately leaves headroom below the 16 ms interaction
 target; filesystem budgets are looser to tolerate host and CI variance.
 
-Historical local measurements with a 120-by-40-cell headless frame show the
-snapshot/frame split that motivated the architecture:
-
-| Case | Debug | ReleaseSafe |
-|---|---:|---:|
-| Move the cursor onto `/lib` | 10–13 µs | 3 µs |
-| Draw while its preview is pending | 0.26 ms | 0.08 ms |
-| Build the `/lib` preview | 15.9–16.1 ms | 9.3 ms |
-| Draw with `/lib` loaded | 0.52–0.54 ms | 0.13 ms |
-| Load 20,000 ordinary files | 38.3 ms | 7.3 ms |
-| Draw the top of that listing | 1.06 ms | 0.25 ms |
-| Jump to its last entry | 13 µs | 2 µs |
-| Draw its bottom viewport | 0.90 ms | 0.18 ms |
-| Draw 100 links with 4,000-byte targets before clipping | 37.9 ms | — |
-| Draw the same long-target viewport after clipping | 0.75 ms | 0.22 ms |
+Profile output is the source of current machine-specific measurements; the
+checked-in contract is the workload configuration and p95 budget rather than a
+timing snapshot that would quickly become stale.
 
 ### Remaining latency boundary
 
-Startup, explicit reload, hidden-filter changes, deletion refresh, navigation to
-content without a reusable preview, and the eventual idle preview remain
-synchronous. A sufficiently large or slow filesystem can still make those
-operations exceed 16 ms.
+Startup, watcher-triggered refresh, hidden-filter changes, deletion refresh,
+navigation to content without a reusable preview, and the eventual idle preview
+remain synchronous. A sufficiently large or slow filesystem can still make
+those operations exceed 16 ms.
 
 The next step for a hard bound would be a generation-tagged background loader:
 build snapshots away from the UI thread, discard obsolete cursor generations,
@@ -632,18 +640,19 @@ deliberately not attempted.
 navigation, selection, deletion, timestamp, command-completion, transition,
 mixed-input invariant, and allocation-failure coverage. `Model.assertValid`
 checks committed pane ownership, row/cursor bounds, anchored paths, projections,
-and selection counts throughout integration sequences. `zig build
-profile-check` guards the performance budgets above. Tests that draw widgets
-directly create and deinitialize their own arenas; multi-frame profile workloads
-reset theirs before each frame to mirror vxfw's production lifetime.
+and selection counts throughout integration sequences. `zig build profile-check`
+guards the performance budgets above. Tests that draw widgets directly create
+and deinitialize their own arenas; multi-frame profile workloads reset theirs
+before each frame to mirror vxfw's production lifetime.
 
 The architecture is built around four boundaries:
 
-1. HERE has one model-owned logical cursor and one mutation boundary.
+1. HERE has one model-owned logical cursor. Normal movement crosses
+   `applyHereCursor`; full view commits initialize that projection atomically.
 2. `Pane.Content` and `PendingPane` make live and staged payload ownership
    explicit.
-3. `PendingView` and `PreparedChildren` are failure-atomic prepare/commit
-   boundaries for full and CHILDREN-only replacement.
+3. Model-coordinated `PendingView`/`Watcher.Pending` and `PreparedChildren`
+   staging provide failure-atomic full and CHILDREN-only replacement.
 4. The vxfw frame arena is the lifetime boundary for everything produced by
    drawing.
 
