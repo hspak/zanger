@@ -698,11 +698,7 @@ pub fn retireRows(self: *Model, rows: []Row) void {
         self.alloc.free(rows);
         return;
     }
-    self.retired_rows.append(self.alloc, rows) catch {
-        // Nothing can be done about OOM here; immediate free is safe when no
-        // frame referencing these rows was rendered yet.
-        self.alloc.free(rows);
-    };
+    self.retired_rows.appendAssumeCapacity(rows);
 }
 
 fn freeRetiredRows(self: *Model) void {
@@ -776,6 +772,11 @@ fn replaceAnchoredView(
         try self.alloc.dupe(u8, "");
     errdefer self.alloc.free(next_message);
 
+    // Pane replacement retires up to three rendered row arrays. Reserve the
+    // tracker before commit so retirement cannot fail after live state starts
+    // changing or free userdata still retained by vxfw's previous frame.
+    try self.retired_rows.ensureUnusedCapacity(self.alloc, self.panes.len);
+
     for (pending_view.directory_empty_transfers, 0..) |maybe_empty, target_index| {
         const empty_transfer = maybe_empty orelse continue;
         const source_role = pending_view.listing_sources[target_index].?;
@@ -827,6 +828,8 @@ fn installPane(self: *Model, role: PaneRole, options: InstallOptions) !void {
         0;
     const target = self.getPane(role);
     const rows = try self.makeRows(target, count);
+    errdefer self.alloc.free(rows);
+    try self.retired_rows.ensureUnusedCapacity(self.alloc, 1);
     target.replace(.{
         .listing = options.listing.*,
         .preview = options.preview.*,
