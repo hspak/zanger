@@ -1136,14 +1136,16 @@ fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
         try self.deferRightSync(ctx);
         return;
     }
-    if (!down and !self.up_selected and
-        pane.list_view.cursor == 0 and pane.showsUpRow())
-    {
-        self.up_selected = true;
-        try self.deferRightSync(ctx);
-        return;
+    if (!down) {
+        // Already on `..`: nothing exists above it, so further ups are
+        // no-ops and must not clear the selection back onto entry zero.
+        if (self.up_selected) return;
+        if (pane.list_view.cursor == 0 and pane.showsUpRow()) {
+            self.up_selected = true;
+            try self.deferRightSync(ctx);
+            return;
+        }
     }
-    self.up_selected = false;
 
     const before = pane.list_view.cursor;
     if (down) pane.list_view.nextItem(ctx) else pane.list_view.prevItem(ctx);
@@ -2837,6 +2839,78 @@ test "stepping onto dotdot hints and enter ascends" {
     try testing.expect(!model.up_selected);
     try model.syncRight();
     try testing.expect(model.cursor_status != null);
+}
+
+test "repeated up keys hold the dotdot selection" {
+    // Regression: key repeat spamming `k` toggled the highlight between
+    // `..` and the first entry because a redundant clear ran after the
+    // boundary step.
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "z.txt", .data = "z" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    // Start below the top so the first press is an ordinary move.
+    const z_index = file_system.indexOfName(model.centerListing(), "z.txt").?;
+    model.centerListing().cursor = z_index;
+    model.getPane(.here).list_view.cursor = @intCast(z_index);
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+    const up_key: Key = .{ .codepoint = 'k' };
+
+    // Hold-the-key spam: three presses in a row.
+    var press: usize = 0;
+    while (press < 3) : (press += 1) {
+        ctx.consume_event = false;
+        ctx.redraw = false;
+        try model.captureEvent(&ctx, .{ .key_press = up_key });
+        try testing.expect(ctx.consume_event);
+    }
+
+    // The selection must rest on `..`, with nothing else highlighted.
+    try testing.expect(model.up_selected);
+    try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const draw_ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 20, .height = 1 },
+        .max = .{ .width = 20, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    };
+    const up_surface = try model.getPane(.here).up_row.widget().draw(draw_ctx);
+    try testing.expect(up_surface.buffer[0].style.reverse);
+    for (model.getPane(.here).rows) |row| {
+        const surface = try row.widget().draw(draw_ctx);
+        try testing.expect(!surface.buffer[0].style.reverse);
+    }
 }
 
 test "dotdot selection blocks entry-scoped input and jumps clear it" {
