@@ -194,8 +194,17 @@ const ViewPlan = struct {
     }
 };
 
-/// Owns a headless model used by the profiling executable.
-pub const ProfileSession = struct {
+/// Owns a headless model used by the profiling executable. Compiled only
+/// into the profiling executable's module, which sets
+/// `enable_profile_session`; application builds see an empty declaration,
+/// so an accidental reference from app code fails to compile instead of
+/// silently shipping measurement hooks into release binaries.
+pub const ProfileSession = if (@import("build_options").enable_profile_session)
+    ProfileSessionImpl
+else
+    struct {};
+
+const ProfileSessionImpl = struct {
     alloc: Allocator,
     model: *Model,
 
@@ -437,70 +446,76 @@ fn setHereCursor(
     if (changed) try self.deferRightSync(ctx);
     return changed;
 }
+
 /// Asserts the model's structural invariants without allocating or touching
-/// the filesystem. Kept in production builds so Debug callers can validate
-/// every commit boundary; tests also call it after mixed action sequences.
+/// the filesystem. Only modules that opt in through the
+/// `enable_profile_session` build option — the test build and the profiling
+/// executable — analyze and emit the checks; application modules compile the
+/// function to an empty body, so no binary that ships contains them. Tests
+/// call it after mixed action sequences and every commit boundary calls it.
 pub fn assertValid(self: *const Model) void {
-    const here = &self.panes[PaneRole.here.toIndex()];
-    const center = here.listingConst() orelse @panic("HERE must own a listing");
+    if (@import("build_options").enable_profile_session) {
+        const here = &self.panes[PaneRole.here.toIndex()];
+        const center = here.listingConst() orelse @panic("HERE must own a listing");
 
-    for (&self.panes) |*pane| {
-        const item_count = pane.itemCount();
-        std.debug.assert(pane.rows.len == item_count);
-        std.debug.assert(pane.list_view.item_count == @as(u32, @intCast(item_count)));
-        if (item_count == 0) {
-            std.debug.assert(pane.list_view.cursor == 0);
-        } else {
-            std.debug.assert(pane.list_view.cursor < item_count);
+        for (&self.panes) |*pane| {
+            const item_count = pane.itemCount();
+            std.debug.assert(pane.rows.len == item_count);
+            std.debug.assert(pane.list_view.item_count == @as(u32, @intCast(item_count)));
+            if (item_count == 0) {
+                std.debug.assert(pane.list_view.cursor == 0);
+            } else {
+                std.debug.assert(pane.list_view.cursor < item_count);
+            }
+            switch (pane.content) {
+                .empty => {},
+                .listing => |listing| {
+                    std.debug.assert(listing.rows.len == listing.entries.len);
+                    std.debug.assert(listing.selected.capacity() == listing.entries.len);
+                    std.debug.assert(listing.selected_count == listing.selected.count());
+                },
+                .preview => |preview| for (preview.rows) |row| switch (row) {
+                    .field => |field| std.debug.assert(field.label.len > 0),
+                    else => {},
+                },
+            }
         }
-        switch (pane.content) {
-            .empty => {},
-            .listing => |listing| {
-                std.debug.assert(listing.rows.len == listing.entries.len);
-                std.debug.assert(listing.selected.capacity() == listing.entries.len);
-                std.debug.assert(listing.selected_count == listing.selected.count());
-            },
-            .preview => |preview| for (preview.rows) |row| switch (row) {
-                .field => |field| std.debug.assert(field.label.len > 0),
-                else => {},
+
+        switch (self.here_cursor) {
+            .none => std.debug.assert(center.entries.len == 0),
+            .entry => |index| {
+                std.debug.assert(index < center.entries.len);
+                std.debug.assert(index == here.list_view.cursor);
             },
         }
-    }
-
-    switch (self.here_cursor) {
-        .none => std.debug.assert(center.entries.len == 0),
-        .entry => |index| {
-            std.debug.assert(index < center.entries.len);
-            std.debug.assert(index == here.list_view.cursor);
-        },
-    }
-    if (self.panes[PaneRole.parent.toIndex()].listingConst()) |parent| {
-        const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
-        std.debug.assert(cwd_index < parent.entries.len);
-        std.debug.assert(std.mem.eql(
-            u8,
-            parent.path,
-            std.fs.path.dirname(center.path) orelse "/",
-        ));
-        std.debug.assert(std.mem.eql(
-            u8,
-            parent.entries[cwd_index].name,
-            std.fs.path.basename(center.path),
-        ));
-    }
-
-    const children = &self.panes[PaneRole.children.toIndex()];
-    if (!self.preview_schedule.isDirty()) {
-        if (children.listingConst()) |child| {
-            std.debug.assert(center.entries.len > 0);
-            const entry = center.entries[self.hereEntryIndex().?];
-            std.debug.assert(entry.is_dir);
+        if (self.panes[PaneRole.parent.toIndex()].listingConst()) |parent| {
+            const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
+            std.debug.assert(cwd_index < parent.entries.len);
             std.debug.assert(std.mem.eql(
                 u8,
-                std.fs.path.dirname(child.path) orelse "/",
-                center.path,
+                parent.path,
+                std.fs.path.dirname(center.path) orelse "/",
             ));
-            std.debug.assert(std.mem.eql(u8, std.fs.path.basename(child.path), entry.name));
+            std.debug.assert(std.mem.eql(
+                u8,
+                parent.entries[cwd_index].name,
+                std.fs.path.basename(center.path),
+            ));
+        }
+
+        const children = &self.panes[PaneRole.children.toIndex()];
+        if (!self.preview_schedule.isDirty()) {
+            if (children.listingConst()) |child| {
+                std.debug.assert(center.entries.len > 0);
+                const entry = center.entries[self.hereEntryIndex().?];
+                std.debug.assert(entry.is_dir);
+                std.debug.assert(std.mem.eql(
+                    u8,
+                    std.fs.path.dirname(child.path) orelse "/",
+                    center.path,
+                ));
+                std.debug.assert(std.mem.eql(u8, std.fs.path.basename(child.path), entry.name));
+            }
         }
     }
 }
@@ -1045,6 +1060,9 @@ fn replaceAnchoredView(
         committed_center.entries.len,
         self.getPane(.here).list_view.cursor,
     );
+    // Compiled out when the build module does not enable development hooks:
+    // assertValid's body is comptime-pruned and optimized builds eliminate
+    // the empty function entirely.
     self.assertValid();
 }
 

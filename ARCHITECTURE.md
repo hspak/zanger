@@ -634,7 +634,9 @@ deliberately not attempted.
 navigation, selection, deletion, timestamp, command-completion, transition,
 mixed-input invariant, and allocation-failure coverage. `Model.assertValid`
 checks committed pane ownership, row/cursor bounds, anchored paths, projections,
-and selection counts throughout integration sequences. `zig build profile-check`
+and selection counts throughout integration sequences; the checks are compiled
+only into the test and profiling modules (`enable_profile_session`), so shipped
+binaries never emit or execute them. `zig build profile-check`
 guards the performance budgets above. Tests that draw widgets directly create
 and deinitialize their own arenas; multi-frame profile workloads reset theirs
 before each frame to mirror vxfw's production lifetime.
