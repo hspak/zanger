@@ -3,7 +3,7 @@
 I like [ranger](https://github.com/ranger/ranger), but it hangs if you happen to
 navigate over certain filetypes or large files. This is my 3 pane file
 navigator:
-- Minimal featureset (no file previews, maybe I'll change my mind at some point)
+- Directory, text, and metadata previews without unbounded file reads
 - Fast
 
 ## Build and run
@@ -38,16 +38,19 @@ minimum, median, and p95 timings. Add `-- --quick` for a smaller local run or
 | `j` / `k`, arrows | Move in the CWD pane |
 | `Ctrl-D` / `Ctrl-U` | Move down / up by half a pane |
 | `g` / `G` | Jump to the first / last entry |
-| `enter` or `l` | Open a non-empty directory under the CWD cursor |
+| `enter` or `l` | Enter a non-empty directory or system-open a non-executable file |
 | `h` or backspace | Move the center to its parent |
 | `space` | Toggle selection and move down |
 | `Ctrl-H` | Toggle hidden files |
 | `:` | Open command mode |
 | `q` | Quit |
 
-Left-click and mouse-wheel input are interactive only over the center/CWD pane.
-Each wheel action moves one row, including on terminals that emit duplicate
-reports. Input over the side panes is ignored.
+In CWD, one left click selects a row and a double click enters or opens it. The
+`..` row selects on one click and ascends on a double click. Clicking a PARENT
+row ascends with that row selected; clicking a CHILDREN row promotes that
+listing to CWD with the clicked row selected. Mouse-wheel navigation belongs to
+CWD and moves one row, including on terminals that emit duplicate reports;
+wheel input over side panes is consumed without scrolling them.
 
 ## Commands
 

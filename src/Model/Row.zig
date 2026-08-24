@@ -96,9 +96,6 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
     return self.emptySurface(ctx);
 }
 
-/// Draws one row into an exact-width surface. Grapheme-aware clipping stops
-/// at the pane width and writes an ellipsis over the last fitting cell, so a
-/// long off-screen link target adds no per-frame work beyond the viewport.
 /// Draws one line into an exact-width surface owned by `widget`.
 /// Grapheme-aware clipping stops at the pane width and writes an ellipsis
 /// over the last fitting cell, so long lines add no per-frame work beyond

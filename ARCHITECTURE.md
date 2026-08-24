@@ -6,7 +6,7 @@ status-bar timestamps.
 
 ## System map
 
-The executable is split into a small entry point and five focused modules:
+The executable is split into a small entry point and focused modules:
 
 | File | Responsibility |
 |---|---|
@@ -69,7 +69,8 @@ dirname(C)                 listing for path C          projection of C/entry
 The model maintains these invariants after every committed operation:
 
 1. HERE owns a readable absolute directory path `C` and is the only pane that
-   accepts browse interaction.
+   accepts keyboard and wheel navigation; side-pane row clicks translate into
+   anchored HERE navigation.
 2. PARENT is absent at `/`. Otherwise, when readable, it represents
    `dirname(C)` and its `cwd_index` identifies `basename(C)`.
 3. CHILDREN is derived from HERE's cursor. A directory — including a
@@ -102,8 +103,9 @@ destination of listing transfers. It does not represent an active pane.
 Browse-mode focus always belongs to HERE's `ListView`. Command mode temporarily
 focuses the persistent `TextField`; leaving command or confirmation mode queues
 a focus request back to HERE. Tab and Shift-Tab are consumed as no-ops, PARENT
-and CHILDREN never draw active cursors, and side-pane mouse input is ignored.
-PARENT's `cwd_index` is an independent location marker, not a focus cursor.
+and CHILDREN never draw active cursors, and side-pane row clicks navigate
+without taking focus. PARENT's `cwd_index` is an independent location marker,
+not a focus cursor.
 
 ## Transactional view replacement
 
@@ -226,7 +228,7 @@ User and group names are resolved through `getpwuid_r` and `getgrgid_r` and
 cached by numeric ID because NSS may consult services outside local files.
 
 The detailed preview renders its timestamp in UTC. The compact browse status
-uses the model's cached local `zeit.TimeZone`; `formatStatusTime` converts the
+uses the model's cached local `zeit.TimeZone`; `format.statusTime` converts the
 filesystem nanosecond timestamp with zeit and renders an `ls`-style local time.
 If the local zone cannot be loaded at startup, the model uses UTC; allocation
 failure still aborts initialization.
@@ -246,24 +248,24 @@ failure still aborts initialization.
   status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
-- `r` rebuilds the anchored view.
 - Space toggles HERE's cursor entry and advances for bulk selection.
 - Ctrl-H toggles hidden entries and performs a full anchored rebuild.
 
 Empty directories remain previews and cannot become HERE. A no-op click or jump
 does not rebuild CHILDREN. Side-pane clicks navigate: a parent row ascends
 into the parent directory with that row picked as the center cursor, and a
-a children click promotes that pane to HERE with the clicked row selected.
-HERE renders a
-cursor-selectable `..` line above its listing except at `/`; single click or
-cursor step highlights it, double click ascends. A second left press on the same HERE row within
-400 ms descends when that row is a directory and opens any other non-executable
-entry with the system opener; every view transaction clears the pending-click
-state so presses cannot pair across listings. Blocked input — refused opens, empty
-directory descents, ascent past `/`, deletions with nothing selected — flashes
-a red notice beside the header path for three seconds, cleared on a watcher
-tick. Any key press or mouse input dismisses the notice immediately. Side listings can retain selections for later reuse,
-but selection and deletion operations always target HERE.
+children click promotes that pane to HERE with the clicked row selected. HERE
+renders a cursor-selectable `..` line above its listing except at `/`; a single
+click or cursor step highlights it, and a double click ascends. A second left
+press on the same HERE row within 400 ms descends when that row is a directory
+and opens any other non-executable entry with the system opener. Every view
+transaction clears pending-click state so presses cannot pair across listings.
+Blocked input — refused opens, empty directory descents, ascent past `/`, or
+deletion with nothing selected — flashes a red notice beside the header path
+for three seconds, cleared on a watcher tick. Any key press or mouse press
+dismisses the notice immediately; mouse releases and motion do not. Side
+listings can retain selections for later reuse, but selection and deletion
+operations always target HERE.
 
 Stable `Row` widgets provide click identity because vxfw `ListView` has no
 click-to-select support and its scroll type is private. A HERE row click moves
@@ -281,7 +283,7 @@ cursor event
     ├─ update HERE cursor
     ├─ mark CHILDREN stale and retain its committed content
     ├─ retain the committed bottom-bar metadata and entry name
-    ├─ move the preview deadline 25 ms forward
+    ├─ move the preview deadline 12 ms forward
     └─ request redraw immediately
              │
              └─ timer after input settles

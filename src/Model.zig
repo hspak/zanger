@@ -1284,14 +1284,10 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
     });
 }
 
-/// Navigates HERE into the children-pane entry at `index`: a directory
-/// becomes the new HERE (the children listing transfers to PARENT, which is
-/// its exact parent directory), and anything else opens through the system
-/// opener like `l` does.
 /// Promotes the children pane to HERE with the clicked row selected as its
 /// cursor: the pane's listing transfers to HERE (zero-cost), the old HERE
 /// becomes PARENT, and the children pane renders the clicked entry's
-/// content â a directory listing, a text preview, or a metadata sheet.
+/// content — a directory listing, a text preview, or a metadata sheet.
 pub fn handleChildrenClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.children);
     const listing = &(pane.listing orelse return);
@@ -1496,8 +1492,7 @@ fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.E
 
 /// Whether the HERE cursor currently highlights the `..` row.
 pub fn hereCursorOnUp(self: *const Model) bool {
-    return self.up_selected and
-        @constCast(self).getPane(.here).showsUpRow();
+    return self.up_selected and self.panes[PaneRole.here.toIndex()].showsUpRow();
 }
 
 /// Drops any active flash immediately in response to user input.
