@@ -20,6 +20,7 @@ pub const Preview = @import("Model/Preview.zig");
 pub const Pane = @import("Model/Pane.zig");
 pub const PendingView = @import("Model/PendingView.zig");
 pub const Row = @import("Model/Row.zig");
+pub const HereCursor = @import("Model/cursor.zig").Here;
 
 const ListingTransfer = PendingView.ListingTransfer;
 const DirectoryEmptyTransfer = PendingView.DirectoryEmptyTransfer;
