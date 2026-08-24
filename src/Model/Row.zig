@@ -74,7 +74,11 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
             self.pane.list_view.cursor == self.index;
         const parent_cwd_index = self.pane.role == .parent and
             self.pane.cwd_index == self.index;
-        style.reverse = active_cursor or parent_cwd_index;
+        // Mouse-picked rows in the children pane highlight until the
+        // content is replaced.
+        const child_picked = self.pane.role == .children and
+            self.pane.picked == self.index;
+        style.reverse = active_cursor or parent_cwd_index or child_picked;
         return drawClippedSurface(ctx, self.widget(), listing.rows[self.index], style);
     }
     if (self.pane.preview) |*preview| {

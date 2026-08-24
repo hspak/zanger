@@ -49,6 +49,9 @@ last_click: ?LastClick = null,
 /// Timestamp of the last press on the `..` row, for its own double-click
 /// detection.
 up_click_at_ns: ?i128 = null,
+/// Timestamp of the last press on a children row, for its double-click
+/// detection.
+child_click_at_ns: ?i128 = null,
 /// True while the HERE cursor rests on the `..` row. The listing cursor
 /// keeps pointing at its last real entry; every consumer branches on this.
 up_selected: bool = false,
@@ -814,6 +817,7 @@ fn replaceAnchoredView(
     // it: row indices belong to different listings.
     self.last_click = null;
     self.up_click_at_ns = null;
+    self.child_click_at_ns = null;
     self.up_selected = false;
 }
 
@@ -1216,19 +1220,36 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
 /// becomes the new HERE (the children listing transfers to PARENT, which is
 /// its exact parent directory), and anything else opens through the system
 /// opener like `l` does.
+/// Handles a left press on a children row: a single press picks and
+/// highlights it, and a second press on the same row inside the double-click
+/// window triggers it (directories descend, other entries open through the
+/// system opener). Preview rows pick without triggering anything.
 pub fn handleChildrenClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.children);
-    const listing = &(pane.listing orelse return);
-    if (index >= listing.entries.len) return;
-    const entry = listing.entries[index];
 
+    const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
+    const is_double = if (self.child_click_at_ns) |at|
+        index == pane.picked and
+            now_ns - at <= double_click_interval_ms * std.time.ns_per_ms
+    else
+        false;
+    self.child_click_at_ns = if (is_double) null else now_ns;
+    pane.picked = index;
+
+    // Only directory listings have something to trigger; preview rows are
+    // pickable but inert.
+    const listing = &(pane.listing orelse return);
+    if (!is_double or index >= listing.entries.len) return;
+
+    const entry = listing.entries[index];
     const target = try file_system.joinPath(self.alloc, listing.path, entry.name);
     defer self.alloc.free(target);
+    pane.picked = null;
+
     if (!entry.is_dir) {
         try self.openWithSystem(target, entry.name);
         return;
     }
-
     self.replaceAnchoredView(target, .{
         .preferred_name = entry.name,
         .transfers = &.{.{ .source = .children, .target = .parent }},
@@ -2888,7 +2909,8 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
 
-    // Press descends... and is refused because `gc` is empty.
+    // A double click attempts descent... and is refused because `gc` is
+    // empty. The first press only picks the row.
     const press: vaxis.Mouse = .{
         .col = 0,
         .row = 0,
@@ -2896,10 +2918,11 @@ test "mouse releases do not dismiss a fresh empty-directory flash" {
         .mods = .{},
         .type = .press,
     };
-    try model.getPane(.children).rows[gc_index].widget().handleEvent(
-        &ctx,
-        .{ .mouse = press },
-    );
+    const gc_widget = model.getPane(.children).rows[gc_index].widget();
+    try gc_widget.handleEvent(&ctx, .{ .mouse = press });
+    try testing.expect(model.getPane(.children).picked == gc_index);
+    try testing.expect(model.error_message == null);
+    try gc_widget.handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(
         "empty directory: gc",
         model.error_message.?,
@@ -3569,9 +3592,29 @@ test "side pane clicks navigate and browse focus returns to cwd" {
         .type = .press,
     };
 
-    // Clicking a children row opens that file like `l` would.
+    // Single click picks and highlights the row without opening anything.
     const children = model.getPane(.children);
     try testing.expect(children.rows.len >= 2);
+    try children.rows[0].widget().handleEvent(&ctx, .{ .mouse = click });
+    try testing.expectEqual(@as(usize, 0), opened.items.len);
+    try testing.expectEqual(@as(usize, 0), children.picked.?);
+    try testing.expect(ctx.consume_event);
+    try testing.expect(ctx.redraw);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const picked_surface = try children.rows[0].widget().draw(.{
+        .arena = arena.allocator(),
+        .min = .{ .width = 30, .height = 1 },
+        .max = .{ .width = 30, .height = 1 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    });
+    try testing.expect(picked_surface.buffer[0].style.reverse);
+
+    // Double click opens it like `l` would.
+    ctx.consume_event = false;
+    ctx.redraw = false;
     try children.rows[0].widget().handleEvent(&ctx, .{ .mouse = click });
     const a_expected = try std.fs.path.join(
         testing.allocator,
