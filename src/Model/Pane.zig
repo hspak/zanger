@@ -1,6 +1,6 @@
-//! One of the three navigator panes: an owned listing or preview, its stable
-//! row widgets, and the vxfw ListView that displays them. Pane roles are
-//! ownership slots (parent / here / children), never focus indicators.
+//! One of the three navigator panes: one tagged owned payload, its stable row
+//! widgets, and the vxfw ListView that displays them. Pane roles are ownership
+//! slots (parent / here / children), never focus indicators.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +13,59 @@ const Model = @import("../Model.zig");
 const interaction = @import("interaction.zig");
 const Preview = @import("Preview.zig");
 const Row = @import("Row.zig");
+
+/// Exactly one owned payload displayed by a pane. The tag is the ownership
+/// state: listing and preview can never coexist or require peer optionals.
+pub const Content = union(enum) {
+    empty,
+    listing: file_system.Listing,
+    preview: Preview,
+
+    pub fn deinit(self: *Content) void {
+        switch (self.*) {
+            .empty => {},
+            .listing => |*payload| payload.deinit(),
+            .preview => |*payload| payload.deinit(),
+        }
+        self.* = .empty;
+    }
+
+    pub fn itemCount(self: *const Content) usize {
+        return switch (self.*) {
+            .empty => 0,
+            .listing => |payload| payload.entries.len,
+            .preview => |payload| payload.lines.len,
+        };
+    }
+
+    pub fn listingPtr(self: *Content) ?*file_system.Listing {
+        return switch (self.*) {
+            .listing => |*payload| payload,
+            else => null,
+        };
+    }
+
+    pub fn listingConst(self: *const Content) ?*const file_system.Listing {
+        return switch (self.*) {
+            .listing => |*payload| payload,
+            else => null,
+        };
+    }
+
+    pub fn previewPtr(self: *Content) ?*Preview {
+        return switch (self.*) {
+            .preview => |*payload| payload,
+            else => null,
+        };
+    }
+
+    pub fn previewConst(self: *const Content) ?*const Preview {
+        return switch (self.*) {
+            .preview => |*payload| payload,
+            else => null,
+        };
+    }
+};
 
 /// The clickable `..` line above the HERE listing. Lives inside its pane so
 /// the widget address is stable for hit testing across frames.
@@ -65,10 +118,7 @@ const Pane = @This();
 
 model: *Model,
 role: Model.PaneRole,
-// Owned snapshot; null when this pane has no readable directory.
-listing: ?file_system.Listing,
-// Owned file details or placeholder when no listing is displayed.
-preview: ?Preview,
+content: Content,
 // Owned widgets parallel to the active listing or preview lines.
 rows: []Row,
 // Stable location marker for the center directory in the parent listing.
@@ -84,8 +134,7 @@ pub const WheelDirection = enum {
 };
 
 pub const Replacement = struct {
-    listing: ?file_system.Listing = null,
-    preview: ?Preview = null,
+    content: Content = .empty,
     rows: []Row,
     cursor: u32 = 0,
     cwd_index: ?usize = null,
@@ -96,8 +145,7 @@ pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
     self.* = .{
         .model = model,
         .role = role,
-        .listing = null,
-        .preview = null,
+        .content = .empty,
         .rows = &.{},
         .cwd_index = null,
         .list_view = undefined,
@@ -109,8 +157,7 @@ pub fn init(self: *Pane, model: *Model, role: Model.PaneRole) void {
 /// Releases the owned listing, preview, and row widgets, then poisons
 /// `self`.
 pub fn deinit(self: *Pane) void {
-    if (self.listing) |*listing| listing.deinit();
-    if (self.preview) |*preview| preview.deinit();
+    self.content.deinit();
     self.model.alloc.free(self.rows);
     self.* = undefined;
 }
@@ -162,8 +209,9 @@ fn typeErasedCaptureHandler(
 /// Whether this pane renders the clickable `..` line: only a HERE pane that
 /// sits below the filesystem root.
 pub fn showsUpRow(self: *const Pane) bool {
-    if (self.role != .here or self.listing == null) return false;
-    return !std.mem.eql(u8, self.listing.?.path, "/");
+    if (self.role != .here) return false;
+    const payload = self.listingConst() orelse return false;
+    return !std.mem.eql(u8, payload.path, "/");
 }
 
 fn typeErasedDrawFn(
@@ -234,21 +282,33 @@ pub fn resetListView(self: *Pane, cursor: u32) void {
 /// Replaces the pane payload, moving ownership of every staged field and
 /// releasing the previous content.
 pub fn replace(self: *Pane, replacement: Replacement) void {
-    if (self.listing) |*old| old.deinit();
-    if (self.preview) |*old| old.deinit();
+    self.content.deinit();
     self.model.retireRows(self.rows);
 
-    self.listing = replacement.listing;
-    self.preview = replacement.preview;
+    self.content = replacement.content;
     self.rows = replacement.rows;
     self.cwd_index = replacement.cwd_index;
     self.resetListView(replacement.cursor);
 }
 
 pub fn itemCount(self: *const Pane) usize {
-    if (self.listing) |listing| return listing.entries.len;
-    if (self.preview) |preview| return preview.lines.len;
-    return 0;
+    return self.content.itemCount();
+}
+
+pub fn listing(self: *Pane) ?*file_system.Listing {
+    return self.content.listingPtr();
+}
+
+pub fn listingConst(self: *const Pane) ?*const file_system.Listing {
+    return self.content.listingConst();
+}
+
+pub fn preview(self: *Pane) ?*Preview {
+    return self.content.previewPtr();
+}
+
+pub fn previewConst(self: *const Pane) ?*const Preview {
+    return self.content.previewConst();
 }
 
 fn buildRow(ptr: *const anyopaque, index: usize, _: usize) ?vxfw.Widget {

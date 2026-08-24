@@ -141,13 +141,6 @@ const DeleteTarget = struct {
     is_dir: bool,
 };
 
-const InstallOptions = struct {
-    listing: *?file_system.Listing,
-    preview: *?Preview,
-    cursor: u32 = 0,
-    cwd_index: ?usize = null,
-};
-
 const ReplaceViewOptions = struct {
     preferred_name: ?[]const u8 = null,
     fallback_cursor: ?usize = null,
@@ -297,7 +290,7 @@ fn getPane(self: *Model, role: PaneRole) *Pane {
 }
 
 fn centerListing(self: *Model) *file_system.Listing {
-    return &self.getPane(.here).listing.?;
+    return self.getPane(.here).listing().?;
 }
 
 fn hereEntryIndex(self: *const Model) ?usize {
@@ -306,7 +299,7 @@ fn hereEntryIndex(self: *const Model) ?usize {
 
 fn normalizeHereCursor(self: *Model, target: HereCursor) HereCursor {
     const pane = self.getPane(.here);
-    const listing = &(pane.listing orelse return .none);
+    const listing = pane.listing() orelse return .none;
     return switch (target) {
         .none => HereCursor.fromEntryCount(listing.entries.len, 0),
         .entry => |index| HereCursor.fromEntryCount(listing.entries.len, index),
@@ -368,10 +361,9 @@ pub fn selectUp(self: *Model, ctx: *vxfw.EventContext) Allocator.Error!void {
 /// every commit boundary; tests also call it after mixed action sequences.
 pub fn assertValid(self: *const Model) void {
     const here = &self.panes[PaneRole.here.toIndex()];
-    const center = &(here.listing orelse @panic("HERE must own a listing"));
+    const center = here.listingConst() orelse @panic("HERE must own a listing");
 
     for (&self.panes) |*pane| {
-        std.debug.assert(!(pane.listing != null and pane.preview != null));
         const item_count = pane.itemCount();
         std.debug.assert(pane.rows.len == item_count);
         std.debug.assert(pane.list_view.item_count == @as(u32, @intCast(item_count)));
@@ -380,13 +372,16 @@ pub fn assertValid(self: *const Model) void {
         } else {
             std.debug.assert(pane.list_view.cursor < item_count);
         }
-        if (pane.listing) |listing| {
-            std.debug.assert(listing.rows.len == listing.entries.len);
-            std.debug.assert(listing.selected.capacity() == listing.entries.len);
-            std.debug.assert(listing.selected_count == listing.selected.count());
-        }
-        if (pane.preview) |preview| {
-            std.debug.assert(preview.header_lines <= preview.lines.len);
+        switch (pane.content) {
+            .empty => {},
+            .listing => |listing| {
+                std.debug.assert(listing.rows.len == listing.entries.len);
+                std.debug.assert(listing.selected.capacity() == listing.entries.len);
+                std.debug.assert(listing.selected_count == listing.selected.count());
+            },
+            .preview => |preview| {
+                std.debug.assert(preview.header_lines <= preview.lines.len);
+            },
         }
     }
 
@@ -406,7 +401,7 @@ pub fn assertValid(self: *const Model) void {
             std.debug.assert(index == here.list_view.cursor);
         },
     }
-    if (self.panes[PaneRole.parent.toIndex()].listing) |parent| {
+    if (self.panes[PaneRole.parent.toIndex()].listingConst()) |parent| {
         const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
         std.debug.assert(cwd_index < parent.entries.len);
         std.debug.assert(std.mem.eql(
@@ -422,17 +417,18 @@ pub fn assertValid(self: *const Model) void {
     }
 
     const children = &self.panes[PaneRole.children.toIndex()];
-    if (!self.preview_dirty and !self.here_cursor.isUp() and children.listing != null) {
-        std.debug.assert(center.entries.len > 0);
-        const entry = center.entries[self.hereEntryIndex().?];
-        const child = children.listing.?;
-        std.debug.assert(entry.is_dir);
-        std.debug.assert(std.mem.eql(
-            u8,
-            std.fs.path.dirname(child.path) orelse "/",
-            center.path,
-        ));
-        std.debug.assert(std.mem.eql(u8, std.fs.path.basename(child.path), entry.name));
+    if (!self.preview_dirty and !self.here_cursor.isUp()) {
+        if (children.listingConst()) |child| {
+            std.debug.assert(center.entries.len > 0);
+            const entry = center.entries[self.hereEntryIndex().?];
+            std.debug.assert(entry.is_dir);
+            std.debug.assert(std.mem.eql(
+                u8,
+                std.fs.path.dirname(child.path) orelse "/",
+                center.path,
+            ));
+            std.debug.assert(std.mem.eql(u8, std.fs.path.basename(child.path), entry.name));
+        }
     }
 }
 
@@ -584,10 +580,10 @@ fn prepareView(
     const center_index = PaneRole.here.toIndex();
     const center_reused = center_reused: {
         const transfer = transferTo(transfers, .here) orelse break :center_reused false;
-        const candidate = self.getPane(transfer.source).listing orelse
+        const candidate = self.getPane(transfer.source).listing() orelse
             break :center_reused false;
         if (!std.mem.eql(u8, candidate.path, center_path)) break :center_reused false;
-        _ = pending_view.borrowListing(transfer.source, .here, candidate);
+        _ = pending_view.borrowListing(transfer.source, .here, candidate.*);
         break :center_reused true;
     };
     if (!center_reused) {
@@ -615,11 +611,11 @@ fn prepareView(
         const parent_reused = parent_reused: {
             const transfer = transferTo(transfers, .parent) orelse
                 break :parent_reused false;
-            const candidate = self.getPane(transfer.source).listing orelse
+            const candidate = self.getPane(transfer.source).listing() orelse
                 break :parent_reused false;
             if (!std.mem.eql(u8, candidate.path, parent_path))
                 break :parent_reused false;
-            const parent = pending_view.borrowListing(transfer.source, .parent, candidate);
+            const parent = pending_view.borrowListing(transfer.source, .parent, candidate.*);
             const parent_cursor = parent.cursorFor(std.fs.path.basename(center.path), null);
             pending_view.cursors[parent_index] = @intCast(parent_cursor);
             pending_view.cwd_indices[parent_index] = parent_cursor;
@@ -663,7 +659,7 @@ fn prepareView(
 
     const children_transfer = transferTo(transfers, .children);
     const reused_children = if (children_transfer) |transfer|
-        self.getPane(transfer.source).listing
+        self.getPane(transfer.source).listing()
     else
         null;
     var reused_applied = false;
@@ -695,7 +691,7 @@ fn prepareView(
                 const children = pending_view.borrowListing(
                     transfer.source,
                     .children,
-                    candidate,
+                    candidate.*,
                 );
                 _ = children;
                 pending_view.cursors[PaneRole.children.toIndex()] =
@@ -852,7 +848,7 @@ fn replaceAnchoredView(
     center_path: []const u8,
     options: ReplaceViewOptions,
 ) !void {
-    const current_center_path = if (self.getPane(.here).listing) |listing|
+    const current_center_path = if (self.getPane(.here).listing()) |listing|
         listing.path
     else
         null;
@@ -920,7 +916,7 @@ fn replaceAnchoredView(
         const empty_transfer = maybe_empty orelse continue;
         const source_role = pending_view.listing_sources[target_index].?;
         const source = self.getPane(source_role);
-        source.listing.?.setDirectoryEmpty(empty_transfer.index, empty_transfer.is_empty);
+        source.listing().?.setDirectoryEmpty(empty_transfer.index, empty_transfer.is_empty);
     }
 
     // No fallible work may remain once live panes begin changing.
@@ -931,15 +927,25 @@ fn replaceAnchoredView(
         const source_role = maybe_source orelse continue;
         const source_index = source_role.toIndex();
         std.debug.assert(!detached_sources[source_index]);
-        std.debug.assert(self.getPane(source_role).listing != null);
-        self.getPane(source_role).listing = null;
+        const source = self.getPane(source_role);
+        std.debug.assert(source.listing() != null);
+        source.content = .empty;
         detached_sources[source_index] = true;
     }
 
     for (&self.panes, 0..) |*pane, index| {
+        std.debug.assert(
+            pending_view.listings[index] == null or
+                pending_view.previews[index] == null,
+        );
+        const content: Pane.Content = if (pending_view.listings[index]) |listing|
+            .{ .listing = listing }
+        else if (pending_view.previews[index]) |preview|
+            .{ .preview = preview }
+        else
+            .empty;
         pane.replace(.{
-            .listing = pending_view.listings[index],
-            .preview = pending_view.previews[index],
+            .content = content,
             .rows = rows[index],
             .cursor = pending_view.cursors[index],
             .cwd_index = pending_view.cwd_indices[index],
@@ -962,32 +968,30 @@ fn replaceAnchoredView(
     self.assertValid();
 }
 
-fn installPane(self: *Model, role: PaneRole, options: InstallOptions) !void {
-    const count = if (options.listing.*) |listing|
-        listing.entries.len
-    else if (options.preview.*) |preview|
-        preview.lines.len
-    else
-        0;
+fn installPane(
+    self: *Model,
+    role: PaneRole,
+    content: *Pane.Content,
+    cursor: u32,
+    cwd_index: ?usize,
+) !void {
+    const count = content.itemCount();
     const target = self.getPane(role);
     const rows = try self.makeRows(target, count);
     errdefer self.alloc.free(rows);
     try self.retired_rows.ensureUnusedCapacity(self.alloc, 1);
     target.replace(.{
-        .listing = options.listing.*,
-        .preview = options.preview.*,
+        .content = content.*,
         .rows = rows,
-        .cursor = options.cursor,
-        .cwd_index = options.cwd_index,
+        .cursor = cursor,
+        .cwd_index = cwd_index,
     });
-    options.listing.* = null;
-    options.preview.* = null;
+    content.* = .empty;
 }
 
 fn clearPane(self: *Model, role: PaneRole) !void {
-    var listing: ?file_system.Listing = null;
-    var preview: ?Preview = null;
-    try self.installPane(role, .{ .listing = &listing, .preview = &preview });
+    var content: Pane.Content = .empty;
+    try self.installPane(role, &content, 0, null);
 }
 
 fn armPreviewTimer(
@@ -1033,19 +1037,21 @@ fn handlePreviewTimer(self: *Model, ctx: *vxfw.EventContext) !void {
 fn syncRight(self: *Model) !void {
     const center = self.centerListing();
     const right = self.getPane(.children);
-    var replacement_listing: ?file_system.Listing = null;
-    errdefer if (replacement_listing) |*listing| listing.deinit();
-    var replacement_preview: ?Preview = null;
-    errdefer if (replacement_preview) |*preview| preview.deinit();
+    var replacement: Pane.Content = .empty;
+    errdefer replacement.deinit();
 
     if (self.here_cursor.isUp() and self.getPane(.here).showsUpRow()) {
         // Highlighting `..`: hint at what it does instead of previewing the
         // remembered entry.
         self.cursor_status = null;
-        replacement_preview = try Preview.initMessage(self.alloc, "go up one level");
+        replacement = .{
+            .preview = try Preview.initMessage(self.alloc, "go up one level"),
+        };
     } else if (center.entries.len == 0) {
         self.cursor_status = null;
-        replacement_preview = try Preview.initMessage(self.alloc, "empty directory");
+        replacement = .{
+            .preview = try Preview.initMessage(self.alloc, "empty directory"),
+        };
     } else {
         const center_cursor = self.hereEntryIndex().?;
         const entry = center.entries[center_cursor];
@@ -1053,7 +1059,7 @@ fn syncRight(self: *Model) !void {
         defer self.alloc.free(desired);
         self.cursor_status = try self.loadCursorStatus(desired, entry.name);
         if (entry.is_dir) {
-            if (right.listing) |listing| {
+            if (right.listing()) |listing| {
                 if (std.mem.eql(u8, listing.path, desired)) {
                     center.setDirectoryEmpty(center_cursor, false);
                     self.preview_dirty = false;
@@ -1079,17 +1085,13 @@ fn syncRight(self: *Model) !void {
             center.setDirectoryEmpty(center_cursor, is_empty);
         }
         if (outcome.content) |content| switch (content) {
-            .listing => |listing| replacement_listing = listing,
-            .preview => |preview| replacement_preview = preview,
+            .listing => |listing| replacement = .{ .listing = listing },
+            .preview => |preview| replacement = .{ .preview = preview },
             .none => {},
         };
     }
 
-    try self.installPane(.children, .{
-        .listing = &replacement_listing,
-        .preview = &replacement_preview,
-        .cursor = 0,
-    });
+    try self.installPane(.children, &replacement, 0, null);
     self.preview_dirty = false;
     self.assertValid();
 }
@@ -1236,7 +1238,7 @@ fn openCenter(self: *Model) !void {
     var transfers: [2]ListingTransfer = undefined;
     transfers[0] = .{ .source = .here, .target = .parent };
     var transfer_count: usize = 1;
-    if (self.getPane(.children).listing) |children| {
+    if (self.getPane(.children).listing()) |children| {
         if (std.mem.eql(u8, children.path, target)) {
             transfers[1] = .{ .source = .children, .target = .here };
             transfer_count = 2;
@@ -1262,7 +1264,7 @@ pub fn ascend(self: *Model) !void {
     }
     const target = try file_system.parentPath(self.alloc, center.path);
     defer self.alloc.free(target);
-    const previous_parent = if (self.getPane(.parent).listing) |*parent|
+    const previous_parent = if (self.getPane(.parent).listing()) |parent|
         parent
     else
         null;
@@ -1280,7 +1282,7 @@ pub fn ascend(self: *Model) !void {
 
 fn moveCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
-    const listing = &(pane.listing orelse return);
+    const listing = pane.listing() orelse return;
     const target = self.here_cursor.step(
         down,
         listing.entries.len,
@@ -1338,7 +1340,7 @@ pub fn handleUpClick(self: *Model, ctx: *vxfw.EventContext) !void {
 /// qualifies — the click only chooses where the cursor lands.
 pub fn handleParentClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.parent);
-    const listing = &(pane.listing orelse return);
+    const listing = pane.listing() orelse return;
     if (index >= listing.entries.len) return;
     const entry = listing.entries[index];
 
@@ -1356,7 +1358,7 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
 /// content — a directory listing, a text preview, or a metadata sheet.
 pub fn handleChildrenClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.children);
-    const listing = &(pane.listing orelse return);
+    const listing = pane.listing() orelse return;
     if (index >= listing.entries.len) return;
     const entry = listing.entries[index];
 
@@ -1390,7 +1392,7 @@ pub fn handleWheel(
 
 fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
     const pane = self.getPane(.here);
-    const listing = if (pane.listing) |*listing| listing else return;
+    const listing = pane.listing() orelse return;
     if (listing.entries.len == 0 or self.here_cursor.isUp() and !down) {
         ctx.consumeEvent();
         return;
@@ -1411,14 +1413,14 @@ fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !void {
 
 fn jumpCenter(self: *Model, ctx: *vxfw.EventContext, bottom: bool) !void {
     const pane = self.getPane(.here);
-    const listing = if (pane.listing) |*listing| listing else return;
+    const listing = pane.listing() orelse return;
     const target = HereCursor.jump(listing.entries.len, bottom);
     _ = try self.setHereCursor(ctx, target, .jump);
 }
 
 fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
     const pane = self.getPane(.here);
-    const listing = if (pane.listing) |*listing| listing else return;
+    const listing = pane.listing() orelse return;
     const center_cursor = self.hereEntryIndex() orelse return;
     listing.toggleSelected(center_cursor);
     try self.setMessage("", .{});
@@ -1428,13 +1430,13 @@ fn toggleSelection(self: *Model, ctx: *vxfw.EventContext) !void {
 }
 
 fn selectedCount(self: *const Model) usize {
-    const listing = self.panes[PaneRole.here.toIndex()].listing orelse return 0;
+    const listing = self.panes[PaneRole.here.toIndex()].listingConst() orelse return 0;
     return listing.selectedCount();
 }
 
 fn deleteCount(self: *const Model) usize {
     const pane = &self.panes[PaneRole.here.toIndex()];
-    const listing = pane.listing orelse return 0;
+    const listing = pane.listingConst() orelse return 0;
     const center_cursor = self.hereEntryIndex() orelse return 0;
     const use_selection = listing.selectedCount() > 0;
     var count: usize = 0;
@@ -2059,7 +2061,7 @@ test "headless model draw" {
         @as(i17, 90),
         bottom_surface.children[1].origin.col + bottom_surface.children[1].surface.size.width,
     );
-    try testing.expect(model.getPane(.here).listing != null);
+    try testing.expect(model.getPane(.here).listing() != null);
 }
 
 test "command status previews unique completion" {
@@ -2397,7 +2399,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
     try testing.expect(model.preview_dirty);
     try testing.expect(model.preview_tick_pending);
-    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
     var pending_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer pending_arena.deinit();
@@ -2418,7 +2420,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
     try testing.expect(!model.preview_dirty);
     try testing.expect(ctx.consume_event);
@@ -2918,9 +2920,9 @@ test "stepping onto dotdot hints and enter ascends" {
     // The children pane hints instead of previewing a stale entry.
     try model.syncRight();
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .placeholder);
-    try testing.expectEqualStrings("go up one level", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .placeholder);
+    try testing.expectEqualStrings("go up one level", child_pane.preview().?.lines[0]);
     try testing.expect(model.cursor_status == null);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3320,7 +3322,7 @@ test "parent clicks ascend and select an empty picked row" {
     // An empty directory row is as pickable as any other: clicking it
     // ascends into the parent with that row highlighted.
     const index = file_system.indexOfName(
-        &model.getPane(.parent).listing.?,
+        model.getPane(.parent).listing().?,
         "target",
     ).?;
     try model.handleParentClick(index);
@@ -3329,9 +3331,9 @@ test "parent clicks ascend and select an empty picked row" {
 
     // CHILDREN mirrors the picked empty directory.
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .placeholder);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
 }
 
 test "parent clicks ascend and select a picked file row" {
@@ -3363,7 +3365,7 @@ test "parent clicks ascend and select a picked file row" {
 
     // Files are pickable too — the click only chooses the cursor target.
     const index = file_system.indexOfName(
-        &model.getPane(.parent).listing.?,
+        model.getPane(.parent).listing().?,
         "notes.txt",
     ).?;
     try model.handleParentClick(index);
@@ -3372,9 +3374,9 @@ test "parent clicks ascend and select a picked file row" {
 
     // CHILDREN mirrors the picked file with its rendered contents.
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .text);
-    try testing.expectEqualStrings("n", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .text);
+    try testing.expectEqualStrings("n", child_pane.preview().?.lines[0]);
 }
 
 test "double click on a directory descends into it" {
@@ -3643,10 +3645,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expect(model.preview_dirty);
-    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
     try testing.expectEqual(@as(u8, 0), model.getPane(.here).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.parent).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.children).list_view.wheel_scroll);
@@ -3690,10 +3692,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(model.preview_dirty);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
     model.preview_due = .zero;
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("a", model.getPane(.children).preview.?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 }
@@ -3774,9 +3776,9 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     // The clicked file renders its text preview in the children pane.
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .text);
-    try testing.expectEqualStrings("a", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .text);
+    try testing.expectEqualStrings("a", child_pane.preview().?.lines[0]);
     // No opener involved for pane promotion.
     try testing.expectEqual(@as(usize, 0), opened.items.len);
     try testing.expect(ctx.consume_event);
@@ -3787,19 +3789,19 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     ctx.consume_event = false;
     ctx.redraw = false;
     var parent = model.getPane(.parent);
-    var pick_index = file_system.indexOfName(&parent.listing.?, "child").?;
+    var pick_index = file_system.indexOfName(parent.listing().?, "child").?;
     try parent.rows[pick_index].widget().handleEvent(&ctx, .{ .mouse = click });
     try testing.expectEqualStrings(path, model.centerListing().path);
     try testing.expectEqual(pick_index, model.hereEntryIndex().?);
     // The old HERE listing transferred to CHILDREN.
     try testing.expectEqualStrings(
         child_path,
-        model.getPane(.children).listing.?.path,
+        model.getPane(.children).listing().?.path,
     );
 
     // A second parent click climbs again, this time picking `sibling`.
     parent = model.getPane(.parent);
-    pick_index = file_system.indexOfName(&parent.listing.?, "sibling").?;
+    pick_index = file_system.indexOfName(parent.listing().?, "sibling").?;
     try parent.rows[pick_index].widget().handleEvent(&ctx, .{ .mouse = click });
     const sub_expected = try std.fs.path.join(testing.allocator, &.{
         process_cwd,
@@ -3928,7 +3930,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
     center.toggleSelected(beta_index);
     center.rebuildRows();
     try model.setMessage("keep this message", .{});
-    const parent_path_pointer = model.getPane(.parent).listing.?.path.ptr;
+    const parent_path_pointer = model.getPane(.parent).listing().?.path.ptr;
 
     try Io.Dir.writeFile(temp.dir, testing.io, .{
         .sub_path = "gamma.txt",
@@ -3959,7 +3961,7 @@ test "watcher refresh preserves cursor selection and parent listing" {
     try testing.expectEqualStrings("beta.txt", center.entries[center_cursor].name);
     try testing.expect(center.selected.isSet(center_cursor));
     try testing.expectEqual(@as(usize, 1), center.selectedCount());
-    try testing.expectEqual(parent_path_pointer, model.getPane(.parent).listing.?.path.ptr);
+    try testing.expectEqual(parent_path_pointer, model.getPane(.parent).listing().?.path.ptr);
     try testing.expectEqualStrings("keep this message", model.message);
     try testing.expect(ctx.redraw);
     try testing.expectEqual(@as(usize, 1), ctx.cmds.items.len);
@@ -4007,9 +4009,9 @@ test "init stages children for a directory of only file symlinks" {
 
     // A file symlink renders its target's contents like a normal file.
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .text);
-    try testing.expectEqualStrings("t", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .text);
+    try testing.expectEqualStrings("t", child_pane.preview().?.lines[0]);
 
     // The debounced sync must tolerate the same entry as well.
     var ctx: vxfw.EventContext = .{
@@ -4020,9 +4022,9 @@ test "init stages children for a directory of only file symlinks" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
     try model.syncRight();
-    try testing.expect(model.getPane(.children).listing == null);
-    try testing.expect(model.getPane(.children).preview.?.kind == .text);
-    try testing.expectEqualStrings("t", model.getPane(.children).preview.?.lines[0]);
+    try testing.expect(model.getPane(.children).listing() == null);
+    try testing.expect(model.getPane(.children).preview().?.kind == .text);
+    try testing.expectEqualStrings("t", model.getPane(.children).preview().?.lines[0]);
 }
 
 test "replaced rows stay readable until the next draw" {
@@ -4109,7 +4111,7 @@ test "anchored model navigation" {
     const center_cursor = model.hereEntryIndex().?;
     try testing.expectEqualStrings(path, center.path);
     try testing.expectEqualStrings("child", center.entries[center_cursor].name);
-    const right = model.getPane(.children).listing.?;
+    const right = model.getPane(.children).listing().?;
     const expected_right = try file_system.joinPath(testing.allocator, path, "child");
     defer testing.allocator.free(expected_right);
     try testing.expectEqualStrings(expected_right, right.path);
@@ -4133,7 +4135,7 @@ test "anchored model navigation" {
     const parent_cwd_index = parent_pane.cwd_index.?;
     try testing.expectEqualStrings(
         std.fs.path.basename(path),
-        parent_pane.listing.?.entries[parent_cwd_index].name,
+        parent_pane.listing().?.entries[parent_cwd_index].name,
     );
     const parent_surface = try parent_pane.rows[parent_cwd_index].widget().draw(.{
         .arena = arena.allocator(),
@@ -4148,8 +4150,8 @@ test "anchored model navigation" {
     try model.openCenter();
     try testing.expectEqualStrings(expected_right, model.centerListing().path);
     try testing.expectEqual(preview_path_pointer, model.centerListing().path.ptr);
-    try testing.expectEqual(original_path_pointer, model.getPane(.parent).listing.?.path.ptr);
-    try testing.expectEqual(@as(usize, 1), model.getPane(.parent).listing.?.selectedCount());
+    try testing.expectEqual(original_path_pointer, model.getPane(.parent).listing().?.path.ptr);
+    try testing.expectEqual(@as(usize, 1), model.getPane(.parent).listing().?.selectedCount());
     try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
     const descended_path_pointer = model.centerListing().path.ptr;
     model.centerListing().toggleSelected(model.hereEntryIndex().?);
@@ -4167,11 +4169,11 @@ test "anchored model navigation" {
     try testing.expectEqual(@as(usize, 1), ascended.selectedCount());
     try testing.expectEqual(
         descended_path_pointer,
-        model.getPane(.children).listing.?.path.ptr,
+        model.getPane(.children).listing().?.path.ptr,
     );
     try testing.expectEqual(
         @as(usize, 1),
-        model.getPane(.children).listing.?.selectedCount(),
+        model.getPane(.children).listing().?.selectedCount(),
     );
 
     // Moving the selected CHILDREN listing back to HERE keeps its selection.
@@ -4232,10 +4234,10 @@ test "children preview shows empty directories and file metadata" {
     try testing.expectEqualStrings("empty", center.entries[center_cursor].name);
     try testing.expectEqualStrings("     empty", center.rows[center_cursor]);
     var child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
-    const empty_message_pointer = child_pane.preview.?.lines[0].ptr;
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .placeholder);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
+    const empty_message_pointer = child_pane.preview().?.lines[0].ptr;
     var event_ctx: vxfw.EventContext = .{
         .io = testing.io,
         .alloc = testing.allocator,
@@ -4245,7 +4247,7 @@ test "children preview shows empty directories and file metadata" {
     try model.jumpCenter(&event_ctx, false);
     try testing.expectEqual(
         empty_message_pointer,
-        model.getPane(.children).preview.?.lines[0].ptr,
+        model.getPane(.children).preview().?.lines[0].ptr,
     );
 
     const original_center_path = model.centerListing().path.ptr;
@@ -4262,8 +4264,8 @@ test "children preview shows empty directories and file metadata" {
     try testing.expect(model.centerListing().entries[model.hereEntryIndex().?].is_empty.?);
 
     child_pane = model.getPane(.children);
-    try testing.expect(child_pane.preview.?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview.?.lines[0]);
+    try testing.expect(child_pane.preview().?.kind == .placeholder);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
     try testing.expectEqualStrings(
         "     empty",
         model.centerListing().rows[model.hereEntryIndex().?],
@@ -4275,21 +4277,21 @@ test "children preview shows empty directories and file metadata" {
     try model.syncRight();
 
     child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind != .placeholder);
-    try testing.expectEqual(@as(usize, 2), child_pane.preview.?.header_lines);
-    try testing.expectEqual(@as(usize, 10), child_pane.preview.?.lines.len);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind != .placeholder);
+    try testing.expectEqual(@as(usize, 2), child_pane.preview().?.header_lines);
+    try testing.expectEqual(@as(usize, 10), child_pane.preview().?.lines.len);
     try testing.expectEqualStrings(
         "non-text files are not rendered",
-        child_pane.preview.?.lines[0],
+        child_pane.preview().?.lines[0],
     );
-    try testing.expectEqualStrings("", child_pane.preview.?.lines[1]);
-    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview.?.lines[2]);
-    try testing.expectEqualStrings("Type: file", child_pane.preview.?.lines[3]);
-    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview.?.lines[4]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[5], "Owner: "));
-    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview.?.lines[6]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview.?.lines[7], "Modified: "));
+    try testing.expectEqualStrings("", child_pane.preview().?.lines[1]);
+    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview().?.lines[2]);
+    try testing.expectEqualStrings("Type: file", child_pane.preview().?.lines[3]);
+    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview().?.lines[4]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview().?.lines[5], "Owner: "));
+    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview().?.lines[6]);
+    try testing.expect(std.mem.startsWith(u8, child_pane.preview().?.lines[7], "Modified: "));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4479,11 +4481,11 @@ test "text file preview renders contents without metadata styling" {
     try model.syncRight();
 
     const child_pane = model.getPane(.children);
-    try testing.expect(child_pane.listing == null);
-    try testing.expect(child_pane.preview.?.kind == .text);
-    try testing.expectEqual(@as(usize, 2), child_pane.preview.?.lines.len);
-    try testing.expectEqualStrings("no colon here", child_pane.preview.?.lines[0]);
-    try testing.expectEqualStrings("second: line", child_pane.preview.?.lines[1]);
+    try testing.expect(child_pane.listing() == null);
+    try testing.expect(child_pane.preview().?.kind == .text);
+    try testing.expectEqual(@as(usize, 2), child_pane.preview().?.lines.len);
+    try testing.expectEqualStrings("no colon here", child_pane.preview().?.lines[0]);
+    try testing.expectEqualStrings("second: line", child_pane.preview().?.lines[1]);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4547,9 +4549,9 @@ test "directory symlinks list targets and file symlinks render them" {
 
     const link_path = try file_system.joinPath(testing.allocator, path, "dir-link");
     defer testing.allocator.free(link_path);
-    try testing.expectEqualStrings(link_path, model.getPane(.children).listing.?.path);
+    try testing.expectEqualStrings(link_path, model.getPane(.children).listing().?.path);
     try testing.expect(
-        file_system.indexOfName(&model.getPane(.children).listing.?, "inside.txt") != null,
+        file_system.indexOfName(model.getPane(.children).listing().?, "inside.txt") != null,
     );
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4578,9 +4580,9 @@ test "directory symlinks list targets and file symlinks render them" {
     _ = model.applyHereCursor(.{ .entry = file_link_index }, .none);
     try model.syncRight();
     const link_child = model.getPane(.children);
-    try testing.expect(link_child.listing == null);
-    try testing.expect(link_child.preview.?.kind == .text);
-    try testing.expectEqualStrings("target", link_child.preview.?.lines[0]);
+    try testing.expect(link_child.listing() == null);
+    try testing.expect(link_child.preview().?.kind == .text);
+    try testing.expectEqualStrings("target", link_child.preview().?.lines[0]);
 
     const long_link_index = file_system.indexOfName(center, "long-link").?;
     try testing.expectEqual(

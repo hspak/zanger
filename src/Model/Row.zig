@@ -55,7 +55,7 @@ fn typeErasedEventHandler(
 fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
     const self: *Row = @ptrCast(@alignCast(ptr));
     var style: vaxis.Cell.Style = .{};
-    if (self.pane.listing) |*listing| {
+    if (self.pane.listing()) |listing| {
         if (self.index >= listing.rows.len) return self.emptySurface(ctx);
         const entry = listing.entries[self.index];
         const selected = listing.selected.isSet(self.index);
@@ -78,7 +78,7 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         style.reverse = active_cursor or parent_cwd_index;
         return drawClippedSurface(ctx, self.widget(), listing.rows[self.index], style);
     }
-    if (self.pane.preview) |*preview| {
+    if (self.pane.preview()) |preview| {
         if (self.index >= preview.lines.len) return self.emptySurface(ctx);
         // A preview's leading lines may be a notice rendered like the
         // placeholder messages ahead of otherwise metadata content.
