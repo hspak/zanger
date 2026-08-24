@@ -1527,7 +1527,10 @@ fn isUpKey(key: Key) bool {
 fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
     switch (event) {
         .key_press => {},
-        .mouse => {},
+        // Only press-type input dismisses an active header flash: the
+        // release and motion reports that trail a click must not wipe a
+        // flash the press itself just raised.
+        .mouse => |mouse| if (mouse.type != .press) return,
         else => return,
     }
     // Deliberate input always dismisses an active header flash.
@@ -2839,6 +2842,84 @@ test "stepping onto dotdot hints and enter ascends" {
     try testing.expect(!model.up_selected);
     try model.syncRight();
     try testing.expect(model.cursor_status != null);
+}
+
+test "mouse releases do not dismiss a fresh empty-directory flash" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try Io.Dir.createDir(temp.dir, testing.io, "c", .default_dir);
+    try Io.Dir.createDir(temp.dir, testing.io, "c/gc", .default_dir);
+    try Io.Dir.writeFile(temp.dir, testing.io, .{ .sub_path = "c/y.txt", .data = "y" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.join(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &temp.sub_path,
+    });
+    defer testing.allocator.free(path);
+
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{
+        .start_path = path,
+        .user = "tester",
+        .hostname = "host",
+    });
+    defer model.deinit();
+
+    // HERE's cursor rests on `c`, so CHILDREN lists its entries.
+    const gc_index = file_system.indexOfName(
+        &model.getPane(.children).listing.?,
+        "gc",
+    ).?;
+
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+        .redraw = false,
+    };
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // Press descends... and is refused because `gc` is empty.
+    const press: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    try model.getPane(.children).rows[gc_index].widget().handleEvent(
+        &ctx,
+        .{ .mouse = press },
+    );
+    try testing.expectEqualStrings(
+        "empty directory: gc",
+        model.error_message.?,
+    );
+
+    // The hardware release that follows must not wipe the fresh flash.
+    const release: vaxis.Mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .release,
+    };
+    try model.captureEvent(&ctx, .{ .mouse = release });
+    try testing.expectEqualStrings(
+        "empty directory: gc",
+        model.error_message.?,
+    );
+
+    // And nearly the whole three-second window remains.
+    const remaining_ns =
+        model.error_deadline.nanoseconds -
+        Io.Clock.awake.now(testing.io).nanoseconds;
+    try testing.expect(remaining_ns > 2 * std.time.ns_per_s);
 }
 
 test "repeated up keys hold the dotdot selection" {
