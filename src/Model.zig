@@ -50,10 +50,8 @@ clicks: interaction.DoubleClickTracker = .{},
 /// Authoritative logical cursor for HERE. The vxfw and listing cursors are
 /// projections updated only by `applyHereCursor` and view commit.
 here_cursor: HereCursor = .none,
-/// Transient blocked-input notice rendered beside the header path until
-/// `error_deadline`, then cleared on a watcher tick.
-error_message: ?[]u8 = null,
-error_deadline: Io.Timestamp = .zero,
+/// Transient blocked-input notice rendered beside the header path.
+flash: ?Flash = null,
 /// Program spawned to open files with; overridable in tests.
 open_program: []const u8 = "xdg-open",
 /// Test seam: when set, open requests append the target path here instead
@@ -65,7 +63,6 @@ wheel_pending: ?WheelDirection = null,
 cwd_visible_rows: u16 = 1,
 // Owned and replaced transactionally by `setMessage`.
 message: []u8 = &.{},
-confirm_count: usize = 0,
 // Replaced pane row arrays, kept readable until the next draw. vxfw retains
 // the previous frame's surface tree for hit testing until a new frame
 // renders, so freeing rows at commit time could leave mouse handlers reading
@@ -75,7 +72,15 @@ retired_rows: std.ArrayList([]Row) = .empty,
 user: []const u8 = "user",
 hostname: []const u8 = "localhost",
 
-const Mode = enum { browse, command, confirm };
+const Mode = union(enum) {
+    browse,
+    command,
+    confirm: usize,
+};
+const Flash = struct {
+    text: []u8,
+    deadline: Io.Timestamp,
+};
 const WatchRefresh = enum { none, refresh, rearm };
 const watcher_interval_ms = 150;
 pub const double_click_interval_ms = 400;
@@ -251,7 +256,7 @@ pub fn deinit(self: *Model) void {
     self.identities.deinit(self.alloc);
     self.freeRetiredRows();
     self.retired_rows.deinit(self.alloc);
-    if (self.error_message) |message| self.alloc.free(message);
+    if (self.flash) |flash| self.alloc.free(flash.text);
     self.alloc.free(self.message);
     self.* = undefined;
 }
@@ -1418,8 +1423,7 @@ fn beginDelete(self: *Model, ctx: *vxfw.EventContext) !void {
         try self.flashError("nothing safe to delete", .{});
         return;
     }
-    self.confirm_count = count;
-    self.mode = .confirm;
+    self.mode = .{ .confirm = count };
     try ctx.requestFocus(self.getPane(.here).list_view.widget());
 }
 
@@ -1495,11 +1499,13 @@ pub fn reportError(self: *Model, action: []const u8, error_name: []const u8) All
 /// Replaces any pending notice and restarts its window.
 fn flashError(self: *Model, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
     const replacement = try std.fmt.allocPrint(self.alloc, fmt, args);
-    if (self.error_message) |old| self.alloc.free(old);
-    self.error_message = replacement;
-    self.error_deadline = Io.Clock.awake.now(self.io).addDuration(
-        .fromMilliseconds(error_flash_ms),
-    );
+    if (self.flash) |old| self.alloc.free(old.text);
+    self.flash = .{
+        .text = replacement,
+        .deadline = Io.Clock.awake.now(self.io).addDuration(
+            .fromMilliseconds(error_flash_ms),
+        ),
+    };
 }
 
 /// Whether the HERE cursor currently highlights the `..` row.
@@ -1510,19 +1516,19 @@ pub fn hereCursorOnUp(self: *const Model) bool {
 
 /// Drops any active flash immediately in response to user input.
 fn dismissError(self: *Model, ctx: *vxfw.EventContext) void {
-    const message = self.error_message orelse return;
-    self.alloc.free(message);
-    self.error_message = null;
+    const flash = self.flash orelse return;
+    self.alloc.free(flash.text);
+    self.flash = null;
     ctx.redraw = true;
 }
 
 /// Drops an expired flash, requesting a redraw when it did.
 fn clearExpiredError(self: *Model) bool {
-    const message = self.error_message orelse return false;
-    if (Io.Clock.awake.now(self.io).nanoseconds < self.error_deadline.nanoseconds)
+    const flash = self.flash orelse return false;
+    if (Io.Clock.awake.now(self.io).nanoseconds < flash.deadline.nanoseconds)
         return false;
-    self.alloc.free(message);
-    self.error_message = null;
+    self.alloc.free(flash.text);
+    self.flash = null;
     return true;
 }
 
@@ -1534,7 +1540,6 @@ fn openCommand(self: *Model, ctx: *vxfw.EventContext) !void {
 
 fn returnToBrowse(self: *Model, ctx: *vxfw.EventContext) !void {
     self.mode = .browse;
-    self.confirm_count = 0;
     self.text_field.clearRetainingCapacity();
     try ctx.requestFocus(self.getPane(.here).list_view.widget());
 }
@@ -1750,10 +1755,10 @@ fn drawHeader(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         undefined,
     };
     var segment_count: usize = 5;
-    if (self.error_message) |message| {
+    if (self.flash) |flash| {
         header_text[5] = .{ .text = "  " };
         header_text[6] = .{
-            .text = message,
+            .text = flash.text,
             .style = .{ .fg = .{ .index = 1 }, .bold = true },
         };
         segment_count = 7;
@@ -1823,10 +1828,11 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
     }
 
     if (self.mode == .confirm) {
+        const count = self.mode.confirm;
         const status_text = try std.fmt.allocPrint(
             ctx.arena,
             "Delete {d} item{s}? [y/N]",
-            .{ self.confirm_count, if (self.confirm_count == 1) "" else "s" },
+            .{ count, if (count == 1) "" else "s" },
         );
         const status: vxfw.Text = .{
             .text = status_text,
@@ -2699,7 +2705,7 @@ test "executable files are excluded from the system opener" {
         try model.handleEvent(&ctx, .{ .key_press = enter });
         try testing.expectEqualStrings(
             "cannot open executables",
-            model.error_message.?,
+            model.flash.?.text,
         );
         try testing.expectEqual(@as(usize, 0), opened.items.len);
     }
@@ -2717,7 +2723,7 @@ test "executable files are excluded from the system opener" {
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try rows[exe_index].widget().handleEvent(&ctx, .{ .mouse = press });
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("cannot open executables", model.error_message.?);
+    try testing.expectEqualStrings("cannot open executables", model.flash.?.text);
     try testing.expectEqual(@as(usize, 0), opened.items.len);
 
     // A non-executable file in the same session still opens.
@@ -2731,7 +2737,7 @@ test "executable files are excluded from the system opener" {
     const tab: Key = .{ .codepoint = Key.tab };
     ctx.redraw = false;
     try model.captureEvent(&ctx, .{ .key_press = tab });
-    try testing.expect(model.error_message == null);
+    try testing.expect(model.flash == null);
     try testing.expect(ctx.redraw);
 
     // A second dismissal with no flash pending is a harmless no-op.
@@ -2781,7 +2787,7 @@ test "flashed errors render red beside the path and expire" {
 
     try testing.expectEqualStrings(
         "cannot open executables",
-        model.error_message.?,
+        model.flash.?.text,
     );
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2819,13 +2825,13 @@ test "flashed errors render red beside the path and expire" {
 
     // A tick before the deadline keeps the flash.
     try model.handleEvent(&ctx, .tick);
-    try testing.expect(model.error_message != null);
+    try testing.expect(model.flash != null);
 
     // A tick past the deadline clears it and redraws.
-    model.error_deadline.nanoseconds -= error_flash_ms * std.time.ns_per_ms + 1;
+    model.flash.?.deadline.nanoseconds -= error_flash_ms * std.time.ns_per_ms + 1;
     ctx.redraw = false;
     try model.handleEvent(&ctx, .tick);
-    try testing.expect(model.error_message == null);
+    try testing.expect(model.flash == null);
     try testing.expect(ctx.redraw);
 }
 
@@ -2866,7 +2872,7 @@ test "a failed system open reports the spawn error" {
     };
     defer ctx.cmds.deinit(ctx.alloc);
     try model.handleEvent(&ctx, .{ .key_press = enter });
-    try testing.expectEqualStrings("open: FileNotFound", model.error_message.?);
+    try testing.expectEqualStrings("open: FileNotFound", model.flash.?.text);
 
     // Sweeping with no children must be a harmless no-op.
     reapChildren();
@@ -2995,7 +3001,7 @@ test "mouse releases do not dismiss a fresh flash" {
     try model.handleEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqualStrings(
         "cannot open executables",
-        model.error_message.?,
+        model.flash.?.text,
     );
     ctx.consume_event = false;
 
@@ -3010,12 +3016,12 @@ test "mouse releases do not dismiss a fresh flash" {
     try model.captureEvent(&ctx, .{ .mouse = release });
     try testing.expectEqualStrings(
         "cannot open executables",
-        model.error_message.?,
+        model.flash.?.text,
     );
 
     // And nearly the whole three-second window remains.
     const remaining_ns =
-        model.error_deadline.nanoseconds -
+        model.flash.?.deadline.nanoseconds -
         Io.Clock.awake.now(testing.io).nanoseconds;
     try testing.expect(remaining_ns > 2 * std.time.ns_per_s);
 
@@ -3029,7 +3035,7 @@ test "mouse releases do not dismiss a fresh flash" {
     };
     press.type = .press;
     try model.captureEvent(&ctx, .{ .mouse = press });
-    try testing.expect(model.error_message == null);
+    try testing.expect(model.flash == null);
 }
 
 test "repeated up keys hold the dotdot selection" {
@@ -3150,7 +3156,7 @@ test "dotdot selection blocks entry-scoped input and jumps clear it" {
     try testing.expect(model.mode != .confirm);
     try testing.expectEqualStrings(
         "nothing safe to delete",
-        model.error_message.?,
+        model.flash.?.text,
     );
 
     // Jumping to the bottom clears the '..' selection.
@@ -4248,7 +4254,7 @@ test "anchored model navigation" {
     try Io.Dir.deleteFile(temp.dir, testing.io, "child/nested.txt");
     try model.openCenter();
     try testing.expectEqual(reascended_path_pointer, model.centerListing().path.ptr);
-    try testing.expectEqualStrings("empty directory: child", model.error_message.?);
+    try testing.expectEqualStrings("empty directory: child", model.flash.?.text);
     try testing.expect(model.centerListing().entries[model.hereEntryIndex().?].is_empty.?);
 }
 
@@ -4313,7 +4319,7 @@ test "children preview shows empty directories and file metadata" {
     try model.openCenter();
     try testing.expectEqual(original_center_path, model.centerListing().path.ptr);
     try testing.expectEqualStrings(path, model.centerListing().path);
-    try testing.expectEqualStrings("empty directory: empty", model.error_message.?);
+    try testing.expectEqualStrings("empty directory: empty", model.flash.?.text);
 
     // Enter may arrive before the debounced CHILDREN preview has established
     // emptiness. The pending view must still be rejected before commit.
