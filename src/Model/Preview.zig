@@ -18,39 +18,67 @@ pub const max_preview_bytes: usize = 128 * 1024;
 
 const Preview = @This();
 
-/// How a preview's lines should render. Metadata sheets bold the key up to
-/// the first colon; text and placeholder lines render verbatim.
-pub const Kind = enum {
-    /// A single dimmed italic status message.
-    placeholder,
-    /// File metadata sheet lines shaped like `Key: value`.
-    metadata,
-    /// Verbatim file content lines.
-    text,
+/// Render meaning and ownership for one preview row. Field labels are static;
+/// every text/value payload is owned by the preview allocator.
+pub const Row = union(enum) {
+    text: []const u8,
+    notice: []const u8,
+    spacer,
+    field: Field,
+
+    pub const Field = struct {
+        label: []const u8,
+        value: []const u8,
+    };
+
+    fn deinit(self: *Row, alloc: Allocator) void {
+        switch (self.*) {
+            .text => |value| alloc.free(value),
+            .notice => |value| alloc.free(value),
+            .spacer => {},
+            .field => |field| alloc.free(field.value),
+        }
+        self.* = undefined;
+    }
 };
 
 alloc: Allocator,
-lines: []const []const u8 = &.{},
-kind: Kind = .metadata,
-/// Number of leading lines rendered with placeholder styling ahead of
-/// otherwise metadata-kind content, including any blank separator.
-header_lines: usize = 0,
+rows: []Row = &.{},
 
 pub fn deinit(self: *Preview) void {
-    for (self.lines) |line| self.alloc.free(line);
-    self.alloc.free(self.lines);
+    for (self.rows) |*row| row.deinit(self.alloc);
+    self.alloc.free(self.rows);
     self.* = undefined;
+}
+
+/// Returns verbatim display text for non-field rows. A spacer is an empty
+/// display line; metadata fields are queried by label instead.
+pub fn displayTextAt(self: *const Preview, index: usize) ?[]const u8 {
+    if (index >= self.rows.len) return null;
+    return switch (self.rows[index]) {
+        .text => |value| value,
+        .notice => |value| value,
+        .spacer => "",
+        .field => null,
+    };
+}
+
+pub fn fieldValue(self: *const Preview, label: []const u8) ?[]const u8 {
+    for (self.rows) |row| switch (row) {
+        .field => |field| if (std.mem.eql(u8, field.label, label)) return field.value,
+        else => {},
+    };
+    return null;
 }
 
 /// A single italic message line, such as the empty-directory placeholder.
 pub fn initMessage(alloc: Allocator, message: []const u8) Allocator.Error!Preview {
-    const lines = try alloc.alloc([]const u8, 1);
-    errdefer alloc.free(lines);
-    lines[0] = try alloc.dupe(u8, message);
+    const rows = try alloc.alloc(Row, 1);
+    errdefer alloc.free(rows);
+    rows[0] = .{ .notice = try alloc.dupe(u8, message) };
     return .{
         .alloc = alloc,
-        .lines = lines,
-        .kind = .placeholder,
+        .rows = rows,
     };
 }
 
@@ -90,44 +118,67 @@ fn initSheet(
         loaded_metadata orelse try FileMetadata.init(path);
 
     var made: usize = 0;
-    const lines = try alloc.alloc([]const u8, 10);
+    const rows = try alloc.alloc(Row, 10);
     errdefer {
-        for (lines[0..made]) |line| alloc.free(line);
-        alloc.free(lines);
+        for (rows[0..made]) |*row| row.deinit(alloc);
+        alloc.free(rows);
     }
 
-    lines[0] = try alloc.dupe(u8, "non-text files are not rendered");
+    rows[0] = .{
+        .notice = try alloc.dupe(u8, "non-text files are not rendered"),
+    };
     made += 1;
-    lines[1] = try alloc.dupe(u8, "");
+    rows[1] = .spacer;
     made += 1;
-    lines[2] = try std.fmt.allocPrint(alloc, "Name: {s}", .{std.fs.path.basename(path)});
+    rows[2] = .{ .field = .{
+        .label = "Name",
+        .value = try alloc.dupe(u8, std.fs.path.basename(path)),
+    } };
     made += 1;
-    lines[3] = try std.fmt.allocPrint(alloc, "Type: {s}", .{@tagName(metadata.kind)});
+    rows[3] = .{ .field = .{
+        .label = "Type",
+        .value = try alloc.dupe(u8, @tagName(metadata.kind)),
+    } };
     made += 1;
-    lines[4] = try formatMode(alloc, metadata.kind, metadata.mode);
+    rows[4] = .{ .field = .{
+        .label = "Mode",
+        .value = try formatMode(alloc, metadata.kind, metadata.mode),
+    } };
     made += 1;
-    lines[5] = try formatOwner(alloc, identities, metadata.uid, metadata.gid);
+    rows[5] = .{ .field = .{
+        .label = "Owner",
+        .value = try formatOwner(alloc, identities, metadata.uid, metadata.gid),
+    } };
     made += 1;
-    lines[6] = try std.fmt.allocPrint(alloc, "Size: {Bi:.2} ({d} bytes)", .{
-        metadata.size,
-        metadata.size,
-    });
+    rows[6] = .{ .field = .{
+        .label = "Size",
+        .value = try std.fmt.allocPrint(alloc, "{Bi:.2} ({d} bytes)", .{
+            metadata.size,
+            metadata.size,
+        }),
+    } };
     made += 1;
-    lines[7] = try formatModifiedTime(alloc, metadata.mtime);
+    rows[7] = .{ .field = .{
+        .label = "Modified",
+        .value = try formatModifiedTime(alloc, metadata.mtime),
+    } };
     made += 1;
-    lines[8] = try std.fmt.allocPrint(
-        alloc,
-        "Writable: {s}",
-        .{if (metadata.mode & 0o222 == 0) "no" else "yes"},
-    );
+    rows[8] = .{ .field = .{
+        .label = "Writable",
+        .value = try alloc.dupe(
+            u8,
+            if (metadata.mode & 0o222 == 0) "no" else "yes",
+        ),
+    } };
     made += 1;
-    lines[9] = try std.fmt.allocPrint(alloc, "Links: {d}", .{metadata.nlink});
+    rows[9] = .{ .field = .{
+        .label = "Links",
+        .value = try std.fmt.allocPrint(alloc, "{d}", .{metadata.nlink}),
+    } };
 
     return .{
         .alloc = alloc,
-        .lines = lines,
-        .kind = .metadata,
-        .header_lines = 2,
+        .rows = rows,
     };
 }
 
@@ -137,7 +188,7 @@ fn formatMode(
     mode: u32,
 ) Allocator.Error![]const u8 {
     const bits = format.modeBits(kind, mode);
-    return std.fmt.allocPrint(alloc, "Mode: {s}", .{bits[0..]});
+    return std.fmt.allocPrint(alloc, "{s}", .{bits[0..]});
 }
 
 fn formatOwner(
@@ -150,7 +201,7 @@ fn formatOwner(
     const group = try identities.groupName(alloc, gid);
     return std.fmt.allocPrint(
         alloc,
-        "Owner: {s}:{s} ({d}:{d})",
+        "{s}:{s} ({d}:{d})",
         .{ user, group, uid, gid },
     );
 }
@@ -163,7 +214,7 @@ fn formatModifiedTime(
     if (seconds < 0 or seconds > 253_402_300_799) {
         return std.fmt.allocPrint(
             alloc,
-            "Modified: {d} ns since Unix epoch",
+            "{d} ns since Unix epoch",
             .{timestamp.nanoseconds},
         );
     }
@@ -174,7 +225,7 @@ fn formatModifiedTime(
     const day_seconds = epoch_seconds.getDaySeconds();
     return std.fmt.allocPrint(
         alloc,
-        "Modified: {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC",
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC",
         .{
             year_day.year,
             month_day.month.numeric(),
@@ -223,40 +274,45 @@ pub fn initTextContent(
 
     if (content.len == 0) return try initMessage(alloc, "(empty file)");
 
-    var lines: std.ArrayList([]const u8) = .empty;
+    var rows: std.ArrayList(Row) = .empty;
     errdefer {
-        for (lines.items) |line| alloc.free(line);
-        lines.deinit(alloc);
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit(alloc);
     }
     var iterator = std.mem.splitScalar(u8, content, '\n');
     while (iterator.next()) |raw_line| {
-        try appendTextLine(alloc, &lines, raw_line);
+        try appendTextRow(alloc, &rows, raw_line);
     }
     // splitScalar yields a trailing empty segment for content ending in '\n';
     // drop it so the list holds exactly the visible lines.
-    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
-        const last = lines.pop().?;
-        alloc.free(last);
+    if (rows.items.len > 0) {
+        const trailing_empty = switch (rows.items[rows.items.len - 1]) {
+            .text => |value| value.len == 0,
+            else => false,
+        };
+        if (trailing_empty) {
+            var last = rows.pop().?;
+            last.deinit(alloc);
+        }
     }
-    if (lines.items.len == 0) return try initMessage(alloc, "(empty file)");
+    if (rows.items.len == 0) return try initMessage(alloc, "(empty file)");
 
     if (size > content.len) {
-        try appendTextLine(alloc, &lines, "… (truncated)");
+        try appendTextRow(alloc, &rows, "… (truncated)");
     }
 
     return .{
         .alloc = alloc,
-        .lines = try lines.toOwnedSlice(alloc),
-        .kind = .text,
+        .rows = try rows.toOwnedSlice(alloc),
     };
 }
 
 /// Copies one source line into an owned display line. Tabs expand to four
 /// spaces; other control characters are dropped so terminal escape sequences
 /// cannot hide inside file contents.
-fn appendTextLine(
+fn appendTextRow(
     alloc: Allocator,
-    lines: *std.ArrayList([]const u8),
+    rows: *std.ArrayList(Row),
     raw_line: []const u8,
 ) Allocator.Error!void {
     var line: std.ArrayList(u8) = .empty;
@@ -270,7 +326,7 @@ fn appendTextLine(
     }
     const owned = try line.toOwnedSlice(alloc);
     errdefer alloc.free(owned);
-    try lines.append(alloc, owned);
+    try rows.append(alloc, .{ .text = owned });
 }
 
 test "text file preview splits sanitized lines" {
@@ -292,12 +348,12 @@ test "text file preview splits sanitized lines" {
     try testing.expect(preview != null);
     defer preview.?.deinit();
 
-    try testing.expectEqual(Kind.text, preview.?.kind);
-    try testing.expectEqual(@as(usize, 4), preview.?.lines.len);
-    try testing.expectEqualStrings("alpha", preview.?.lines[0]);
-    try testing.expectEqualStrings("be    ta", preview.?.lines[1]);
-    try testing.expectEqualStrings("gamma", preview.?.lines[2]);
-    try testing.expectEqualStrings("final", preview.?.lines[3]);
+    try testing.expectEqual(@as(usize, 4), preview.?.rows.len);
+    for (preview.?.rows) |row| try testing.expect(row == .text);
+    try testing.expectEqualStrings("alpha", preview.?.displayTextAt(0).?);
+    try testing.expectEqualStrings("be    ta", preview.?.displayTextAt(1).?);
+    try testing.expectEqualStrings("gamma", preview.?.displayTextAt(2).?);
+    try testing.expectEqualStrings("final", preview.?.displayTextAt(3).?);
 }
 
 test "binary and invalid utf-8 files decline text preview" {
@@ -347,8 +403,8 @@ test "empty file previews as a placeholder message" {
     try testing.expect(preview != null);
     defer preview.?.deinit();
 
-    try testing.expectEqual(Kind.placeholder, preview.?.kind);
-    try testing.expectEqualStrings("(empty file)", preview.?.lines[0]);
+    try testing.expect(preview.?.rows[0] == .notice);
+    try testing.expectEqualStrings("(empty file)", preview.?.displayTextAt(0).?);
 }
 
 test "oversized files truncate with a marker line" {
@@ -364,12 +420,11 @@ test "oversized files truncate with a marker line" {
     try testing.expect(preview != null);
     defer preview.?.deinit();
 
-    try testing.expectEqual(Kind.text, preview.?.kind);
     // The 16-byte cap ends mid-line; partial lines render as-is.
-    try testing.expectEqualStrings("0123456789", preview.?.lines[0]);
-    try testing.expectEqualStrings("abcde", preview.?.lines[1]);
-    try testing.expectEqualStrings("… (truncated)", preview.?.lines[2]);
-    try testing.expectEqual(@as(usize, 3), preview.?.lines.len);
+    try testing.expectEqualStrings("0123456789", preview.?.displayTextAt(0).?);
+    try testing.expectEqualStrings("abcde", preview.?.displayTextAt(1).?);
+    try testing.expectEqualStrings("… (truncated)", preview.?.displayTextAt(2).?);
+    try testing.expectEqual(@as(usize, 3), preview.?.rows.len);
 }
 
 test "file symlink sheets follow targets behind the notice" {
@@ -388,13 +443,22 @@ test "file symlink sheets follow targets behind the notice" {
     var preview = try initFileFollow(testing.allocator, &identities, path);
     defer preview.deinit();
 
-    // The sheet describes the followed file, not the link.
-    try testing.expectEqual(@as(usize, 2), preview.header_lines);
+    // The sheet describes the followed file, not the link, and its one layout
+    // test keeps notice/spacer/field order explicit.
+    try testing.expectEqual(@as(usize, 10), preview.rows.len);
+    try testing.expect(preview.rows[0] == .notice);
+    try testing.expect(preview.rows[1] == .spacer);
     try testing.expectEqualStrings(
         "non-text files are not rendered",
-        preview.lines[0],
+        preview.displayTextAt(0).?,
     );
-    try testing.expectEqualStrings("", preview.lines[1]);
-    try testing.expectEqualStrings("Name: link.dat", preview.lines[2]);
-    try testing.expectEqualStrings("Type: file", preview.lines[3]);
+    const expected_labels = [_][]const u8{
+        "Name", "Type", "Mode", "Owner", "Size", "Modified", "Writable", "Links",
+    };
+    for (expected_labels, 2..) |label, index| switch (preview.rows[index]) {
+        .field => |field| try testing.expectEqualStrings(label, field.label),
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("link.dat", preview.fieldValue("Name").?);
+    try testing.expectEqualStrings("file", preview.fieldValue("Type").?);
 }

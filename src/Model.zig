@@ -478,8 +478,9 @@ pub fn assertValid(self: *const Model) void {
                 std.debug.assert(listing.selected.capacity() == listing.entries.len);
                 std.debug.assert(listing.selected_count == listing.selected.count());
             },
-            .preview => |preview| {
-                std.debug.assert(preview.header_lines <= preview.lines.len);
+            .preview => |preview| for (preview.rows) |row| switch (row) {
+                .field => |field| std.debug.assert(field.label.len > 0),
+                else => {},
             },
         }
     }
@@ -2415,7 +2416,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(@as(u32, 1), model.getPane(.here).list_view.cursor);
     try testing.expect(model.preview_schedule.isDirty());
-    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.displayTextAt(0).?);
     try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
     var pending_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer pending_arena.deinit();
@@ -2436,7 +2437,7 @@ test "space toggles consecutive selections and advances the cursor" {
     try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
     model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
     try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
     try testing.expect(!model.preview_schedule.isDirty());
     try testing.expect(ctx.consume_event);
@@ -2974,8 +2975,8 @@ test "stepping onto dotdot hints and enter ascends" {
     try model.syncRight();
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .placeholder);
-    try testing.expectEqualStrings("go up one level", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .notice);
+    try testing.expectEqualStrings("go up one level", child_pane.preview().?.displayTextAt(0).?);
     try testing.expect(model.cursor_status == null);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3385,8 +3386,8 @@ test "parent clicks ascend and select an empty picked row" {
     // CHILDREN mirrors the picked empty directory.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .notice);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.displayTextAt(0).?);
 }
 
 test "parent clicks ascend and select a picked file row" {
@@ -3428,8 +3429,8 @@ test "parent clicks ascend and select a picked file row" {
     // CHILDREN mirrors the picked file with its rendered contents.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .text);
-    try testing.expectEqualStrings("n", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .text);
+    try testing.expectEqualStrings("n", child_pane.preview().?.displayTextAt(0).?);
 }
 
 test "double click on a directory descends into it" {
@@ -3698,10 +3699,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expect(model.preview_schedule.isDirty());
-    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.displayTextAt(0).?);
     model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
     try testing.expectEqual(@as(u8, 0), model.getPane(.here).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.parent).list_view.wheel_scroll);
     try testing.expectEqual(@as(u8, 0), model.getPane(.children).list_view.wheel_scroll);
@@ -3745,10 +3746,10 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
     try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(model.preview_schedule.isDirty());
-    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
     model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.lines[0]);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.displayTextAt(0).?);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 }
@@ -3830,8 +3831,8 @@ test "side pane clicks navigate and browse focus returns to cwd" {
     // The clicked file renders its text preview in the children pane.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .text);
-    try testing.expectEqualStrings("a", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .text);
+    try testing.expectEqualStrings("a", child_pane.preview().?.displayTextAt(0).?);
     // No opener involved for pane promotion.
     try testing.expectEqual(@as(usize, 0), opened.items.len);
     try testing.expect(ctx.consume_event);
@@ -4063,8 +4064,8 @@ test "init stages children for a directory of only file symlinks" {
     // A file symlink renders its target's contents like a normal file.
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .text);
-    try testing.expectEqualStrings("t", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .text);
+    try testing.expectEqualStrings("t", child_pane.preview().?.displayTextAt(0).?);
 
     // The debounced sync must tolerate the same entry as well.
     var ctx: vxfw.EventContext = .{
@@ -4076,8 +4077,8 @@ test "init stages children for a directory of only file symlinks" {
     defer ctx.cmds.deinit(ctx.alloc);
     try model.syncRight();
     try testing.expect(model.getPane(.children).listing() == null);
-    try testing.expect(model.getPane(.children).preview().?.kind == .text);
-    try testing.expectEqualStrings("t", model.getPane(.children).preview().?.lines[0]);
+    try testing.expect(model.getPane(.children).preview().?.rows[0] == .text);
+    try testing.expectEqualStrings("t", model.getPane(.children).preview().?.displayTextAt(0).?);
 }
 
 test "children sync allocation failures preserve the committed projection" {
@@ -4111,7 +4112,7 @@ test "children sync allocation failures preserve the committed projection" {
         const b_index = file_system.indexOfName(model.centerListing(), "b.txt").?;
         _ = model.applyHereCursor(.{ .entry = b_index }, .none);
         model.preview_schedule = .{ .dirty = .zero };
-        const committed_line = model.getPane(.children).preview().?.lines[0].ptr;
+        const committed_line = model.getPane(.children).preview().?.displayTextAt(0).?.ptr;
         try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
 
         var failing = testing.FailingAllocator.init(testing.allocator, .{
@@ -4123,7 +4124,7 @@ test "children sync allocation failures preserve the committed projection" {
 
         if (result) |_| {
             reached_success = true;
-            try testing.expectEqualStrings("b", model.getPane(.children).preview().?.lines[0]);
+            try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
             try testing.expectEqualStrings("b.txt", model.cursor_status.?.entry_name);
             try testing.expect(!model.preview_schedule.isDirty());
             model.assertValid();
@@ -4133,7 +4134,7 @@ test "children sync allocation failures preserve the committed projection" {
             failure_count += 1;
             try testing.expectEqual(
                 committed_line,
-                model.getPane(.children).preview().?.lines[0].ptr,
+                model.getPane(.children).preview().?.displayTextAt(0).?.ptr,
             );
             try testing.expectEqualStrings("a.txt", model.cursor_status.?.entry_name);
             try testing.expect(model.preview_schedule.isDirty());
@@ -4437,9 +4438,9 @@ test "children preview shows empty directories and file metadata" {
     try testing.expectEqualStrings("     empty", center.rows[center_cursor]);
     var child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
-    const empty_message_pointer = child_pane.preview().?.lines[0].ptr;
+    try testing.expect(child_pane.preview().?.rows[0] == .notice);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.displayTextAt(0).?);
+    const empty_message_pointer = child_pane.preview().?.displayTextAt(0).?.ptr;
     var event_ctx: vxfw.EventContext = .{
         .io = testing.io,
         .alloc = testing.allocator,
@@ -4449,7 +4450,7 @@ test "children preview shows empty directories and file metadata" {
     try model.jumpCenter(&event_ctx, false);
     try testing.expectEqual(
         empty_message_pointer,
-        model.getPane(.children).preview().?.lines[0].ptr,
+        model.getPane(.children).preview().?.displayTextAt(0).?.ptr,
     );
 
     const original_center_path = model.centerListing().path.ptr;
@@ -4466,8 +4467,8 @@ test "children preview shows empty directories and file metadata" {
     try testing.expect(model.centerListing().entries[model.hereEntryIndex().?].is_empty.?);
 
     child_pane = model.getPane(.children);
-    try testing.expect(child_pane.preview().?.kind == .placeholder);
-    try testing.expectEqualStrings("empty directory", child_pane.preview().?.lines[0]);
+    try testing.expect(child_pane.preview().?.rows[0] == .notice);
+    try testing.expectEqualStrings("empty directory", child_pane.preview().?.displayTextAt(0).?);
     try testing.expectEqualStrings(
         "     empty",
         model.centerListing().rows[model.hereEntryIndex().?],
@@ -4480,20 +4481,20 @@ test "children preview shows empty directories and file metadata" {
 
     child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind != .placeholder);
-    try testing.expectEqual(@as(usize, 2), child_pane.preview().?.header_lines);
-    try testing.expectEqual(@as(usize, 10), child_pane.preview().?.lines.len);
+    const metadata_preview = child_pane.preview().?;
+    try testing.expectEqual(@as(usize, 10), metadata_preview.rows.len);
+    try testing.expect(metadata_preview.rows[0] == .notice);
+    try testing.expect(metadata_preview.rows[1] == .spacer);
     try testing.expectEqualStrings(
         "non-text files are not rendered",
-        child_pane.preview().?.lines[0],
+        metadata_preview.displayTextAt(0).?,
     );
-    try testing.expectEqualStrings("", child_pane.preview().?.lines[1]);
-    try testing.expectEqualStrings("Name: notes.txt", child_pane.preview().?.lines[2]);
-    try testing.expectEqualStrings("Type: file", child_pane.preview().?.lines[3]);
-    try testing.expectEqualStrings("Mode: -rw-r-----", child_pane.preview().?.lines[4]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview().?.lines[5], "Owner: "));
-    try testing.expectEqualStrings("Size: 5B (5 bytes)", child_pane.preview().?.lines[6]);
-    try testing.expect(std.mem.startsWith(u8, child_pane.preview().?.lines[7], "Modified: "));
+    try testing.expectEqualStrings("notes.txt", metadata_preview.fieldValue("Name").?);
+    try testing.expectEqualStrings("file", metadata_preview.fieldValue("Type").?);
+    try testing.expectEqualStrings("-rw-r-----", metadata_preview.fieldValue("Mode").?);
+    try testing.expect(metadata_preview.fieldValue("Owner").?.len > 0);
+    try testing.expectEqualStrings("5B (5 bytes)", metadata_preview.fieldValue("Size").?);
+    try testing.expect(metadata_preview.fieldValue("Modified").?.len > 0);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4684,10 +4685,11 @@ test "text file preview renders contents without metadata styling" {
 
     const child_pane = model.getPane(.children);
     try testing.expect(child_pane.listing() == null);
-    try testing.expect(child_pane.preview().?.kind == .text);
-    try testing.expectEqual(@as(usize, 2), child_pane.preview().?.lines.len);
-    try testing.expectEqualStrings("no colon here", child_pane.preview().?.lines[0]);
-    try testing.expectEqualStrings("second: line", child_pane.preview().?.lines[1]);
+    try testing.expectEqual(@as(usize, 2), child_pane.preview().?.rows.len);
+    try testing.expect(child_pane.preview().?.rows[0] == .text);
+    try testing.expect(child_pane.preview().?.rows[1] == .text);
+    try testing.expectEqualStrings("no colon here", child_pane.preview().?.displayTextAt(0).?);
+    try testing.expectEqualStrings("second: line", child_pane.preview().?.displayTextAt(1).?);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4783,8 +4785,8 @@ test "directory symlinks list targets and file symlinks render them" {
     try model.syncRight();
     const link_child = model.getPane(.children);
     try testing.expect(link_child.listing() == null);
-    try testing.expect(link_child.preview().?.kind == .text);
-    try testing.expectEqualStrings("target", link_child.preview().?.lines[0]);
+    try testing.expect(link_child.preview().?.rows[0] == .text);
+    try testing.expectEqualStrings("target", link_child.preview().?.displayTextAt(0).?);
 
     const long_link_index = file_system.indexOfName(center, "long-link").?;
     try testing.expectEqual(

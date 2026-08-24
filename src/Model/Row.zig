@@ -9,6 +9,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const Pane = @import("Pane.zig");
+const Preview = @import("Preview.zig");
 const interaction = @import("interaction.zig");
 
 const Row = @This();
@@ -83,20 +84,19 @@ fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw
         return drawClippedSurface(ctx, self.widget(), listing.rows[self.index], style);
     }
     if (self.pane.preview()) |preview| {
-        if (self.index >= preview.lines.len) return self.emptySurface(ctx);
-        // A preview's leading lines may be a notice rendered like the
-        // placeholder messages ahead of otherwise metadata content.
-        const in_header = self.index < preview.header_lines;
-        const dimmed = preview.kind == .placeholder or in_header;
-        style.dim = dimmed;
-        style.italic = dimmed;
-        if (preview.kind == .metadata and !in_header) {
-            return self.drawMetadataRow(ctx, preview.lines[self.index], style);
-        }
-        // Empty lines must still occupy a row: ListView constrains children
-        // to min.height 0, so an empty Text collapses to zero height and
-        // pulls every following row up. drawClippedRow always fills one row.
-        return drawClippedSurface(ctx, self.widget(), preview.lines[self.index], style);
+        if (self.index >= preview.rows.len) return self.emptySurface(ctx);
+        return switch (preview.rows[self.index]) {
+            .text => |value| drawClippedSurface(ctx, self.widget(), value, style),
+            .notice => |value| notice: {
+                style.dim = true;
+                style.italic = true;
+                break :notice drawClippedSurface(ctx, self.widget(), value, style);
+            },
+            // Empty rows must still occupy one terminal line: ListView gives
+            // children min.height 0, so a normal empty Text would collapse.
+            .spacer => drawClippedSurface(ctx, self.widget(), "", style),
+            .field => |field| self.drawMetadataField(ctx, field, style),
+        };
     }
     return self.emptySurface(ctx);
 }
@@ -153,19 +153,20 @@ pub fn drawClippedSurface(
     return surface;
 }
 
-/// Draws a metadata sheet line with the key up to the first colon bolded.
-fn drawMetadataRow(
+/// Draws one metadata field without reconstructing its schema from text.
+fn drawMetadataField(
     self: *const Row,
     ctx: vxfw.DrawContext,
-    line: []const u8,
+    field: Preview.Row.Field,
     style: vaxis.Cell.Style,
 ) Allocator.Error!vxfw.Surface {
-    const colon = std.mem.indexOfScalar(u8, line, ':') orelse unreachable;
     var key_style = style;
     key_style.bold = true;
-    const spans: [2]vaxis.Segment = .{
-        .{ .text = line[0 .. colon + 1], .style = key_style },
-        .{ .text = line[colon + 1 ..], .style = style },
+    const spans: [4]vaxis.Segment = .{
+        .{ .text = field.label, .style = key_style },
+        .{ .text = ":", .style = key_style },
+        .{ .text = " ", .style = style },
+        .{ .text = field.value, .style = style },
     };
     const text: vxfw.RichText = .{
         .text = &spans,

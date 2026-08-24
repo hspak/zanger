@@ -34,7 +34,7 @@ pub const Content = union(enum) {
         return switch (self.*) {
             .empty => 0,
             .listing => |payload| payload.entries.len,
-            .preview => |payload| payload.lines.len,
+            .preview => |payload| payload.rows.len,
         };
     }
 
