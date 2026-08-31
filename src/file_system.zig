@@ -12,6 +12,9 @@ const log = std.log.scoped(.file_system);
 const symlink = @import("file_system/symlink.zig");
 const test_support = @import("test_support.zig");
 
+const directory_reader_buffer_bytes = 32 * 1024;
+const directory_entry_batch_count = 128;
+
 /// A directory entry whose name is owned by its containing `Listing`.
 pub const Entry = struct {
     /// Owned by the containing `Listing`.
@@ -206,13 +209,13 @@ pub const ReadOptions = struct {
 pub const ReadDirError = combined: {
     break :combined Allocator.Error ||
         Dir.OpenError ||
-        Dir.Iterator.Error ||
+        Dir.Reader.Error ||
         symlink.ReadError;
 };
 
 /// Errors returned while checking whether a directory has any visible entries.
 pub const IsDirEmptyError = combined: {
-    break :combined Dir.OpenError || Dir.Iterator.Error;
+    break :combined Dir.OpenError || Dir.Reader.Error;
 };
 
 /// Whether absolute `path` has no entries included by `options`.
@@ -220,13 +223,18 @@ pub fn isDirEmpty(io: Io, path: []const u8, options: ReadOptions) IsDirEmptyErro
     const dir = try Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer Dir.close(dir, io);
 
-    var it = Dir.iterate(dir);
-    while (try it.next(io)) |entry| {
-        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-        const hidden = entry.name.len > 0 and entry.name[0] == '.';
-        if (!hidden or options.show_hidden) return false;
+    var reader_buffer: [directory_reader_buffer_bytes]u8 align(@alignOf(usize)) = undefined;
+    var reader = freshDirectoryReader(dir, &reader_buffer);
+    var entry_batch: [directory_entry_batch_count]Dir.Entry = undefined;
+    while (true) {
+        const entry_count = try reader.read(io, &entry_batch);
+        if (entry_count == 0) return true;
+        for (entry_batch[0..entry_count]) |entry| {
+            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            const hidden = entry.name.len > 0 and entry.name[0] == '.';
+            if (!hidden or options.show_hidden) return false;
+        }
     }
-    return true;
 }
 
 /// Reads absolute `path`. The returned listing owns all of its storage.
@@ -251,35 +259,41 @@ pub fn readDir(
 
     const dir = try Dir.openDirAbsolute(io, normalized_path, .{ .iterate = true });
     defer Dir.close(dir, io);
-    var it = Dir.iterate(dir);
-    while (try it.next(io)) |de| {
-        // Some directory iterators report these; parent navigation is handled
-        // by the model rather than as a rendered entry.
-        if (std.mem.eql(u8, de.name, ".") or std.mem.eql(u8, de.name, "..")) continue;
-        const hidden = de.name.len > 0 and de.name[0] == '.';
-        if (hidden and !options.show_hidden) continue;
+    var reader_buffer: [directory_reader_buffer_bytes]u8 align(@alignOf(usize)) = undefined;
+    var reader = freshDirectoryReader(dir, &reader_buffer);
+    var entry_batch: [directory_entry_batch_count]Dir.Entry = undefined;
+    while (true) {
+        const entry_count = try reader.read(io, &entry_batch);
+        if (entry_count == 0) break;
+        for (entry_batch[0..entry_count]) |de| {
+            // Some directory readers report these; parent navigation is handled
+            // by the model rather than as a rendered entry.
+            if (std.mem.eql(u8, de.name, ".") or std.mem.eql(u8, de.name, "..")) continue;
+            const hidden = de.name.len > 0 and de.name[0] == '.';
+            if (hidden and !options.show_hidden) continue;
 
-        if (count == entries.len) {
-            entries = try alloc.realloc(entries, @max(32, entries.len * 2));
-        }
-        const is_sym = de.kind == .sym_link;
-        var link_target: ?[]const u8 = null;
-        var is_dir = de.kind == .directory;
-        if (is_sym) {
-            const link = try symlink.read(string_alloc, dir, de.name);
-            link_target = link.target;
-            is_dir = link.is_dir;
-        }
+            if (count == entries.len) {
+                entries = try alloc.realloc(entries, @max(32, entries.len * 2));
+            }
+            const is_sym = de.kind == .sym_link;
+            var link_target: ?[]const u8 = null;
+            var is_dir = de.kind == .directory;
+            if (is_sym) {
+                const link = try symlink.read(string_alloc, dir, de.name);
+                link_target = link.target;
+                is_dir = link.is_dir;
+            }
 
-        const name = try string_alloc.dupe(u8, de.name);
-        const entry: Entry = .{
-            .name = name,
-            .link_target = link_target,
-            .is_dir = is_dir,
-            .is_sym = is_sym,
-        };
-        entries[count] = entry;
-        count += 1;
+            const name = try string_alloc.dupe(u8, de.name);
+            const entry: Entry = .{
+                .name = name,
+                .link_target = link_target,
+                .is_dir = is_dir,
+                .is_sym = is_sym,
+            };
+            entries[count] = entry;
+            count += 1;
+        }
     }
 
     sortEntries(entries[0..count]);
@@ -337,6 +351,17 @@ fn nameLess(a: []const u8, b: []const u8) bool {
 
 fn toLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+}
+
+fn freshDirectoryReader(
+    dir: Dir,
+    buffer: []align(@alignOf(usize)) u8,
+) Dir.Reader {
+    var reader = Dir.Reader.init(dir, buffer);
+    // Every caller has just opened `dir`, so rewinding it before the first
+    // native batch read would be a redundant syscall.
+    reader.state = .reading;
+    return reader;
 }
 
 fn rowCapacity(entry: Entry) usize {
@@ -478,6 +503,26 @@ test "directory emptiness follows hidden visibility" {
 
     try tree.writeFile("visible", "v");
     try testing.expect(!try isDirEmpty(testing_io, tree.path, .{}));
+}
+
+test "batched directory reads cross an entry batch boundary" {
+    const alloc = testing.allocator;
+    var tree = try test_support.TempTree.init(alloc, testing_io);
+    defer tree.deinit();
+
+    for (0..directory_entry_batch_count + 1) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, ".file-{d:0>6}", .{index});
+        try tree.writeFile(name, "");
+    }
+
+    try testing.expect(try isDirEmpty(testing_io, tree.path, .{}));
+
+    var listing = try readDir(alloc, testing_io, tree.path, .{ .show_hidden = true });
+    defer listing.deinit();
+    try testing.expectEqual(directory_entry_batch_count + 1, listing.entries.len);
+    try testing.expect(indexOfName(&listing, ".file-000000") != null);
+    try testing.expect(indexOfName(&listing, ".file-000128") != null);
 }
 
 test "symlinks display targets and classify directory targets" {

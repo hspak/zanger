@@ -207,14 +207,16 @@ stale work.
 `file_system.Listing` owns a complete, sorted snapshot of one directory. It does
 not synthesize `.` or `..`; upward navigation is a model operation.
 
-Snapshot construction opens the directory once and consumes its iterator.
-Ordinary entry kinds come from that iterator and do not require a separate
-`stat`. Symbolic links use target-selected relative kernel APIs for their
-displayed target and directory classification: Linux uses `readlinkat` plus a
-type-only `statx`, while macOS uses Darwin `readlinkat` plus `fstatat`. A
-target-resolution failure such as a dangling link leaves the entry visible but
-non-navigable; failure to read or store the target still fails snapshot
-construction.
+Snapshot construction opens the directory once and consumes it through batched
+`Io.Dir.Reader` calls backed by a 32 KiB buffer. Zig lowers those batches to
+Linux `getdents64` or Darwin `getdirentries`; starting in the already-reading
+state avoids rewinding the newly opened directory. Ordinary entry kinds come
+from those batches and do not require a separate `stat`. Symbolic links use
+target-selected relative kernel APIs for their displayed target and directory
+classification: Linux uses `readlinkat` plus a type-only `statx`, while macOS
+uses Darwin `readlinkat` plus `fstatat`. A target-resolution failure such as a
+dangling link leaves the entry visible but non-navigable; failure to read or
+store the target still fails snapshot construction.
 
 Each listing owns:
 
