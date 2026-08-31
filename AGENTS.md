@@ -1,3 +1,7 @@
+# Zanger
+
+This is a three pane TUI file explorer written in zig and libvaxis
+
 # Zig Coding Style Guide
 
 Shared conventions, including the [Zig language reference style
