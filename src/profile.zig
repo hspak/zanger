@@ -151,7 +151,7 @@ const Fixture = struct {
 
         var long_symlinks = try root.createDirPathOpen(io, "long-symlinks", .{});
         defer long_symlinks.close(io);
-        var long_target: [4000]u8 = undefined;
+        var long_target: [@min(4000, Io.Dir.max_path_bytes - 1)]u8 = undefined;
         @memset(&long_target, 'x');
         for (0..options.long_symlink_count) |index| {
             var name_buffer: [32]u8 = undefined;

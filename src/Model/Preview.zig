@@ -85,7 +85,7 @@ pub fn initMessage(alloc: Allocator, message: []const u8) Allocator.Error!Previe
 /// A dimmed non-text notice, one blank separator line, and an eight-line
 /// metadata sheet for a regular file whose contents are not rendered.
 /// `loaded_metadata` may carry metadata already stat'ed for the same path;
-/// otherwise one `statx` runs.
+/// otherwise one native stat call runs.
 pub fn initFile(
     alloc: Allocator,
     identities: *IdentityCache,

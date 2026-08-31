@@ -61,6 +61,8 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("build_options", dev_options);
 
     const tests = b.addTest(.{ .root_module = test_module });
+    const test_compile_step = b.step("test-compile", "Compile tests without running them");
+    test_compile_step.dependOn(&tests.step);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);

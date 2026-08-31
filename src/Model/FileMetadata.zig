@@ -1,21 +1,16 @@
-//! One file's metadata as returned by a single relative `statx` call.
+//! One file's metadata as returned by one native stat call.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
-const FileMetadata = @This();
+const native = switch (builtin.os.tag) {
+    .linux => @import("FileMetadata/linux.zig"),
+    .macos => @import("FileMetadata/macos.zig"),
+    else => @compileError("Zanger supports only Linux and macOS"),
+};
 
-/// Errors from `toPosixPath`, the `statx` syscall mapping, and unexpected
-/// kernel responses.
-pub const InitError =
-    error{
-        NameTooLong,
-        AccessDenied,
-        SymLinkLoop,
-        FileNotFound,
-        NotDir,
-        SystemResources,
-    } || std.posix.UnexpectedError;
+const FileMetadata = @This();
 
 kind: Io.File.Kind,
 size: u64,
@@ -25,8 +20,12 @@ mode: u32,
 uid: u32,
 gid: u32,
 
+/// Errors from path conversion, native stat error mapping, and unexpected
+/// kernel responses.
+pub const InitError = native.InitError;
+
 /// Stats `path` without following symlinks. The error set contains no
-/// allocation failure; every failure is an `statx` outcome.
+/// allocation failure; every failure is a native stat outcome.
 pub fn init(path: []const u8) InitError!FileMetadata {
     return initPath(path, false);
 }
@@ -39,74 +38,5 @@ pub fn initFollow(path: []const u8) InitError!FileMetadata {
 }
 
 fn initPath(path: []const u8, comptime follow_symlinks: bool) InitError!FileMetadata {
-    const linux = std.os.linux;
-    const path_z = try std.posix.toPosixPath(path);
-    const requested: linux.STATX = .{
-        .TYPE = true,
-        .MODE = true,
-        .NLINK = true,
-        .UID = true,
-        .GID = true,
-        .MTIME = true,
-        .SIZE = true,
-    };
-    // AT.SYMLINK_NOFOLLOW's packed-struct bit comes from a comptime int, so
-    // build the flag word as a runtime u32 instead.
-    // follow_symlinks is comptime so the flag word stays a compile-time
-    // value like the original expression.
-    const at_flags = if (follow_symlinks)
-        linux.AT.NO_AUTOMOUNT
-    else
-        linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW;
-
-    var statx = std.mem.zeroes(linux.Statx);
-    while (true) switch (linux.errno(linux.statx(
-        linux.AT.FDCWD,
-        &path_z,
-        at_flags,
-        requested,
-        &statx,
-    ))) {
-        .SUCCESS => break,
-        .INTR => continue,
-        .ACCES => return error.AccessDenied,
-        .LOOP => return error.SymLinkLoop,
-        .NOENT => return error.FileNotFound,
-        .NOTDIR => return error.NotDir,
-        .NOMEM => return error.SystemResources,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
-
-    const actual_mask: u32 = @bitCast(statx.mask);
-    const requested_mask: u32 = @bitCast(requested);
-    if (actual_mask & requested_mask != requested_mask) return error.Unexpected;
-
-    const mode: u32 = statx.mode;
-    return .{
-        .kind = kindFromLinuxMode(statx.mode),
-        .size = statx.size,
-        .mtime = .{
-            .nanoseconds = @intCast(
-                @as(i128, statx.mtime.sec) * std.time.ns_per_s + statx.mtime.nsec,
-            ),
-        },
-        .nlink = statx.nlink,
-        .mode = mode,
-        .uid = statx.uid,
-        .gid = statx.gid,
-    };
-}
-
-fn kindFromLinuxMode(mode: u16) Io.File.Kind {
-    const linux = std.os.linux;
-    return switch (mode & linux.S.IFMT) {
-        linux.S.IFBLK => .block_device,
-        linux.S.IFCHR => .character_device,
-        linux.S.IFDIR => .directory,
-        linux.S.IFIFO => .named_pipe,
-        linux.S.IFLNK => .sym_link,
-        linux.S.IFREG => .file,
-        linux.S.IFSOCK => .unix_domain_socket,
-        else => .unknown,
-    };
+    return native.init(FileMetadata, path, follow_symlinks);
 }

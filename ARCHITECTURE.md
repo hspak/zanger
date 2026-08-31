@@ -1,8 +1,8 @@
 # Zanger Architecture
 
-Zanger is written for Zig 0.16.0 and Linux. It uses libvaxis/vxfw 0.6.0 for the
-terminal UI, Linux inotify for live directory updates, and zeit 0.9.0 for local
-status-bar timestamps.
+Zanger is written for Zig 0.16.0 and supports x86_64 Linux and aarch64 macOS. It
+uses libvaxis/vxfw 0.6.0 for the terminal UI, inotify or kqueue for live
+directory updates, and zeit 0.9.0 for local status-bar timestamps.
 
 ## System map
 
@@ -20,11 +20,16 @@ The executable is split into a small entry point and focused modules:
 | [`src/Model/input.zig`](src/Model/input.zig) | One key-to-browse-action policy shared by capture and bubble handlers |
 | [`src/Model/interaction.zig`](src/Model/interaction.zig) | Actionable mouse-event recognition and double-click tracking |
 | [`src/Model/scheduler.zig`](src/Model/scheduler.zig) | Pure deferred-preview scheduling state |
-| [`src/Model/FileMetadata.zig`](src/Model/FileMetadata.zig) | One file's `statx` metadata |
+| [`src/Model/FileMetadata.zig`](src/Model/FileMetadata.zig) | One file's native `statx`/`fstatat` metadata |
+| [`src/Model/FileMetadata/`](src/Model/FileMetadata/) | Target-isolated Linux and macOS metadata queries |
 | [`src/Model/IdentityCache.zig`](src/Model/IdentityCache.zig) | Cached UID/GID to account-name resolution |
 | [`src/Model/format.zig`](src/Model/format.zig) | Pure permission-bit, size, and timestamp formatters |
 | [`src/file_system.zig`](src/file_system.zig) | Builds and owns directory snapshots, entries, selection state, and preformatted rows |
-| [`src/Watcher.zig`](src/Watcher.zig) | Owns the nonblocking inotify descriptor and transactional HERE watch |
+| [`src/file_system/symlink/`](src/file_system/symlink/) | Target-isolated Linux and macOS relative symlink queries |
+| [`src/Watcher.zig`](src/Watcher.zig) | Platform-neutral transactional HERE-watch facade |
+| [`src/Watcher/`](src/Watcher/) | Linux inotify and macOS kqueue watcher backends |
+| [`src/platform.zig`](src/platform.zig) | Supported-target checks, desktop opener policy, and POSIX child reaping |
+| [`src/platform/`](src/platform/) | Target-isolated desktop opener policy |
 | [`src/command.zig`](src/command.zig) | Resolves unique command prefixes into a closed command enum |
 | [`src/profile.zig`](src/profile.zig) | Runs deterministic filesystem and headless-rendering performance workloads |
 
@@ -135,7 +140,7 @@ The replacement flow is:
 navigation / rebuild / refresh request
         │
         ├─ derive transfer and restoration mechanics from `ViewTransition`
-        ├─ prepare an inotify watch when the path or re-arm policy requires it
+        ├─ prepare a platform watch when the path or re-arm policy requires it
         ├─ construct required listings and previews
         ├─ validate every proposed listing transfer
         ├─ restore HERE cursor and selections when requested
@@ -204,11 +209,12 @@ not synthesize `.` or `..`; upward navigation is a model operation.
 
 Snapshot construction opens the directory once and consumes its iterator.
 Ordinary entry kinds come from that iterator and do not require a separate
-`stat`. Symbolic links require a relative `readlinkat` for their displayed
-target and a relative Linux `statx` to determine whether the target should be
-navigable as a directory. A target-resolution failure such as a dangling link
-leaves the entry visible but non-navigable; failure to read or store the target
-still fails snapshot construction.
+`stat`. Symbolic links use target-selected relative kernel APIs for their
+displayed target and directory classification: Linux uses `readlinkat` plus a
+type-only `statx`, while macOS uses Darwin `readlinkat` plus `fstatat`. A
+target-resolution failure such as a dangling link leaves the entry visible but
+non-navigable; failure to read or store the target still fails snapshot
+construction.
 
 Each listing owns:
 
@@ -243,8 +249,8 @@ or `field { label, value }`. Rendering switches on that tag; it never infers a
 metadata field from a row index or a colon in display text. Tests can therefore
 query fields by label while a separate layout test protects their order.
 
-Symbolic links render like their targets: content reads and the sheet's
-`statx` resolve through the link (the bottom status bar keeps describing the
+Symbolic links render like their targets: content reads and the sheet's native
+stat call resolve through the link (the bottom status bar keeps describing the
 link itself). A dangling link therefore previews as an unavailable target.
 
 A binary file's metadata sheet formats name, type, Unix mode bits, owner/group,
@@ -269,10 +275,11 @@ failure still aborts initialization.
 - `g`/`G` jump directly to the first or last entry.
 - Enter or `l` descends into a non-empty directory. On any other entry it first
   follows symlinks and accepts only a regular file without execute bits, because
-  `xdg-open` may execute what it is given. Accepted paths are spawned detached
-  and their children are collected on a later recurring model tick. Refused
-  entries flash `cannot open executables`; spawn failures flash `open:` plus the
-  error name, while action-level failures use the bottom status message.
+  desktop openers may execute what they are given. Accepted paths are spawned
+  detached through `xdg-open` on Linux or `/usr/bin/open` on macOS, and their
+  children are collected on a later recurring model tick. Refused entries flash
+  `cannot open executables`; spawn failures flash `open:` plus the error name,
+  while action-level failures use the bottom status message.
 - `h` or Backspace ascends and keeps the directory just left under HERE's
   cursor.
 - Space toggles HERE's cursor entry and advances for bulk selection.
@@ -362,10 +369,12 @@ number deleted and, if applicable, the first failure.
 
 ## Live directory watching
 
-`Watcher` is Linux-only and owns one process-lifetime, close-on-exec,
-nonblocking inotify descriptor. At most one watch is current, and it always
-corresponds to HERE. It listens for creation, deletion, moves, self-deletion,
-self-move, unmount, invalidation, and queue overflow.
+`Watcher` presents one transactional interface over two backends. Linux owns a
+process-lifetime, close-on-exec, nonblocking inotify descriptor. macOS owns a
+close-on-exec kqueue plus one `O_EVTONLY | O_CLOEXEC` directory descriptor per
+prepared or current watch. At most one watch is current, and it always
+corresponds to HERE. Both backends detect child-list changes, deletion or rename
+of HERE, and unmount/revocation; Linux also reports inotify queue overflow.
 
 libvaxis 0.6.0 does not expose its internal poll set through `vxfw.App`, so the
 model schedules a recurring 150 ms vxfw tick. An idle tick performs one
@@ -376,12 +385,14 @@ to the strongest required action:
 - `content`: refresh the anchored snapshot;
 - `rearm`: refresh and install a replacement watch.
 
-Events from retired watch descriptors are ignored. Hidden-name events are
-drained without dirtying HERE when hidden files are disabled. Event storms are
-coalesced into one refresh, and refresh is postponed while confirmation is
-active or a cursor preview is dirty so watcher work does not interrupt either
-operation. Queue overflow or a self-invalidating event forces a full refresh
-and re-arm.
+Events from retired watches are ignored. inotify includes child names, so Linux
+can drain hidden-name events without dirtying HERE when hidden files are
+disabled. `EVFILT_VNODE` identifies only the changed directory, so macOS
+conservatively refreshes after a hidden-only mutation; the listing filter still
+keeps hidden entries invisible. Event storms are coalesced into one refresh,
+and refresh is postponed while confirmation is active or a cursor preview is
+dirty so watcher work does not interrupt either operation. Queue overflow or a
+self-invalidating event forces a full refresh and re-arm.
 
 The model coordinates watcher ownership with `PendingView`: navigation prepares
 a candidate directory watch when required, pane preparation runs, and only a
@@ -554,13 +565,14 @@ not directory size.
 
 - **Many ordinary entries:** every name must be copied and sorted, affecting
   startup, watcher refresh, and first preview but not later drawing.
-- **Many symbolic links:** every link needs `readlinkat` and `statx`; relative
-  syscalls and snapshot reuse limit the overhead that can be avoided.
+- **Many symbolic links:** every link needs a relative link read and target
+  stat; relative operations and snapshot reuse limit the overhead that can be
+  avoided.
 - **Slow, remote, FUSE, or automounted directories:** an individual synchronous
   open or read can block without a useful upper bound. Debouncing protects
   active scrolling, but the eventual idle load can still pause the event loop.
-- **Metadata and NSS:** `statx` and account lookup can block. Identity caching
-  and debouncing avoid repeating them for intermediate cursor positions.
+- **Metadata and NSS:** native stat and account lookup can block. Identity
+  caching and debouncing avoid repeating them for intermediate cursor positions.
 - **Filesystem event storms:** events are drained and coalesced before one
   transactional refresh.
 - **Long names and targets:** snapshot memory scales with byte length, while
@@ -583,10 +595,10 @@ zig build profile-check -- --json
 The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
 links, a 1 MiB text-file fixture, complete model initialization, top and bottom
 large-directory frames, cursor movement and pending-preview frames, combined
-input plus draw, and 100 long links with 4,000-byte targets. The preview itself
-still obeys the production 128 KiB read bound. `--samples=N` changes the frame
-sample count; scan sample counts are derived from it. Fixture creation and
-cleanup are outside the measured regions.
+input plus draw, and 100 long links with targets up to 4,000 bytes, capped at
+the platform path limit. The preview itself still obeys the production 128 KiB
+read bound. `--samples=N` changes the frame sample count; scan sample counts are
+derived from it. Fixture creation and cleanup are outside the measured regions.
 
 Regression gates use these p95 budgets:
 

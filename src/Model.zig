@@ -16,6 +16,7 @@ const file_system = @import("file_system.zig");
 const format = @import("Model/format.zig");
 const input = @import("Model/input.zig");
 const interaction = @import("Model/interaction.zig");
+const platform = @import("platform.zig");
 const scheduler = @import("Model/scheduler.zig");
 const test_support = @import("test_support.zig");
 pub const FileMetadata = @import("Model/FileMetadata.zig");
@@ -56,7 +57,7 @@ here_cursor: HereCursor = .none,
 /// Transient blocked-input notice rendered beside the header path.
 flash: ?Flash = null,
 /// Program spawned to open files with; overridable in tests.
-open_program: []const u8 = "xdg-open",
+open_program: []const u8 = platform.open_program,
 /// Test seam: when set, open requests append the target path here instead
 /// of spawning a process. Borrowed for the model's lifetime.
 open_recorder: ?*std.ArrayList([]const u8) = null,
@@ -906,7 +907,7 @@ fn buildChildrenOutcome(
         // Text files render their contents; anything binary or invalid
         // UTF-8 keeps the metadata sheet.
         const size_hint: ?u64 = if (entry.is_sym)
-            null // A link's statx size is the target-path length, not content.
+            null // A link's lstat size is the target-path length, not content.
         else if (metadata_hint) |hint| hint.size else null;
         const text_preview = Preview.initTextContent(
             self.alloc,
@@ -1207,7 +1208,7 @@ fn recoverMissingCenter(self: *Model, failure: anyerror) !void {
 }
 
 /// Opens `path` with the system opener. Restricted to regular files
-/// without execute bits: `xdg-open` may execute whatever it is handed.
+/// without execute bits: desktop openers may execute whatever they are handed.
 /// Symbolic links are classified by their targets. In tests the request may
 /// be recorded instead of spawned; see `open_recorder`.
 fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
@@ -1231,7 +1232,7 @@ fn openWithSystem(self: *Model, path: []const u8, name: []const u8) !void {
 }
 
 /// Spawns `self.open_program` for one path without waiting for it. The
-/// child is left for `reapChildren` to collect on later watcher ticks.
+/// child is left for the platform reaper to collect on later watcher ticks.
 fn spawnOpen(self: *Model, path: []const u8) std.process.SpawnError!void {
     _ = try std.process.spawn(self.io, .{
         .argv = &.{ self.open_program, path },
@@ -1239,25 +1240,6 @@ fn spawnOpen(self: *Model, path: []const u8) std.process.SpawnError!void {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-}
-
-/// Collects exited opener children so detached spawns leave no zombies.
-/// Nonblocking: returns as soon as no child has exited.
-fn reapChildren() void {
-    var status: u32 = undefined;
-    while (true) {
-        const rc = std.os.linux.wait4(-1, &status, std.os.linux.W.NOHANG, null);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {
-                // rc is the child pid, or 0 when children exist but none has
-                // exited yet.
-                if (rc == 0) return;
-            },
-            .CHILD => return,
-            .INTR => continue,
-            else => return,
-        }
-    }
 }
 
 fn openCenter(self: *Model) !void {
@@ -1726,7 +1708,7 @@ fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
             ctx.consumeEvent();
         },
         .tick => {
-            reapChildren();
+            platform.reapChildren();
             if (self.clearExpiredError()) ctx.redraw = true;
             try ctx.tick(watcher_interval_ms, self.widget());
             const refreshed = self.reconcileWatcher() catch |err| {
@@ -2881,7 +2863,7 @@ test "a failed system open reports the spawn error" {
     try testing.expectEqualStrings("open: FileNotFound", model.flash.?.text);
 
     // Sweeping with no children must be a harmless no-op.
-    reapChildren();
+    platform.reapChildren();
 }
 
 test "mouse releases do not dismiss a fresh flash" {
@@ -4005,7 +3987,7 @@ test "anchored view allocation failures retain the old watch and panes" {
 
         const committed_center = model.centerListing().path.ptr;
         const committed_children = model.getPane(.children).listing().?.path.ptr;
-        const committed_watch = model.watcher.current_descriptor;
+        const committed_watch = model.watcher.currentId();
         try testing.expectEqual(@as(usize, 0), model.retired_rows.items.len);
         model.retired_rows.deinit(testing.allocator);
         model.retired_rows = .empty;
@@ -4030,7 +4012,7 @@ test "anchored view allocation failures retain the old watch and panes" {
                 committed_children,
                 model.getPane(.children).listing().?.path.ptr,
             );
-            try testing.expectEqual(committed_watch, model.watcher.current_descriptor);
+            try testing.expectEqual(committed_watch, model.watcher.currentId());
             model.assertValid();
         }
     }
@@ -4530,7 +4512,7 @@ test "directory symlinks list targets and file symlinks render them" {
         .is_directory = true,
     });
     try Io.Dir.symLink(temp.dir, testing.io, "target.txt", "file-link", .{});
-    var long_target: [4000]u8 = undefined;
+    var long_target: [@min(4000, Io.Dir.max_path_bytes - 1)]u8 = undefined;
     @memset(&long_target, 'x');
     try Io.Dir.symLink(temp.dir, testing.io, &long_target, "long-link", .{});
 

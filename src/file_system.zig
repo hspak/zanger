@@ -9,6 +9,7 @@ const Dir = Io.Dir;
 const Path = std.fs.path;
 const log = std.log.scoped(.file_system);
 
+const symlink = @import("file_system/symlink.zig");
 const test_support = @import("test_support.zig");
 
 /// A directory entry whose name is owned by its containing `Listing`.
@@ -206,7 +207,7 @@ pub const ReadDirError = combined: {
     break :combined Allocator.Error ||
         Dir.OpenError ||
         Dir.Iterator.Error ||
-        ReadSymlinkError;
+        symlink.ReadError;
 };
 
 /// Errors returned while checking whether a directory has any visible entries.
@@ -265,9 +266,9 @@ pub fn readDir(
         var link_target: ?[]const u8 = null;
         var is_dir = de.kind == .directory;
         if (is_sym) {
-            const symlink = try readSymlink(string_alloc, dir, de.name);
-            link_target = symlink.target;
-            is_dir = symlink.is_dir;
+            const link = try symlink.read(string_alloc, dir, de.name);
+            link_target = link.target;
+            is_dir = link.is_dir;
         }
 
         const name = try string_alloc.dupe(u8, de.name);
@@ -336,88 +337,6 @@ fn nameLess(a: []const u8, b: []const u8) bool {
 
 fn toLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
-}
-
-const ReadSymlinkError = Allocator.Error || error{
-    AccessDenied,
-    BadPathName,
-    FileNotFound,
-    FileSystem,
-    NameTooLong,
-    NotDir,
-    NotLink,
-    PermissionDenied,
-    SymLinkLoop,
-    SystemResources,
-} || std.posix.UnexpectedError;
-
-const Symlink = struct {
-    target: []const u8,
-    is_dir: bool,
-};
-
-fn readSymlink(alloc: Allocator, dir: Dir, name: []const u8) ReadSymlinkError!Symlink {
-    const linux = std.os.linux;
-    if (name.len > Dir.max_name_bytes) return error.NameTooLong;
-    var name_buffer: [Dir.max_name_bytes + 1]u8 = undefined;
-    @memcpy(name_buffer[0..name.len], name);
-    name_buffer[name.len] = 0;
-
-    var target_buffer: [Dir.max_path_bytes]u8 = undefined;
-    const target_length: usize = while (true) {
-        const rc = linux.readlinkat(
-            dir.handle,
-            @ptrCast(&name_buffer),
-            &target_buffer,
-            target_buffer.len,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => break @intCast(rc),
-            .INTR => continue,
-            .ACCES => return error.AccessDenied,
-            .INVAL => return error.NotLink,
-            .IO => return error.FileSystem,
-            .LOOP => return error.SymLinkLoop,
-            .NAMETOOLONG => return error.NameTooLong,
-            .NOENT => return error.FileNotFound,
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
-            .ILSEQ => return error.BadPathName,
-            .BADF, .FAULT => unreachable,
-            else => |err| return std.posix.unexpectedErrno(err),
-        }
-    };
-    if (target_length == target_buffer.len) return error.NameTooLong;
-    const target = try alloc.dupe(u8, target_buffer[0..target_length]);
-    errdefer alloc.free(target);
-
-    const is_dir = is_dir: {
-        const requested: linux.STATX = .{ .TYPE = true };
-        var statx = std.mem.zeroes(linux.Statx);
-        while (true) switch (linux.errno(linux.statx(
-            dir.handle,
-            @ptrCast(&name_buffer),
-            linux.AT.NO_AUTOMOUNT,
-            requested,
-            &statx,
-        ))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            .ACCES, .LOOP, .NAMETOOLONG, .NOENT, .NOTDIR, .PERM => break :is_dir false,
-            .NOMEM => return error.SystemResources,
-            .BADF, .FAULT, .INVAL => unreachable,
-            else => |err| return std.posix.unexpectedErrno(err),
-        };
-        const actual_mask: u32 = @bitCast(statx.mask);
-        const requested_mask: u32 = @bitCast(requested);
-        if (actual_mask & requested_mask != requested_mask) return error.Unexpected;
-        break :is_dir statx.mode & linux.S.IFMT == linux.S.IFDIR;
-    };
-    return .{
-        .target = target,
-        .is_dir = is_dir,
-    };
 }
 
 fn rowCapacity(entry: Entry) usize {

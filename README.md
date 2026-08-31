@@ -8,6 +8,9 @@ navigator:
 
 ## Build and run
 
+Supported targets are x86_64 Linux and aarch64 macOS. Zanger requires Zig
+0.16.0.
+
 ```sh
 zig build
 zig build run
@@ -18,6 +21,9 @@ Run all filesystem, parser, and headless UI tests with:
 ```sh
 zig build test
 ```
+
+To compile the tests for another supported target without trying to run the
+foreign binary, use `zig build test-compile -Dtarget=<target>`.
 
 Run the repeatable ReleaseSafe performance suite or its regression gate with:
 
