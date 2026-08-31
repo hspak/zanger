@@ -1,4 +1,5 @@
-//! Runs repeatable filesystem and headless rendering performance workloads.
+//! Runs repeatable filesystem, layout, and surface-composition performance
+//! workloads without requiring an interactive terminal.
 
 const std = @import("std");
 
@@ -192,11 +193,16 @@ const ModelInit = struct {
 const DrawFrame = struct {
     session: *Model.ProfileSession,
     arena: *std.heap.ArenaAllocator,
+    screen: *vaxis.Screen,
 
     fn run(self: *DrawFrame) !void {
-        _ = self.arena.reset(.retain_capacity);
+        // Match vxfw.App: release the frame arena, build the surface tree,
+        // clear the terminal cell grid, and compose every surface into it.
+        _ = self.arena.reset(.free_all);
         const surface = try self.session.draw(drawContext(self.arena.allocator()));
-        std.mem.doNotOptimizeAway(surface.children.len);
+        self.screen.clear();
+        surface.render(screenWindow(self.screen), self.session.focusedWidget());
+        std.mem.doNotOptimizeAway(self.screen.buf.ptr);
     }
 };
 
@@ -209,6 +215,7 @@ const MoveCursor = struct {
         self.event_ctx.consume_event = false;
         self.event_ctx.redraw = false;
         try self.session.moveCursor(self.event_ctx, self.down);
+        std.debug.assert(self.event_ctx.redraw);
         self.down = !self.down;
     }
 };
@@ -229,6 +236,18 @@ fn drawContext(arena: Allocator) vxfw.DrawContext {
         .min = .{ .width = 120, .height = 40 },
         .max = .{ .width = 120, .height = 40 },
         .cell_size = .{ .width = 8, .height = 16 },
+    };
+}
+
+fn screenWindow(screen: *vaxis.Screen) vaxis.Window {
+    return .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = screen,
     };
 }
 
@@ -445,6 +464,13 @@ fn runSuite(
     defer session.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
+    var screen = try vaxis.Screen.init(alloc, .{
+        .rows = 40,
+        .cols = 120,
+        .x_pixel = 960,
+        .y_pixel = 640,
+    });
+    defer screen.deinit(alloc);
     var event_ctx: vxfw.EventContext = .{
         .io = io,
         .alloc = alloc,
@@ -452,7 +478,11 @@ fn runSuite(
         .redraw = false,
     };
     defer event_ctx.cmds.deinit(alloc);
-    var frame: DrawFrame = .{ .session = &session, .arena = &arena };
+    var frame: DrawFrame = .{
+        .session = &session,
+        .arena = &arena,
+        .screen = &screen,
+    };
 
     passed = try emitMetric(
         writer,
@@ -501,7 +531,11 @@ fn runSuite(
 
     var long_session = try Model.ProfileSession.init(alloc, io, fixture.long_symlink_path);
     defer long_session.deinit();
-    var long_frame: DrawFrame = .{ .session = &long_session, .arena = &arena };
+    var long_frame: DrawFrame = .{
+        .session = &long_session,
+        .arena = &arena,
+        .screen = &screen,
+    };
     passed = try emitMetric(
         writer,
         options,
@@ -527,7 +561,11 @@ fn runSuite(
 
     var text_session = try Model.ProfileSession.init(alloc, io, fixture.text_path);
     defer text_session.deinit();
-    var text_frame: DrawFrame = .{ .session = &text_session, .arena = &arena };
+    var text_frame: DrawFrame = .{
+        .session = &text_session,
+        .arena = &arena,
+        .screen = &screen,
+    };
     passed = try emitMetric(
         writer,
         options,

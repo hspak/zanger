@@ -11,6 +11,11 @@ const vxfw = vaxis.vxfw;
 
 const Model = @import("Model.zig");
 
+// vxfw services input and timers on frame boundaries. A 120 Hz cadence keeps
+// the scheduling contribution below one typical 60 Hz terminal refresh while
+// redraws themselves remain demand-driven.
+const app_framerate = 120;
+
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     const io = init.io;
@@ -48,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer model.deinit();
 
-    try app.run(model.widget(), .{});
+    try app.run(model.widget(), .{ .framerate = app_framerate });
 }
 
 test {

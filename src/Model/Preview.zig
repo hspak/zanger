@@ -15,6 +15,10 @@ const test_support = @import("../test_support.zig");
 /// Upper bound on bytes read from one file for a content preview. Files at or
 /// below this size render fully; larger files show a truncation marker.
 pub const max_preview_bytes: usize = 128 * 1024;
+/// Text previews are not independently scrollable, so constructing more rows
+/// than any practical terminal can display only adds allocation and teardown
+/// work to the UI-thread preview commit.
+pub const max_preview_lines: usize = 1024;
 
 const Preview = @This();
 
@@ -31,9 +35,9 @@ pub const Row = union(enum) {
         value: []const u8,
     };
 
-    fn deinit(self: *Row, alloc: Allocator) void {
+    fn deinit(self: *Row, alloc: Allocator, owns_text: bool) void {
         switch (self.*) {
-            .text => |value| alloc.free(value),
+            .text => |value| if (owns_text) alloc.free(value),
             .notice => |value| alloc.free(value),
             .spacer => {},
             .field => |field| alloc.free(field.value),
@@ -44,10 +48,15 @@ pub const Row = union(enum) {
 
 alloc: Allocator,
 rows: []Row = &.{},
+// Text-preview rows borrow slices of this one allocation. Other preview kinds
+// leave it null and continue to own their row payloads individually.
+text_storage: ?[]u8 = null,
 
 pub fn deinit(self: *Preview) void {
-    for (self.rows) |*row| row.deinit(self.alloc);
+    const owns_text = self.text_storage == null;
+    for (self.rows) |*row| row.deinit(self.alloc, owns_text);
     self.alloc.free(self.rows);
+    if (self.text_storage) |storage| self.alloc.free(storage);
     self.* = undefined;
 }
 
@@ -120,7 +129,7 @@ fn initSheet(
     var made: usize = 0;
     const rows = try alloc.alloc(Row, 10);
     errdefer {
-        for (rows[0..made]) |*row| row.deinit(alloc);
+        for (rows[0..made]) |*row| row.deinit(alloc, true);
         alloc.free(rows);
     }
 
@@ -274,59 +283,72 @@ pub fn initTextContent(
 
     if (content.len == 0) return try initMessage(alloc, "(empty file)");
 
-    var rows: std.ArrayList(Row) = .empty;
-    errdefer {
-        for (rows.items) |*row| row.deinit(alloc);
-        rows.deinit(alloc);
-    }
+    const TextSpan = struct { start: usize, len: usize };
+    var storage: std.ArrayList(u8) = .empty;
+    defer storage.deinit(alloc);
+    var spans: std.ArrayList(TextSpan) = .empty;
+    defer spans.deinit(alloc);
+
+    var line_limit_reached = false;
     var iterator = std.mem.splitScalar(u8, content, '\n');
     while (iterator.next()) |raw_line| {
-        try appendTextRow(alloc, &rows, raw_line);
+        if (spans.items.len == max_preview_lines) {
+            // A file ending in a newline yields one final empty segment; it
+            // does not represent an additional visible row.
+            line_limit_reached = raw_line.len != 0 or iterator.rest().len != 0;
+            break;
+        }
+        const start = storage.items.len;
+        try appendSanitizedText(alloc, &storage, raw_line);
+        try spans.append(alloc, .{
+            .start = start,
+            .len = storage.items.len - start,
+        });
     }
     // splitScalar yields a trailing empty segment for content ending in '\n';
     // drop it so the list holds exactly the visible lines.
-    if (rows.items.len > 0) {
-        const trailing_empty = switch (rows.items[rows.items.len - 1]) {
-            .text => |value| value.len == 0,
-            else => false,
-        };
-        if (trailing_empty) {
-            var last = rows.pop().?;
-            last.deinit(alloc);
-        }
+    if (!line_limit_reached and spans.items.len > 0 and spans.items[spans.items.len - 1].len == 0) {
+        _ = spans.pop();
     }
-    if (rows.items.len == 0) return try initMessage(alloc, "(empty file)");
+    if (spans.items.len == 0) return try initMessage(alloc, "(empty file)");
 
-    if (size > content.len) {
-        try appendTextRow(alloc, &rows, "… (truncated)");
+    if (size > content.len or line_limit_reached) {
+        const start = storage.items.len;
+        try storage.appendSlice(alloc, "… (truncated)");
+        try spans.append(alloc, .{
+            .start = start,
+            .len = storage.items.len - start,
+        });
     }
 
+    const text_storage = try storage.toOwnedSlice(alloc);
+    errdefer alloc.free(text_storage);
+    const rows = try alloc.alloc(Row, spans.items.len);
+    for (rows, spans.items) |*row, span| {
+        row.* = .{ .text = text_storage[span.start..][0..span.len] };
+    }
     return .{
         .alloc = alloc,
-        .rows = try rows.toOwnedSlice(alloc),
+        .rows = rows,
+        .text_storage = text_storage,
     };
 }
 
-/// Copies one source line into an owned display line. Tabs expand to four
-/// spaces; other control characters are dropped so terminal escape sequences
-/// cannot hide inside file contents.
-fn appendTextRow(
+/// Appends one sanitized source line to the preview's contiguous text storage.
+/// Tabs expand to four spaces; other control characters are dropped so
+/// terminal escape sequences cannot hide inside file contents.
+fn appendSanitizedText(
     alloc: Allocator,
-    rows: *std.ArrayList(Row),
+    storage: *std.ArrayList(u8),
     raw_line: []const u8,
 ) Allocator.Error!void {
-    var line: std.ArrayList(u8) = .empty;
-    errdefer line.deinit(alloc);
     for (raw_line) |byte| {
         switch (byte) {
-            '\t' => try line.appendSlice(alloc, "    "),
+            '\t' => try storage.appendSlice(alloc, "    "),
             0x00...0x08, 0x0a...0x1f, 0x7f => {},
-            else => try line.append(alloc, byte),
+            else => try storage.append(alloc, byte),
         }
     }
-    const owned = try line.toOwnedSlice(alloc);
-    errdefer alloc.free(owned);
-    try rows.append(alloc, .{ .text = owned });
 }
 
 fn checkTextAllocationFailures(
@@ -393,6 +415,45 @@ test "text file preview splits sanitized lines" {
     try testing.expectEqualStrings("be    ta", preview.?.displayTextAt(1).?);
     try testing.expectEqualStrings("gamma", preview.?.displayTextAt(2).?);
     try testing.expectEqualStrings("final", preview.?.displayTextAt(3).?);
+    const storage = preview.?.text_storage.?;
+    const storage_start = @intFromPtr(storage.ptr);
+    const storage_end = storage_start + storage.len;
+    for (preview.?.rows) |row| {
+        const text = row.text;
+        const start = @intFromPtr(text.ptr);
+        try testing.expect(start >= storage_start and start + text.len <= storage_end);
+    }
+}
+
+test "text preview caps source lines in contiguous storage" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+
+    const source_line_count = max_preview_lines + 2;
+    const content = try testing.allocator.alloc(u8, source_line_count * 2);
+    defer testing.allocator.free(content);
+    for (0..source_line_count) |index| {
+        content[index * 2] = 'x';
+        content[index * 2 + 1] = '\n';
+    }
+    try tree.writeFile("many-lines.txt", content);
+
+    const path = try tree.absolutePath("many-lines.txt");
+    defer testing.allocator.free(path);
+    var preview = (try initTextContent(
+        testing.allocator,
+        testing.io,
+        path,
+        null,
+        content.len,
+    )).?;
+    defer preview.deinit();
+
+    try testing.expectEqual(max_preview_lines + 1, preview.rows.len);
+    try testing.expectEqualStrings("x", preview.displayTextAt(max_preview_lines - 1).?);
+    try testing.expectEqualStrings("… (truncated)", preview.displayTextAt(max_preview_lines).?);
+    try testing.expect(preview.text_storage != null);
 }
 
 test "binary and invalid utf-8 files decline text preview" {

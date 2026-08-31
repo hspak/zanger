@@ -16,6 +16,9 @@ zig build
 zig build run
 ```
 
+`zig build run` uses Zig's default Debug optimization mode. For representative
+interactive performance, run `zig build -Doptimize=ReleaseSafe run`.
+
 Run all filesystem, parser, and headless UI tests with:
 
 ```sh
@@ -55,7 +58,7 @@ In CWD, one left click selects a row and a double click enters or opens it.
 Clicking a PARENT
 row ascends with that row selected; clicking a CHILDREN row promotes that
 listing to CWD with the clicked row selected. Mouse-wheel navigation belongs to
-CWD and moves one row, including on terminals that emit duplicate reports;
+CWD and moves one row per press report; release-shaped reports are ignored and
 wheel input over side panes is consumed without scrolling them.
 
 ## Commands

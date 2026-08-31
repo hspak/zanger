@@ -31,7 +31,7 @@ The executable is split into a small entry point and focused modules:
 | [`src/platform.zig`](src/platform.zig) | Supported-target checks, desktop opener policy, and POSIX child reaping |
 | [`src/platform/`](src/platform/) | Target-isolated desktop opener policy |
 | [`src/command.zig`](src/command.zig) | Resolves unique command prefixes into a closed command enum |
-| [`src/profile.zig`](src/profile.zig) | Runs deterministic filesystem and headless-rendering performance workloads |
+| [`src/profile.zig`](src/profile.zig) | Runs deterministic filesystem, layout, and surface-composition performance workloads |
 
 At runtime the dependency direction is:
 
@@ -240,8 +240,10 @@ filled, so a long off-screen link target does not add work to every frame.
 A regular-file preview first reads up to 128 KiB and classifies that prefix: a
 NUL byte or invalid UTF-8 marks it as binary. Text files render one preview line
 per source line instead, with tabs expanded, control characters dropped, and a
-truncation marker for oversized files; empty files preview as a placeholder
-message. Binary files keep the metadata sheet under a dimmed italic notice
+truncation marker for oversized files. At most 1,024 source lines are retained,
+and their sanitized bytes share one contiguous allocation rather than one
+allocation per line; empty files preview as a placeholder message. Binary files
+keep the metadata sheet under a dimmed italic notice
 reading "non-text files are not rendered", styled like the empty-directory
 placeholder. The read is bounded and debounced like all children work, so
 oversized or slow files cannot affect cursor movement.
@@ -309,8 +311,9 @@ Stable `Row` widgets provide click identity because vxfw `ListView` has no
 click-to-select support and its scroll type is private. A HERE row click moves
 the cursor. Pane wrappers capture wheel presses before `ListView` applies its
 own viewport-only scrolling; HERE moves by one item and side panes consume the
-input without changing state. Duplicate same-direction wheel reports from one
-physical notch are coalesced within a 12 ms window.
+input without changing state. Every press report contributes one move, so rapid
+wheel notches accumulate in model state before the input batch's single frame;
+release-shaped reports are consumed without moving.
 
 ### Debounced CHILDREN preview
 
@@ -319,9 +322,10 @@ Filesystem work is kept out of continuous cursor input:
 ```text
 cursor event
     ├─ update HERE cursor
+    ├─ request an immediate cursor/status redraw
     ├─ mark CHILDREN stale and retain its committed content
-    ├─ retain the committed bottom-bar metadata and entry name
-    ├─ move the preview deadline 12 ms forward
+    ├─ show the current entry name with a pending status
+    ├─ move the preview deadline 40 ms forward
     └─ queue or revise the servicing timer
              │
              └─ timer after input settles
@@ -330,10 +334,13 @@ cursor event
                     └─ request another redraw
 ```
 
-The preview timer is separate from the recurring watcher timer. Continued input
-moves the deadline, so only the final cursor target incurs a directory scan,
-metadata request, or account lookup. The compact bottom details change with the
-same commit as CHILDREN, while entry and selection counts remain live.
+The preview timer is separate from the recurring watcher timer. Forty
+milliseconds spans normal 30–60 Hz key-repeat intervals, so continued input can
+move the deadline before synchronous work begins. Only the final cursor target
+incurs a directory scan, metadata request, or account lookup. The cursor and
+pending name paint immediately; full bottom details change with the same commit
+as CHILDREN, while entry and selection counts remain live. Watcher refresh stays
+postponed for the same dirty interval.
 
 ### Commands and modes
 
@@ -492,12 +499,18 @@ that arena with `.free_all`, lays out the root widget, updates focus and hover
 state, renders the resulting surface tree, and retains surface references only
 until the next redraw. The arena is deinitialized when the app exits.
 
+The application requests a 120 Hz vxfw cadence, bounding its frame-quantized
+input and timer scheduling contribution to about 8.3 ms. Rendering remains
+demand-driven, although vxfw still wakes to service its loop at that cadence.
+An event-driven wake-up would avoid the periodic idle work, but vaxis 0.6.0 does
+not expose that loop policy to applications.
+
 `DrawContext.arena` therefore has exactly frame lifetime. Zanger allocates
 temporary widgets, formatted status strings, segments, cells, and surfaces from
 it without individual frees. Anything referenced across events or redraws must
 instead use the model allocator or a listing-owned arena. vaxis does not expose
-an `App` option for changing this reset policy; the profiling harness controls
-its own headless arena and uses `.retain_capacity` between measured frames.
+an `App` option for changing this reset policy; the profiling harness therefore
+uses the same `.free_all` reset between measured frames.
 
 Nested layout widgets may create short-lived child arenas backed by the frame
 arena. Releasing one returns no memory to the general-purpose allocator; the
@@ -545,9 +558,10 @@ owner on both success and rollback paths.
 
 ## Performance model
 
-Cursor input plus its requested frame should complete within 16 ms. Snapshot
-construction may take longer, but it must not occur for every cursor event
-during continuous scrolling.
+Cursor input plus its requested frame should complete within 16 ms. A changed
+HERE cursor always requests that frame directly; it never waits for CHILDREN's
+preview timer. Snapshot construction may take longer, but it must not occur for
+every cursor event during continuous scrolling.
 
 The design separates those costs:
 
@@ -598,9 +612,12 @@ The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
 links, a 1 MiB text-file fixture, complete model initialization, top and bottom
 large-directory frames, cursor movement and pending-preview frames, combined
 input plus draw, and 100 long links with targets up to 4,000 bytes, capped at
-the platform path limit. The preview itself still obeys the production 128 KiB
-read bound. `--samples=N` changes the frame sample count; scan sample counts are
-derived from it. Fixture creation and cleanup are outside the measured regions.
+the platform path limit. Frame workloads use production's `.free_all` arena
+reset and compose the completed surface tree into a 120×40 cell grid. They do
+not emulate Vaxis's final screen diff or a real terminal flush. The preview
+itself still obeys the production 128 KiB and 1,024-line bounds. `--samples=N`
+changes the frame sample count; scan sample counts are derived from it. Fixture
+creation and cleanup are outside the measured regions.
 
 Regression gates use these p95 budgets:
 
@@ -611,7 +628,7 @@ Regression gates use these p95 budgets:
 | Text-file preview build | 25 ms |
 | Full large-model initialization | 100 ms |
 | Cursor movement | 1 ms |
-| Every headless frame workload | 4 ms |
+| Every composed frame workload | 4 ms |
 
 The rendering budget deliberately leaves headroom below the 16 ms interaction
 target; filesystem budgets are looser to tolerate host and CI variance.
@@ -630,8 +647,7 @@ those operations exceed 16 ms.
 The next step for a hard bound would be a generation-tagged background loader:
 build snapshots away from the UI thread, discard obsolete cursor generations,
 and deliver completed ownership through a UI event. That would require explicit
-thread allocator, cancellation, watcher-snapshot, and shutdown rules and is not
-needed for the current continuous-scrolling target.
+thread allocator, cancellation, watcher-snapshot, and shutdown rules.
 
 Delivery is currently blocked by the dependency, not by this codebase: vaxis
 0.6.0 creates its event loop inside `App.run` as stack-local state and exposes
