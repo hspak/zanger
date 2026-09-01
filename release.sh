@@ -21,26 +21,47 @@ version=$1
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   die "version must use the X.Y.Z format"
 
-for command in curl git grep makepkg mktemp sed sha256sum; do
+for command in curl gh git grep install makepkg mktemp ruby sed sha256sum tar zig; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 aur_dir=$(cd -- "$repo_dir/../../aur/zanger" 2>/dev/null && pwd) ||
   die "AUR repository not found at $repo_dir/../../aur/zanger"
+tap_dir=$(cd -- "$repo_dir/../homebrew-tap" 2>/dev/null && pwd) ||
+  die "Homebrew tap not found at $repo_dir/../homebrew-tap"
 pkgbuild=$aur_dir/PKGBUILD
+formula_path=Formula/zanger.rb
+formula=$tap_dir/$formula_path
 
 [[ -f $pkgbuild ]] || die "PKGBUILD not found at $pkgbuild"
+[[ -f $formula ]] || die "Homebrew formula not found at $formula"
 git -C "$repo_dir" remote get-url origin >/dev/null 2>&1 ||
   die "the source repository has no origin remote"
 git -C "$aur_dir" remote get-url origin >/dev/null 2>&1 ||
   die "the AUR repository has no origin remote"
+git -C "$tap_dir" remote get-url origin >/dev/null 2>&1 ||
+  die "the Homebrew tap has no origin remote"
+git -C "$repo_dir" symbolic-ref --quiet HEAD >/dev/null ||
+  die "the source repository is in detached HEAD state"
 git -C "$aur_dir" symbolic-ref --quiet HEAD >/dev/null ||
   die "the AUR repository is in detached HEAD state"
+git -C "$tap_dir" symbolic-ref --quiet HEAD >/dev/null ||
+  die "the Homebrew tap is in detached HEAD state"
+git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1 ||
+  die "the current source branch has no upstream"
 git -C "$aur_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1 ||
   die "the current AUR branch has no upstream"
+git -C "$tap_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1 ||
+  die "the current Homebrew tap branch has no upstream"
 git -C "$aur_dir" var GIT_AUTHOR_IDENT >/dev/null 2>&1 ||
   die "git author information is not configured for the AUR repository"
+git -C "$tap_dir" var GIT_AUTHOR_IDENT >/dev/null 2>&1 ||
+  die "git author information is not configured for the Homebrew tap"
+gh auth status --hostname github.com >/dev/null 2>&1 ||
+  die "GitHub CLI is not authenticated; run 'gh auth login'"
+github_repo=$(cd -- "$repo_dir" && gh repo view --json nameWithOwner --jq .nameWithOwner) ||
+  die "could not resolve the GitHub repository from origin"
 
 # Do not mix a release with pre-existing tracked or staged changes. Untracked
 # makepkg output in the AUR repository is intentionally ignored.
@@ -52,6 +73,14 @@ git -C "$aur_dir" diff --quiet --ignore-submodules -- ||
   die "the AUR repository has uncommitted tracked changes"
 git -C "$aur_dir" diff --cached --quiet --ignore-submodules -- ||
   die "the AUR repository has staged changes"
+git -C "$tap_dir" diff --quiet --ignore-submodules -- ||
+  die "the Homebrew tap has uncommitted tracked changes"
+git -C "$tap_dir" diff --cached --quiet --ignore-submodules -- ||
+  die "the Homebrew tap has staged changes"
+git -C "$tap_dir" ls-files --error-unmatch "$formula_path" >/dev/null 2>&1 ||
+  die "the Homebrew formula is not tracked"
+[[ $(git -C "$repo_dir" rev-parse HEAD) == $(git -C "$repo_dir" rev-parse '@{upstream}') ]] ||
+  die "the source branch is not synchronized with its upstream; push or pull it first"
 
 grep -Fq ".version = \"$version\"" "$repo_dir/build.zig.zon" ||
   die "build.zig.zon does not declare version $version"
@@ -59,6 +88,12 @@ grep -Fq ".version = \"$version\"" "$repo_dir/build.zig.zon" ||
   die "expected exactly one pkgver entry in PKGBUILD"
 [[ $(grep -Ec '^sha256sums=' "$pkgbuild") -eq 1 ]] ||
   die "expected exactly one sha256sums entry in PKGBUILD"
+[[ $(grep -Ec '^  version "[0-9]+\.[0-9]+\.[0-9]+"$' "$formula") -eq 1 ]] ||
+  die "expected exactly one version entry in the Homebrew formula"
+[[ $(grep -Ec '^    url ".*"$' "$formula") -eq 2 ]] ||
+  die "expected exactly two URL entries in the Homebrew formula"
+[[ $(grep -Ec '^    sha256 "[^"]*"$' "$formula") -eq 2 ]] ||
+  die "expected exactly two SHA-256 entries in the Homebrew formula"
 
 git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/$version" >/dev/null &&
   die "tag $version already exists locally"
@@ -70,15 +105,94 @@ else
 fi
 git -C "$aur_dir" ls-remote origin HEAD >/dev/null ||
   die "could not connect to the AUR origin"
+git -C "$tap_dir" ls-remote origin HEAD >/dev/null ||
+  die "could not connect to the Homebrew tap origin"
+
+release_dir=$(mktemp --directory --suffix="-zanger-$version")
+trap 'rm -rf -- "$release_dir"' EXIT
+
+previous_tag=$(git -C "$repo_dir" describe --tags --abbrev=0 \
+  --match '[0-9]*.[0-9]*.[0-9]*' HEAD 2>/dev/null || true)
+notes=$release_dir/release-notes.md
+if [[ -n $previous_tag ]]; then
+  echo "Generating release notes from commits after $previous_tag..."
+  git -C "$repo_dir" log --no-decorate --pretty=oneline "$previous_tag..HEAD" |
+    sed 's/$/  /' >"$notes"
+else
+  echo "Generating release notes from all commits..."
+  git -C "$repo_dir" log --no-decorate --pretty=oneline HEAD |
+    sed 's/$/  /' >"$notes"
+fi
+[[ -s $notes ]] || die "there are no commits to include in the release notes"
+
+echo "Running tests..."
+(
+  cd -- "$repo_dir"
+  zig build test
+)
+
+targets=(
+  x86_64-linux-musl
+  aarch64-macos
+)
+asset_names=()
+release_assets=()
+
+for target in "${targets[@]}"; do
+  echo "Building $target..."
+  prefix=$release_dir/prefix-$target
+  package_name=zanger-$version-$target
+  package_dir=$release_dir/$package_name
+  archive_name=$package_name.tar.gz
+
+  (
+    cd -- "$repo_dir"
+    zig build \
+      --prefix "$prefix" \
+      -Dtarget="$target" \
+      -Doptimize=ReleaseSafe \
+      -Dversion="$version"
+  )
+
+  mkdir -- "$package_dir"
+  install -m 0755 "$prefix/bin/zanger" "$package_dir/zanger"
+  install -m 0644 "$repo_dir/README.md" "$repo_dir/LICENSE" "$package_dir/"
+  tar -C "$release_dir" -czf "$release_dir/$archive_name" "$package_name"
+  asset_names+=("$archive_name")
+  release_assets+=("$release_dir/$archive_name")
+done
+
+(
+  cd -- "$release_dir"
+  sha256sum -- "${asset_names[@]}" >SHA256SUMS
+)
+release_assets+=("$release_dir/SHA256SUMS")
+
+linux_archive=$release_dir/zanger-$version-x86_64-linux-musl.tar.gz
+macos_archive=$release_dir/zanger-$version-aarch64-macos.tar.gz
+linux_sha256=$(sha256sum "$linux_archive")
+linux_sha256=${linux_sha256%% *}
+macos_sha256=$(sha256sum "$macos_archive")
+macos_sha256=${macos_sha256%% *}
+
+actual_version=$("$release_dir/prefix-x86_64-linux-musl/bin/zanger" --version)
+[[ $actual_version == "version: $version" ]] ||
+  die "release binary reported '$actual_version' instead of 'version: $version'"
 
 echo "Tagging $version and pushing it to GitHub..."
 git -C "$repo_dir" tag "$version"
 git -C "$repo_dir" push origin "refs/tags/$version"
 
-archive_url="https://github.com/hspak/zanger/archive/refs/tags/$version.tar.gz"
-archive=$(mktemp --suffix="-$version.tar.gz")
-trap 'rm -f -- "$archive"' EXIT
+echo "Creating a draft GitHub release..."
+gh release create "$version" "${release_assets[@]}" \
+  --repo "$github_repo" \
+  --draft \
+  --verify-tag \
+  --title "Zanger $version" \
+  --notes-file "$notes"
 
+archive_url="https://github.com/$github_repo/archive/refs/tags/$version.tar.gz"
+archive=$release_dir/zanger-$version-source.tar.gz
 echo "Downloading the tagged source archive..."
 curl --fail --location --silent --show-error \
   --retry 5 --retry-delay 2 --retry-all-errors \
@@ -100,4 +214,28 @@ sed -Ei "s/^sha256sums=.*/sha256sums=(\"$sha256\")/" "$pkgbuild"
   git push
 )
 
-echo "Published zanger $version to GitHub and the AUR."
+echo "Updating the Homebrew tap..."
+download_url=https://github.com/$github_repo/releases/download/$version
+sed -Ei "s|^  version \".*\"|  version \"$version\"|" "$formula"
+sed -Ei "/^  on_macos do$/,/^  end$/ {
+  s|^    url \".*\"|    url \"$download_url/zanger-$version-aarch64-macos.tar.gz\"|
+  s|^    sha256 \".*\"|    sha256 \"$macos_sha256\"|
+}" "$formula"
+sed -Ei "/^  on_linux do$/,/^  end$/ {
+  s|^    url \".*\"|    url \"$download_url/zanger-$version-x86_64-linux-musl.tar.gz\"|
+  s|^    sha256 \".*\"|    sha256 \"$linux_sha256\"|
+}" "$formula"
+ruby -c "$formula" >/dev/null
+
+(
+  cd -- "$tap_dir"
+  git diff --check
+  git add -- "$formula_path"
+  git commit -m "Publish version $version"
+  git push
+)
+
+echo "Publishing the GitHub release..."
+gh release edit "$version" --repo "$github_repo" --draft=false
+
+echo "Published zanger $version to GitHub, the AUR, and Homebrew."
