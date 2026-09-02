@@ -311,9 +311,9 @@ Stable `Row` widgets provide click identity because vxfw `ListView` has no
 click-to-select support and its scroll type is private. A HERE row click moves
 the cursor. Pane wrappers capture wheel presses before `ListView` applies its
 own viewport-only scrolling; HERE moves by one item and side panes consume the
-input without changing state. Every press report contributes one move, so rapid
-wheel notches accumulate in model state before the input batch's single frame;
-release-shaped reports are consumed without moving.
+input without changing state. Same-direction press reports within one short
+coalescing window contribute only one move; release-shaped reports are consumed
+without moving.
 
 ### Debounced CHILDREN preview
 

@@ -61,6 +61,8 @@ open_program: []const u8 = platform.open_program,
 /// Test seam: when set, open requests append the target path here instead
 /// of spawning a process. Borrowed for the model's lifetime.
 open_recorder: ?*std.ArrayList([]const u8) = null,
+// Non-null while one coalescing tick covers wheel reports in this direction.
+wheel_pending: ?WheelDirection = null,
 // Updated during layout; HERE has one item per terminal row.
 cwd_visible_rows: u16 = 1,
 // Owned and replaced transactionally by `setMessage`.
@@ -91,6 +93,7 @@ const error_flash_ms = 3000;
 // deadline before synchronous CHILDREN work begins. HERE redraws immediately;
 // only the derived preview and metadata wait for quiet input.
 const preview_debounce_ms = 40;
+const wheel_coalesce_ms = 12;
 
 const WheelDirection = Pane.WheelDirection;
 
@@ -337,6 +340,14 @@ fn previewTimerWidget(self: *Model) vxfw.Widget {
         .userdata = self,
         .eventHandler = typeErasedPreviewTimerHandler,
         .drawFn = typeErasedPreviewTimerDrawFn,
+    };
+}
+
+fn wheelTimerWidget(self: *Model) vxfw.Widget {
+    return .{
+        .userdata = self,
+        .eventHandler = typeErasedWheelTimerHandler,
+        .drawFn = typeErasedWheelTimerDrawFn,
     };
 }
 
@@ -588,6 +599,31 @@ fn typeErasedPreviewTimerDrawFn(
     return .{
         .size = ctx.min,
         .widget = self.previewTimerWidget(),
+        .buffer = &.{},
+        .children = &.{},
+    };
+}
+
+fn typeErasedWheelTimerHandler(
+    ptr: *anyopaque,
+    _: *vxfw.EventContext,
+    event: vxfw.Event,
+) anyerror!void {
+    const self: *Model = @ptrCast(@alignCast(ptr));
+    switch (event) {
+        .tick => self.wheel_pending = null,
+        else => {},
+    }
+}
+
+fn typeErasedWheelTimerDrawFn(
+    ptr: *anyopaque,
+    ctx: vxfw.DrawContext,
+) Allocator.Error!vxfw.Surface {
+    const self: *Model = @ptrCast(@alignCast(ptr));
+    return .{
+        .size = ctx.min,
+        .widget = self.wheelTimerWidget(),
         .buffer = &.{},
         .children = &.{},
     };
@@ -1325,10 +1361,14 @@ pub fn handleWheel(
     ctx: *vxfw.EventContext,
     direction: WheelDirection,
 ) !bool {
-    // Release-shaped reports are filtered by Pane. Preserve every press so a
-    // burst of genuine wheel notches accumulates in model state before vxfw
-    // renders the batch, instead of silently dropping same-direction input.
-    return try self.moveCenter(ctx, direction == .down);
+    if (self.wheel_pending == direction) return false;
+
+    if (self.wheel_pending == null) {
+        try ctx.tick(wheel_coalesce_ms, self.wheelTimerWidget());
+    }
+    self.wheel_pending = direction;
+    _ = try self.moveCenter(ctx, direction == .down);
+    return true;
 }
 
 fn halfJumpCenter(self: *Model, ctx: *vxfw.EventContext, down: bool) !bool {
@@ -2447,6 +2487,7 @@ test "deferred input work stays idle when its first tick cannot queue" {
     });
     ctx.alloc = wheel_failing.allocator();
     try testing.expectError(error.OutOfMemory, model.handleWheel(&ctx, .down));
+    try testing.expect(model.wheel_pending == null);
     try testing.expect(model.here_cursor.eql(cursor));
     try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
     ctx.alloc = testing.allocator;
@@ -3340,27 +3381,27 @@ test "mouse wheel moves cwd one item and is ignored by side panes" {
     try testing.expect(!ctx.redraw);
     mouse.button = .wheel_down;
 
-    // Every press contributes movement. vxfw still renders this input batch
-    // once, so rapid notches accumulate without being lost.
+    // Duplicate reports from one wheel action remain one cursor step.
     ctx.consume_event = false;
     ctx.redraw = false;
     const command_count = ctx.cmds.items.len;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
-    try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
-    try testing.expectEqual(command_count + 1, ctx.cmds.items.len);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+    try testing.expectEqual(command_count, ctx.cmds.items.len);
     try testing.expect(ctx.consume_event);
-    try testing.expect(ctx.redraw);
+    try testing.expect(!ctx.redraw);
 
     ctx.consume_event = false;
     ctx.redraw = false;
+    ctx.cmds.clearRetainingCapacity();
     mouse.button = .wheel_up;
     try model.getPane(.here).widget().captureEvent(&ctx, .{ .mouse = mouse });
-    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
     try testing.expect(model.preview_schedule.isDirty());
     try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
     model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
-    try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
+    try testing.expectEqualStrings("a", model.getPane(.children).preview().?.displayTextAt(0).?);
     try testing.expect(ctx.consume_event);
     try testing.expect(ctx.redraw);
 }

@@ -58,8 +58,8 @@ In CWD, one left click selects a row and a double click enters or opens it.
 Clicking a PARENT
 row ascends with that row selected; clicking a CHILDREN row promotes that
 listing to CWD with the clicked row selected. Mouse-wheel navigation belongs to
-CWD and moves one row per press report; release-shaped reports are ignored and
-wheel input over side panes is consumed without scrolling them.
+CWD and moves one row per wheel action; duplicate and release-shaped reports
+are ignored, and wheel input over side panes is consumed without scrolling them.
 
 ## Commands
 
