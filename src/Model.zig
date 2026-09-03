@@ -40,8 +40,8 @@ text_field: vxfw.TextField,
 identities: IdentityCache,
 watcher: Watcher,
 local_time_zone: zeit.TimeZone,
-// Metadata for the last committed CHILDREN target. Cursor movement retains it
-// until the debounced CHILDREN refresh commits.
+// Metadata for the last committed CHILDREN target. Cursor movement retains the
+// complete status bar until the debounced CHILDREN refresh commits.
 cursor_status: ?CursorStatus = null,
 show_hidden: bool = false,
 watch_refresh: WatchRefresh = .none,
@@ -1788,34 +1788,6 @@ fn drawCounts(
     return counts.draw(child_ctx);
 }
 
-fn drawPendingStatus(
-    ctx: vxfw.DrawContext,
-    child_ctx: vxfw.DrawContext,
-    entry_name: []const u8,
-    counts_text: []const u8,
-) Allocator.Error!vxfw.Surface {
-    const pending_text = try std.fmt.allocPrint(
-        ctx.arena,
-        "{s}  preview pending",
-        .{entry_name},
-    );
-    const pending = try ctx.arena.create(vxfw.Text);
-    pending.* = .{
-        .text = pending_text,
-        .style = .{ .dim = true },
-        .softwrap = false,
-        .overflow = .ellipsis,
-        .width_basis = .parent,
-    };
-    const counts = try ctx.arena.create(vxfw.Text);
-    counts.* = .{ .text = counts_text, .softwrap = false };
-    const items = try ctx.arena.alloc(vxfw.FlexItem, 2);
-    items[0] = .{ .widget = pending.widget(), .flex = 1 };
-    items[1] = .{ .widget = counts.widget(), .flex = 0 };
-    const row: vxfw.FlexRow = .{ .children = items };
-    return row.draw(child_ctx);
-}
-
 fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!vxfw.Surface {
     const child_ctx = ctx.withConstraints(
         .{ .width = width, .height = 1 },
@@ -1874,16 +1846,6 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         "{d} entries · {d} selected",
         .{ center.entries.len, self.selectedCount() },
     );
-    if (self.preview_schedule.isDirty()) {
-        const cursor = self.hereEntryIndex() orelse
-            return drawCounts(ctx, child_ctx, counts_text);
-        return drawPendingStatus(
-            ctx,
-            child_ctx,
-            center.entries[cursor].name,
-            counts_text,
-        );
-    }
     const cursor_status = self.cursor_status orelse
         return drawCounts(ctx, child_ctx, counts_text);
     if (center.entries.len == 0 or ctx.stringWidth(counts_text) + 2 >= width) {
@@ -2420,6 +2382,20 @@ test "space toggles consecutive selections and advances the cursor" {
         .cell_size = .{ .width = 8, .height = 16 },
     }, 160);
     try testing.expectEqual(@as(usize, 2), pending_bottom.children.len);
+    const pending_details = pending_bottom.children[0].surface.buffer;
+    const committed_name = "a.txt";
+    var rendered_name: [committed_name.len]u8 = undefined;
+    var rendered_name_len: usize = 0;
+    for (pending_details) |cell| {
+        if (!cell.style.bold) continue;
+        if (rendered_name_len == rendered_name.len or cell.char.grapheme.len != 1) {
+            return error.TestUnexpectedResult;
+        }
+        rendered_name[rendered_name_len] = cell.char.grapheme[0];
+        rendered_name_len += 1;
+    }
+    try testing.expectEqual(rendered_name.len, rendered_name_len);
+    try testing.expectEqualStrings(committed_name, &rendered_name);
     model.preview_schedule = .{ .dirty = .zero };
     try model.previewTimerWidget().handleEvent(&ctx, .tick);
     try testing.expectEqualStrings("b", model.getPane(.children).preview().?.displayTextAt(0).?);
