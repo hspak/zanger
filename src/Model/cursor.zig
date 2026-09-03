@@ -83,18 +83,32 @@ test "one-step transitions include none" {
         .{ .start = .{ .entry = 2 }, .down = true, .count = 3, .expected = .{ .entry = 2 } },
     };
     for (cases) |case| {
-        try testing.expect(case.expected.eql(case.start.step(
-            case.down,
-            case.count,
-        )));
+        try testing.expectEqual(case.expected, case.start.step(case.down, case.count));
     }
 }
 
 test "half-page and jump transitions saturate" {
     const testing = std.testing;
-    try testing.expect((Here{ .entry = 4 }).halfPage(true, 8, 3).eql(.{ .entry = 7 }));
-    try testing.expect((Here{ .entry = 4 }).halfPage(false, 8, 3).eql(.{ .entry = 1 }));
-    try testing.expect(Here.jump(8, false).eql(.{ .entry = 0 }));
-    try testing.expect(Here.jump(8, true).eql(.{ .entry = 7 }));
-    try testing.expect(Here.jump(0, true).eql(.none));
+    try testing.expectEqual(Here{ .entry = 7 }, (Here{ .entry = 4 }).halfPage(
+        true,
+        8,
+        3,
+    ));
+    try testing.expectEqual(Here{ .entry = 1 }, (Here{ .entry = 4 }).halfPage(
+        false,
+        8,
+        3,
+    ));
+    try testing.expectEqual(Here{ .entry = 0 }, Here.jump(8, false));
+    try testing.expectEqual(Here{ .entry = 7 }, Here.jump(8, true));
+    try testing.expectEqual(Here.none, Here.jump(0, true));
+}
+
+test "cursor equality distinguishes tags and entry indices" {
+    const testing = std.testing;
+
+    try testing.expect(@as(Here, .none).eql(.none));
+    try testing.expect(!@as(Here, .none).eql(.{ .entry = 0 }));
+    try testing.expect((Here{ .entry = 0 }).eql(.{ .entry = 0 }));
+    try testing.expect(!(Here{ .entry = 0 }).eql(.{ .entry = 1 }));
 }

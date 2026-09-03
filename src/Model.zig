@@ -1962,14 +1962,16 @@ fn draw(self: *Model, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
     };
 }
 
-test "headless model draw" {
+test "model draw renders the three-pane layout and status" {
     const testing = std.testing;
-    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(cwd);
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("alpha.txt", "alpha");
+    try tree.writeFile("beta.txt", "beta");
 
     var model: Model = undefined;
     try model.init(testing.allocator, testing.io, .{
-        .start_path = cwd,
+        .start_path = tree.path,
         .user = "tester",
         .hostname = "host",
     });
@@ -2000,12 +2002,7 @@ test "headless model draw" {
         vaxis.Cell.Color.default,
         header_buffer["tester@host".len].style.fg,
     );
-    var expected_status_buffer: [64]u8 = undefined;
-    const expected_status = try std.fmt.bufPrint(
-        &expected_status_buffer,
-        "{d} entries · 0 selected",
-        .{model.centerListing().entries.len},
-    );
+    const expected_status = "2 entries · 0 selected";
     const bottom_surface = surface.children[2].surface;
     try testing.expectEqual(@as(usize, 2), bottom_surface.children.len);
     const status_buffer = bottom_surface.children[1].surface.buffer;
@@ -2322,7 +2319,7 @@ test "ctrl-u saturates at the first entry instead of wrapping" {
     try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
 }
 
-test "space toggles consecutive selections and advances the cursor" {
+test "space selects consecutive rows while preview and status commit together" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
@@ -2464,7 +2461,7 @@ test "deferred input work stays idle when its first tick cannot queue" {
     ctx.alloc = wheel_failing.allocator();
     try testing.expectError(error.OutOfMemory, model.handleWheel(&ctx, .down));
     try testing.expect(model.wheel_pending == null);
-    try testing.expect(model.here_cursor.eql(cursor));
+    try testing.expectEqual(cursor, model.here_cursor);
     try testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
     ctx.alloc = testing.allocator;
 }
@@ -2516,15 +2513,14 @@ test "delete recursively removes selected directories and their children" {
 
     try model.executeDelete();
 
-    const directory_path = try file_system.joinPath(
+    const directory_path = try std.fs.path.join(
         testing.allocator,
-        path,
-        "selected",
+        &.{ path, "selected" },
     );
     defer testing.allocator.free(directory_path);
-    const file_path = try file_system.joinPath(testing.allocator, path, "selected.txt");
+    const file_path = try std.fs.path.join(testing.allocator, &.{ path, "selected.txt" });
     defer testing.allocator.free(file_path);
-    const kept_path = try file_system.joinPath(testing.allocator, path, "kept.txt");
+    const kept_path = try std.fs.path.join(testing.allocator, &.{ path, "kept.txt" });
     defer testing.allocator.free(kept_path);
     try testing.expectError(
         error.FileNotFound,
@@ -4131,7 +4127,7 @@ test "anchored model navigation" {
     try testing.expectEqualStrings(path, center.path);
     try testing.expectEqualStrings("child", center.entries[center_cursor].name);
     const right = model.getPane(.children).listing().?;
-    const expected_right = try file_system.joinPath(testing.allocator, path, "child");
+    const expected_right = try std.fs.path.join(testing.allocator, &.{ path, "child" });
     defer testing.allocator.free(expected_right);
     try testing.expectEqualStrings(expected_right, right.path);
     const original_path_pointer = center.path.ptr;
@@ -4567,7 +4563,7 @@ test "directory symlinks list targets and file symlinks render them" {
     _ = model.applyHereCursor(.{ .entry = dir_link_index }, .none);
     try model.syncRight();
 
-    const link_path = try file_system.joinPath(testing.allocator, path, "dir-link");
+    const link_path = try std.fs.path.join(testing.allocator, &.{ path, "dir-link" });
     defer testing.allocator.free(link_path);
     try testing.expectEqualStrings(link_path, model.getPane(.children).listing().?.path);
     try testing.expect(

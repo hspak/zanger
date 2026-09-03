@@ -20,8 +20,6 @@ io: Io,
 queue_descriptor: i32,
 current_descriptor: ?i32 = null,
 
-pub const reports_child_names = false;
-
 pub const InitError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,

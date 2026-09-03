@@ -19,8 +19,6 @@ io: Io,
 file: Io.File,
 current_descriptor: ?i32 = null,
 
-pub const reports_child_names = true;
-
 pub const InitError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,

@@ -25,7 +25,6 @@ pub const ArmError = Backend.ArmError;
 pub const DrainError = Backend.DrainError;
 pub const Pending = Backend.Pending;
 pub const Refresh = Backend.Refresh;
-const reports_child_names = Backend.reports_child_names;
 
 /// Initializes the native event queue with no current directory watch.
 pub fn init(io: Io) InitError!Watcher {
@@ -137,7 +136,11 @@ test "ignores hidden entry changes when hidden files are excluded" {
     watcher.commit(try watcher.prepare(tree.path));
 
     try tree.writeFile(".hidden", "hidden");
-    const hidden_refresh: Refresh = if (reports_child_names) .none else .content;
+    const hidden_refresh: Refresh = switch (builtin.os.tag) {
+        .linux => .none,
+        .macos => .content,
+        else => comptime unreachable,
+    };
     try testing.expectEqual(hidden_refresh, try watcher.drain(false));
 
     try tree.writeFile("visible", "visible");

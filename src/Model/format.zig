@@ -123,14 +123,14 @@ test "status size formatter uses ls-like units" {
     try testing.expectEqualStrings("4.0K", kibibytes);
 }
 
-test "status timestamp omits signs from positive fields" {
+test "status timestamp renders positive fields without signs" {
     const testing = std.testing;
     const rendered = try statusTime(testing.allocator, .{
         .nanoseconds = 1_700_000_000 * std.time.ns_per_s,
     }, &zeit.utc);
     defer testing.allocator.free(rendered);
 
-    try testing.expect(std.mem.indexOfScalar(u8, rendered, '+') == null);
+    try testing.expectEqualStrings("Nov 14 22:13", rendered);
 }
 
 test "status timestamp uses the supplied time zone" {
