@@ -136,6 +136,26 @@ pub const EventHarness = struct {
         self.ctx.consume_event = false;
         self.ctx.redraw = false;
     }
+
+    /// Replays the key phases while retaining the focus target chosen before
+    /// an input batch; vxfw applies queued focus requests after that batch.
+    pub fn dispatchKey(
+        self: *EventHarness,
+        root: vxfw.Widget,
+        focused: vxfw.Widget,
+        key: vaxis.Key,
+    ) !void {
+        self.resetEffects();
+        const event: vxfw.Event = .{ .key_press = key };
+        self.ctx.phase = .capturing;
+        try root.captureEvent(&self.ctx, event);
+        if (self.ctx.consume_event) return;
+        self.ctx.phase = .at_target;
+        try focused.handleEvent(&self.ctx, event);
+        if (self.ctx.consume_event) return;
+        self.ctx.phase = .bubbling;
+        try root.handleEvent(&self.ctx, event);
+    }
 };
 
 pub fn keyPress(codepoint: u21, mods: vaxis.Key.Modifiers) vaxis.Key {

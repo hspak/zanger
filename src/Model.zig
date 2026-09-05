@@ -1667,17 +1667,26 @@ fn captureEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void 
 
     switch (self.mode) {
         .browse => {
-            const action = input.browseAction(key) orelse return;
-            if (action.phase() != .capture) return;
-            // Capture-owned movement must stop before the focused ListView's
-            // own movement handler can step the cursor a second time.
-            try self.dispatchBrowseAction(ctx, action);
+            // Focus requests take effect after the input batch. Route every
+            // key by mode so a previous TextField cannot capture browse input.
+            if (input.browseAction(key)) |action| {
+                try self.dispatchBrowseAction(ctx, action);
+            } else {
+                try self.getPane(.here).list_view.handleEvent(ctx, event);
+                ctx.consumeEvent();
+            }
         },
         .command => {
             if (key.matches(Key.escape, .{})) {
                 try self.returnToBrowse(ctx);
                 try self.setMessage("command cancelled", .{});
                 ctx.consumeAndRedraw();
+            } else {
+                const previous_phase = ctx.phase;
+                ctx.phase = .at_target;
+                defer ctx.phase = previous_phase;
+                try self.text_field.widget().handleEvent(ctx, event);
+                ctx.consumeEvent();
             }
         },
         .confirm => {
@@ -1720,12 +1729,6 @@ fn handleEvent(self: *Model, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
                 return;
             };
             if (refreshed) ctx.redraw = true;
-        },
-        .key_press => |key| {
-            if (self.mode != .browse) return;
-            const action = input.browseAction(key) orelse return;
-            if (action.phase() != .bubble) return;
-            try self.dispatchBrowseAction(ctx, action);
         },
         else => {},
     }
@@ -2126,7 +2129,7 @@ test "ctrl-h toggles hidden files" {
         .codepoint = 'h',
         .mods = .{ .ctrl = true },
     };
-    try model.handleEvent(&ctx, .{ .key_press = ctrl_h });
+    try model.captureEvent(&ctx, .{ .key_press = ctrl_h });
 
     try testing.expect(model.show_hidden);
     try testing.expect(file_system.indexOfName(model.centerListing(), ".secret") != null);
@@ -2136,7 +2139,7 @@ test "ctrl-h toggles hidden files" {
 
     ctx.consume_event = false;
     ctx.redraw = false;
-    try model.handleEvent(&ctx, .{ .key_press = ctrl_h });
+    try model.captureEvent(&ctx, .{ .key_press = ctrl_h });
     try testing.expect(!model.show_hidden);
     try testing.expect(file_system.indexOfName(model.centerListing(), ".secret") == null);
     try testing.expectEqualStrings("hidden files off", model.message);
@@ -2369,7 +2372,7 @@ test "space selects consecutive rows while preview and status commit together" {
     defer ctx.cmds.deinit(ctx.alloc);
     const space: Key = .{ .codepoint = Key.space };
 
-    try model.handleEvent(&ctx, .{ .key_press = space });
+    try model.captureEvent(&ctx, .{ .key_press = space });
     var center = model.centerListing();
     try testing.expect(center.selected.isSet(0));
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
@@ -2431,13 +2434,13 @@ test "space selects consecutive rows while preview and status commit together" {
         selected_surface.buffer[0].style.fg,
     );
 
-    try model.handleEvent(&ctx, .{ .key_press = space });
+    try model.captureEvent(&ctx, .{ .key_press = space });
     center = model.centerListing();
     try testing.expect(center.selected.isSet(1));
     try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 2), center.selectedCount());
 
-    try model.handleEvent(&ctx, .{ .key_press = space });
+    try model.captureEvent(&ctx, .{ .key_press = space });
     center = model.centerListing();
     try testing.expect(center.selected.isSet(2));
     try testing.expectEqual(@as(usize, 2), model.hereEntryIndex().?);
@@ -2646,7 +2649,7 @@ test "enter on a file opens it through the system opener" {
         .redraw = false,
     };
     defer ctx.cmds.deinit(ctx.alloc);
-    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try model.captureEvent(&ctx, .{ .key_press = enter });
 
     // The request went to the opener seam, not to navigation.
     try testing.expectEqual(@as(usize, 1), opened.items.len);
@@ -2660,7 +2663,7 @@ test "enter on a file opens it through the system opener" {
     const dir_index = file_system.indexOfName(model.centerListing(), "sub").?;
     _ = model.applyHereCursor(.{ .entry = dir_index }, .none);
     ctx.cmds.clearRetainingCapacity();
-    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try model.captureEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqual(@as(usize, 1), opened.items.len);
     try testing.expect(model.centerListing().path.len > path.len);
 }
@@ -2727,7 +2730,7 @@ test "executable files are excluded from the system opener" {
         const index = file_system.indexOfName(model.centerListing(), name).?;
         _ = model.applyHereCursor(.{ .entry = index }, .none);
         ctx.cmds.clearRetainingCapacity();
-        try model.handleEvent(&ctx, .{ .key_press = enter });
+        try model.captureEvent(&ctx, .{ .key_press = enter });
         try testing.expectEqualStrings(
             "cannot open executables",
             model.flash.?.text,
@@ -2896,7 +2899,7 @@ test "a failed system open reports the spawn error" {
         .redraw = false,
     };
     defer ctx.cmds.deinit(ctx.alloc);
-    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try model.captureEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqualStrings("open: FileNotFound", model.flash.?.text);
 
     // Sweeping with no children must be a harmless no-op.
@@ -2944,7 +2947,7 @@ test "mouse releases do not dismiss a fresh flash" {
 
     // Refuse an executable to raise the flash.
     const enter: Key = .{ .codepoint = Key.enter };
-    try model.handleEvent(&ctx, .{ .key_press = enter });
+    try model.captureEvent(&ctx, .{ .key_press = enter });
     try testing.expectEqualStrings(
         "cannot open executables",
         model.flash.?.text,
@@ -3517,7 +3520,7 @@ test "side pane clicks navigate and browse focus returns to cwd" {
 
     const center_cursor = model.getPane(.here).list_view.cursor;
     const tab: Key = .{ .codepoint = Key.tab };
-    try model.handleEvent(&ctx, .{ .key_press = tab });
+    try model.captureEvent(&ctx, .{ .key_press = tab });
     try testing.expectEqual(center_cursor, model.getPane(.here).list_view.cursor);
     try testing.expect(ctx.consume_event);
     try testing.expect(!ctx.redraw);
@@ -3961,8 +3964,8 @@ test "mixed input and refresh sequence preserves model invariants" {
     );
     model.assertValid();
 
-    // A side-pane mouse press promotes CHILDREN to HERE, then a bubble-owned
-    // key ascends back to the original directory.
+    // A side-pane mouse press promotes CHILDREN to HERE, then a key ascends
+    // back to the original directory.
     try model.getPane(.children).rows[0].widget().handleEvent(
         ctx,
         .{ .mouse = test_support.leftMouse(.press) },
@@ -3972,7 +3975,6 @@ test "mixed input and refresh sequence preserves model invariants" {
 
     const up = test_support.keyPress('h', .{});
     try model.captureEvent(ctx, .{ .key_press = up });
-    try model.handleEvent(ctx, .{ .key_press = up });
     try testing.expectEqualStrings(tree.path, model.centerListing().path);
     model.assertValid();
 
@@ -4731,4 +4733,47 @@ test "help errors and deletion results are visible until navigation" {
     try testing.expect(!try test_support.containsText(confirmation, "AccessDenied"));
     try model.captureEvent(&events.ctx, .{ .key_press = test_support.keyPress('y', .{}) });
     try testing.expect(try test_support.containsText(try model.draw(ctx), "deleted 1 item"));
+}
+
+test "command mode routes a batch before framework focus changes" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("a", "a");
+    try tree.writeFile("b", "b");
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var events = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer events.deinit();
+    const focused = model.getPane(.here).list_view.widget();
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = ':', .text = ":" });
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = 'j', .text = "j" });
+    try testing.expectEqual(@as(u32, 0), model.getPane(.here).list_view.cursor);
+    try testing.expectEqual(@as(usize, 1), model.text_field.byteOffsetToCursor());
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = Key.backspace });
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = 'q', .text = "q" });
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = Key.enter });
+    try testing.expect(events.ctx.quit);
+}
+
+test "leaving command mode routes remaining keys away from the text field" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("a", "a");
+    try tree.writeFile("b", "b");
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var events = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer events.deinit();
+    try model.openCommand(&events.ctx);
+    const focused = model.text_field.widget();
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = Key.escape });
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = 'j', .text = "j" });
+    try events.dispatchKey(model.widget(), focused, .{ .codepoint = 'q', .text = "q" });
+    try testing.expect(events.ctx.quit);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+    try testing.expectEqual(@as(usize, 0), model.text_field.byteOffsetToCursor());
 }
