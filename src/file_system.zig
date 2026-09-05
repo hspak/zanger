@@ -210,6 +210,7 @@ pub const ReadDirError = combined: {
     break :combined Allocator.Error ||
         Dir.OpenError ||
         Dir.Reader.Error ||
+        Dir.StatFileError ||
         symlink.ReadError;
 };
 
@@ -275,9 +276,15 @@ pub fn readDir(
             if (count == entries.len) {
                 entries = try alloc.realloc(entries, @max(32, entries.len * 2));
             }
-            const is_sym = de.kind == .sym_link;
+            // d_type is optional on POSIX filesystems. Resolve only unknown
+            // entries, without following links until link classification.
+            const kind = if (de.kind == .unknown)
+                (try dir.statFile(io, de.name, .{ .follow_symlinks = false })).kind
+            else
+                de.kind;
+            const is_sym = kind == .sym_link;
             var link_target: ?[]const u8 = null;
-            var is_dir = de.kind == .directory;
+            var is_dir = kind == .directory;
             if (is_sym) {
                 const link = try symlink.read(string_alloc, dir, de.name);
                 link_target = link.target;
@@ -697,4 +704,44 @@ test "row formatting" {
     const empty_row = try formatRow(alloc, empty_directory, false);
     defer alloc.free(empty_row);
     try testing.expectEqualStrings("     empty", empty_row);
+}
+
+test "unknown entry kinds preserve directory and symlink behavior" {
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("directory");
+    try tree.writeFile("directory/inside", "text");
+    try tree.writeFile("file", "text");
+    try tree.symLink("directory", "directory-link");
+    try tree.symLink("file", "file-link");
+    try tree.symLink("missing", "dangling-link");
+    const reader = struct {
+        fn read(userdata: ?*anyopaque, r: *Dir.Reader, buffer: []Dir.Entry) Dir.Reader.Error!usize {
+            const count = try testing.io.vtable.dirRead(userdata, r, buffer);
+            for (buffer[0..count]) |*entry| entry.kind = .unknown;
+            return count;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.dirRead = reader.read;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var listing = try readDir(testing.allocator, io, tree.path, .{});
+    defer listing.deinit();
+    const directory = listing.entries[indexOfName(&listing, "directory").?];
+    try testing.expect(directory.is_dir);
+    try testing.expect(directory.deleteAsDirectory());
+    const directory_link = listing.entries[indexOfName(&listing, "directory-link").?];
+    try testing.expect(directory_link.is_dir and directory_link.is_sym);
+    try testing.expect(!directory_link.deleteAsDirectory());
+    for ([_][]const u8{ "file-link", "dangling-link" }) |name| {
+        const entry = listing.entries[indexOfName(&listing, name).?];
+        try testing.expect(entry.is_sym and !entry.is_dir);
+    }
+    const file = listing.entries[indexOfName(&listing, "file").?];
+    try testing.expect(!file.is_dir and !file.is_sym);
+    const link_path = try tree.absolutePath("directory-link");
+    defer testing.allocator.free(link_path);
+    try deleteEntry(io, link_path, directory_link.deleteAsDirectory());
+    const target = try tree.temp.dir.openFile(testing.io, "directory/inside", .{});
+    defer target.close(testing.io);
 }
