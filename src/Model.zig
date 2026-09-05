@@ -464,6 +464,8 @@ fn setHereCursor(
     // unchanged.
     try self.deferRightSync(ctx);
     std.debug.assert(self.applyHereCursor(normalized, scroll));
+    self.alloc.free(self.message);
+    self.message = &.{};
     return true;
 }
 
@@ -1825,6 +1827,16 @@ fn drawBottom(self: *Model, ctx: vxfw.DrawContext, width: u16) Allocator.Error!v
         );
         const status: vxfw.Text = .{
             .text = status_text,
+            .softwrap = false,
+            .overflow = .ellipsis,
+            .width_basis = .parent,
+        };
+        return status.draw(child_ctx);
+    }
+
+    if (self.message.len > 0) {
+        const status: vxfw.Text = .{
+            .text = self.message,
             .softwrap = false,
             .overflow = .ellipsis,
             .width_basis = .parent,
@@ -4688,4 +4700,35 @@ test "small layouts retain the focused directory widget" {
         const surface = try model.draw(test_support.drawContext(arena.allocator(), size));
         try testing.expect(test_support.containsWidget(surface, model.getPane(.here).list_view.widget()));
     }
+}
+
+test "help errors and deletion results are visible until navigation" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("a", "a");
+    try tree.writeFile("b", "b");
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var events = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer events.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = test_support.drawContext(arena.allocator(), .{ .width = 120, .height = 24 });
+
+    try model.submitCommand(&events.ctx, "help");
+    try testing.expect(try test_support.containsText(try model.draw(ctx), "j/k move"));
+    _ = try model.moveCenter(&events.ctx, true);
+    try testing.expect(!try test_support.containsText(try model.draw(ctx), "j/k move"));
+    try model.submitCommand(&events.ctx, "unknown");
+    try testing.expect(try test_support.containsText(try model.draw(ctx), "unknown command"));
+    try model.reportError("preview", "AccessDenied");
+    try testing.expect(try test_support.containsText(try model.draw(ctx), "preview: AccessDenied"));
+    try model.beginDelete(&events.ctx);
+    const confirmation = try model.draw(ctx);
+    try testing.expect(try test_support.containsText(confirmation, "Delete 1 item?"));
+    try testing.expect(!try test_support.containsText(confirmation, "AccessDenied"));
+    try model.captureEvent(&events.ctx, .{ .key_press = test_support.keyPress('y', .{}) });
+    try testing.expect(try test_support.containsText(try model.draw(ctx), "deleted 1 item"));
 }

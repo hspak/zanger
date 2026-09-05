@@ -150,6 +150,17 @@ pub fn containsWidget(surface: vxfw.Surface, target: vxfw.Widget) bool {
     return false;
 }
 
+pub fn containsText(surface: vxfw.Surface, text: []const u8) !bool {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    for (surface.buffer) |cell| try bytes.appendSlice(std.testing.allocator, cell.char.grapheme);
+    if (std.mem.indexOf(u8, bytes.items, text) != null) return true;
+    for (surface.children) |child| {
+        if (try containsText(child.surface, text)) return true;
+    }
+    return false;
+}
+
 pub fn drawContext(arena: Allocator, size: vxfw.Size) vxfw.DrawContext {
     vxfw.DrawContext.init(.unicode);
     return .{
