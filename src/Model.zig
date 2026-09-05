@@ -180,7 +180,7 @@ const ViewTransition = union(enum) {
 const ViewPlan = struct {
     preferred_name: ?[]const u8 = null,
     fallback_cursor: ?usize = null,
-    transfer_storage: [2]ListingTransfer = undefined,
+    transfer_storage: [1]ListingTransfer = undefined,
     transfer_count: usize = 0,
     restore_here_from: ?*const file_system.Listing = null,
     preserve_message: bool = false,
@@ -368,7 +368,7 @@ fn planViewTransition(
             plan.addTransfer(.{ .source = .here, .target = .parent });
             if (self.getPane(.children).listing()) |children| {
                 if (std.mem.eql(u8, children.path, center_path)) {
-                    plan.addTransfer(.{ .source = .children, .target = .here });
+                    plan.restore_here_from = children;
                 }
             }
         },
@@ -386,7 +386,11 @@ fn planViewTransition(
         },
         .promote_children => |preferred_name| {
             plan.preferred_name = preferred_name;
-            plan.addTransfer(.{ .source = .children, .target = .here });
+            if (self.getPane(.children).listing()) |children| {
+                if (std.mem.eql(u8, children.path, center_path)) {
+                    plan.restore_here_from = children;
+                }
+            }
             plan.addTransfer(.{ .source = .here, .target = .parent });
         },
         .watch_refresh => |rearm_watcher| {
@@ -661,32 +665,19 @@ fn prepareView(
     var pending_view: PendingView = .{};
     errdefer pending_view.deinit();
 
-    const center_reused = center_reused: {
-        const transfer = transferTo(transfers, .here) orelse break :center_reused false;
-        const candidate = self.getPane(transfer.source).listing() orelse
-            break :center_reused false;
-        if (!std.mem.eql(u8, candidate.path, center_path)) break :center_reused false;
-        _ = pending_view.borrowListing(transfer.source, .here, candidate.*);
-        break :center_reused true;
-    };
-    if (!center_reused) {
-        _ = pending_view.stageOwned(
-            .here,
-            .{ .listing = try file_system.readDir(
-                self.alloc,
-                self.io,
-                center_path,
-                .{ .show_hidden = self.show_hidden },
-            ) },
-        );
-    }
+    // The destination watch is already armed. CHILDREN may predate that
+    // watch, so only a fresh snapshot can become the authoritative HERE.
+    _ = pending_view.stageOwned(
+        .here,
+        .{ .listing = try file_system.readDir(
+            self.alloc,
+            self.io,
+            center_path,
+            .{ .show_hidden = self.show_hidden },
+        ) },
+    );
     const center_pending = pending_view.pane(.here);
     const center = center_pending.listing().?;
-    if (reject_empty_center and center_reused and try file_system.isDirEmpty(
-        self.io,
-        center_path,
-        .{ .show_hidden = self.show_hidden },
-    )) return error.EmptyDirectory;
     if (reject_empty_center and center.entries.len == 0) return error.EmptyDirectory;
     const center_cursor = center.cursorFor(preferred_name, fallback_cursor);
     center_pending.cursor = @intCast(center_cursor);
@@ -1338,8 +1329,8 @@ pub fn handleParentClick(self: *Model, index: usize) !void {
 }
 
 /// Promotes the children pane to HERE with the clicked row selected as its
-/// cursor: the pane's listing transfers to HERE (zero-cost), the old HERE
-/// becomes PARENT, and the children pane renders the clicked entry's
+/// cursor: HERE receives a fresh snapshot, the old HERE becomes PARENT,
+/// and the children pane renders the clicked entry's
 /// content — a directory listing, a text preview, or a metadata sheet.
 pub fn handleChildrenClick(self: *Model, index: usize) !void {
     const pane = self.getPane(.children);
@@ -3875,15 +3866,12 @@ test "view transition planner derives the legal transfer matrix" {
     defer testing.allocator.free(child_path);
     var plan = model.planViewTransition(child_path, .descend);
     try testing.expect(plan.reject_empty_center);
-    try testing.expectEqual(@as(usize, 2), plan.transfer_count);
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
     try testing.expectEqual(
         ListingTransfer{ .source = .here, .target = .parent },
         plan.transfers()[0],
     );
-    try testing.expectEqual(
-        ListingTransfer{ .source = .children, .target = .here },
-        plan.transfers()[1],
-    );
+    try testing.expect(plan.restore_here_from == model.getPane(.children).listing());
 
     plan = model.planViewTransition("/stale-target", .descend);
     try testing.expectEqual(@as(usize, 1), plan.transfer_count);
@@ -3901,15 +3889,11 @@ test "view transition planner derives the legal transfer matrix" {
     );
 
     plan = model.planViewTransition(path, .{ .promote_children = "inside.txt" });
-    try testing.expectEqual(@as(usize, 2), plan.transfer_count);
+    try testing.expectEqual(@as(usize, 1), plan.transfer_count);
     try testing.expectEqualStrings("inside.txt", plan.preferred_name.?);
     try testing.expectEqual(
-        ListingTransfer{ .source = .children, .target = .here },
-        plan.transfers()[0],
-    );
-    try testing.expectEqual(
         ListingTransfer{ .source = .here, .target = .parent },
-        plan.transfers()[1],
+        plan.transfers()[0],
     );
 
     plan = model.planViewTransition(path, .{ .watch_refresh = true });
@@ -4181,7 +4165,8 @@ test "anchored model navigation" {
     try testing.expectEqual(@as(usize, 1), center.selectedCount());
     try model.openCenter();
     try testing.expectEqualStrings(expected_right, model.centerListing().path);
-    try testing.expectEqual(preview_path_pointer, model.centerListing().path.ptr);
+    // HERE now owns a fresh snapshot; side-pane selection survives by name.
+    try testing.expect(preview_path_pointer != model.centerListing().path.ptr);
     try testing.expectEqual(original_path_pointer, model.getPane(.parent).listing().?.path.ptr);
     try testing.expectEqual(@as(usize, 1), model.getPane(.parent).listing().?.selectedCount());
     try testing.expectEqual(@as(usize, 0), model.centerListing().selectedCount());
@@ -4208,15 +4193,15 @@ test "anchored model navigation" {
         model.getPane(.children).listing().?.selectedCount(),
     );
 
-    // Moving the selected CHILDREN listing back to HERE keeps its selection.
+    // Rereading CHILDREN as HERE restores its selected entry by name.
     try model.openCenter();
-    try testing.expectEqual(descended_path_pointer, model.centerListing().path.ptr);
+    try testing.expect(descended_path_pointer != model.centerListing().path.ptr);
     try testing.expect(model.centerListing().selected.isSet(0));
     try testing.expectEqual(@as(usize, 1), model.centerListing().selectedCount());
     try model.ascend();
     const reascended_path_pointer = model.centerListing().path.ptr;
 
-    // CHILDREN is not watched recursively. Revalidate a reusable snapshot so a
+    // CHILDREN is not watched recursively. Read a fresh snapshot so a
     // directory emptied externally cannot become HERE with stale contents.
     try Io.Dir.deleteFile(temp.dir, testing.io, "child/nested.txt");
     try model.openCenter();
@@ -4811,4 +4796,29 @@ test "watcher and deletion refresh keep the cursor visible and viewport stable" 
     const deleted = try model.draw(ctx);
     try testing.expect(test_support.containsWidget(deleted, here.rows[here.list_view.cursor].widget()));
     try testing.expectEqual(top, here.list_view.scroll.top);
+}
+
+test "descent and children clicks refresh snapshots before making them HERE" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("child");
+    try tree.writeFile("child/a", "a");
+    for ([_]bool{ false, true }) |click| {
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+        defer model.deinit();
+        model.getPane(.children).listing().?.toggleSelected(0);
+        try tree.writeFile("child/b", "b");
+        if (click) try model.handleChildrenClick(0) else try model.openCenter();
+        _ = try model.reconcileWatcher();
+        const center = model.centerListing();
+        try testing.expect(file_system.indexOfName(center, "b") != null);
+        try testing.expect(center.selected.isSet(file_system.indexOfName(center, "a").?));
+        try tree.writeFile("child/c", "c");
+        try testing.expect(try model.reconcileWatcher());
+        try testing.expect(file_system.indexOfName(model.centerListing(), "c") != null);
+        try tree.temp.dir.deleteFile(testing.io, "child/b");
+        try tree.temp.dir.deleteFile(testing.io, "child/c");
+    }
 }
