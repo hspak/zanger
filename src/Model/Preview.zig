@@ -248,14 +248,14 @@ fn formatModifiedTime(
 
 /// Errors from opening and reading a candidate text file, plus allocation.
 pub const TextContentError =
-    Allocator.Error || Io.File.OpenError || Io.File.StatError || Io.File.ReadPositionalError;
+    Allocator.Error || Io.Dir.StatFileError || std.posix.OpenError || Io.File.ReadPositionalError;
 
 /// Reads at most `max_bytes` of `path` and renders its contents as one preview
 /// line per source line. Returns null when the file is not text: a NUL byte
 /// or invalid UTF-8 in the read portion classifies it as binary, leaving the
 /// metadata sheet as the preview. Empty files preview as a placeholder
-/// message. `size_hint` avoids one `stat` when the caller already knows the
-/// file size.
+/// message. Non-regular files decline content preview. `size_hint` can limit
+/// the read to the size observed while preparing the associated status.
 pub fn initTextContent(
     alloc: Allocator,
     io: Io,
@@ -263,13 +263,24 @@ pub fn initTextContent(
     size_hint: ?u64,
     max_bytes: usize,
 ) TextContentError!?Preview {
-    const file = try Io.Dir.openFileAbsolute(io, path, .{});
-    defer Io.File.close(file, io);
+    const metadata = try Io.Dir.cwd().statFile(io, path, .{});
+    if (metadata.kind != .file) return null;
 
-    const size: u64 = if (size_hint) |hint|
-        hint
-    else
-        (try file.stat(io)).size;
+    // Io.Dir.OpenFileOptions has no general NONBLOCK option. A native open
+    // prevents a replacement FIFO from blocking between stat and open.
+    const file: Io.File = .{
+        .handle = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .CLOEXEC = true,
+            .NOCTTY = true,
+        }, 0),
+        .flags = .{ .nonblocking = true },
+    };
+    defer Io.File.close(file, io);
+    const opened_metadata = try file.stat(io);
+    if (opened_metadata.kind != .file) return null;
+    const size = @min(size_hint orelse opened_metadata.size, opened_metadata.size);
     const read_length: usize = @intCast(@min(size, max_bytes));
     const bytes = try alloc.alloc(u8, read_length);
     defer alloc.free(bytes);
@@ -561,4 +572,40 @@ test "file symlink sheets follow targets behind the notice" {
     };
     try testing.expectEqualStrings("link.dat", preview.fieldValue("Name").?);
     try testing.expectEqualStrings("file", preview.fieldValue("Type").?);
+}
+
+test "text preview rejects a FIFO substituted between stat and open" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("target", "text");
+    try tree.namedPipe("replacement");
+    const path = try tree.absolutePath("target");
+    defer testing.allocator.free(path);
+    const check = struct {
+        fn statFile(
+            userdata: ?*anyopaque,
+            dir: Io.Dir,
+            sub_path: []const u8,
+            options: Io.Dir.StatFileOptions,
+        ) Io.Dir.StatFileError!Io.File.Stat {
+            const metadata = try testing.io.vtable.dirStatFile(userdata, dir, sub_path, options);
+            var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+            const replacement = std.fmt.bufPrint(&buffer, "{s}/replacement", .{
+                std.fs.path.dirname(sub_path).?,
+            }) catch return error.Unexpected;
+            dir.rename(replacement, dir, sub_path, testing.io) catch return error.Unexpected;
+            return metadata;
+        }
+
+        fn run(target: []const u8) !void {
+            var vtable = testing.io.vtable.*;
+            vtable.dirStatFile = statFile;
+            const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+            var preview = try initTextContent(testing.allocator, io, target, null, max_preview_bytes);
+            defer if (preview) |*content| content.deinit();
+            try testing.expect(preview == null);
+        }
+    };
+    try test_support.expectCompletes(testing.io, 2000, check.run, .{path});
 }

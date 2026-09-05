@@ -4617,3 +4617,22 @@ test "directory symlinks list targets and file symlinks render them" {
     );
     try testing.expectEqualStrings("…", clipped_surface.buffer[19].char.grapheme);
 }
+
+test "FIFO previews and their symlinks return metadata without a writer" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.namedPipe("pipe");
+    const check = struct {
+        fn run(path: []const u8) !void {
+            var model: Model = undefined;
+            try model.init(testing.allocator, testing.io, .{ .start_path = path });
+            defer model.deinit();
+            const preview = model.getPane(.children).preview() orelse return error.MissingPreview;
+            try testing.expectEqualStrings("named_pipe", preview.fieldValue("Type").?);
+        }
+    };
+    try test_support.expectCompletes(testing.io, 2000, check.run, .{tree.path});
+    try tree.symLink("pipe", "a-link");
+    try test_support.expectCompletes(testing.io, 2000, check.run, .{tree.path});
+}
