@@ -17,7 +17,7 @@ The executable is split into a small entry point and focused modules:
 | [`src/Model/Row.zig`](src/Model/Row.zig) | Stable row widgets for click identity, clipping, and metadata styling |
 | [`src/Model/Preview.zig`](src/Model/Preview.zig) | Structured text, notice, spacer, and metadata rows for the children pane |
 | [`src/Model/cursor.zig`](src/Model/cursor.zig) | Pure HERE cursor transitions |
-| [`src/Model/input.zig`](src/Model/input.zig) | One key-to-browse-action policy shared by capture and bubble handlers |
+| [`src/Model/input.zig`](src/Model/input.zig) | Key-to-browse-action policy used by root capture |
 | [`src/Model/interaction.zig`](src/Model/interaction.zig) | Actionable mouse-event recognition and double-click tracking |
 | [`src/Model/scheduler.zig`](src/Model/scheduler.zig) | Pure deferred-preview scheduling state |
 | [`src/Model/FileMetadata.zig`](src/Model/FileMetadata.zig) | One file's native `statx`/`fstatat` metadata |
@@ -25,7 +25,7 @@ The executable is split into a small entry point and focused modules:
 | [`src/Model/IdentityCache.zig`](src/Model/IdentityCache.zig) | Cached UID/GID to account-name resolution |
 | [`src/Model/format.zig`](src/Model/format.zig) | Pure permission-bit, size, and timestamp formatters |
 | [`src/file_system.zig`](src/file_system.zig) | Builds and owns directory snapshots, entries, selection state, and preformatted rows |
-| [`src/file_system/symlink/`](src/file_system/symlink/) | Target-isolated Linux and macOS relative symlink queries |
+| [`src/file_system/symlink.zig`](src/file_system/symlink.zig) | Relative symlink queries, with a Linux stat workaround under `symlink/` |
 | [`src/Watcher.zig`](src/Watcher.zig) | Platform-neutral transactional HERE-watch facade |
 | [`src/Watcher/`](src/Watcher/) | Linux inotify and macOS kqueue watcher backends |
 | [`src/platform.zig`](src/platform.zig) | Supported-target checks, desktop opener policy, and POSIX child reaping |
@@ -48,12 +48,14 @@ main
      └─ vxfw widgets and surfaces
 ```
 
-`main` reads the starting working directory, user, and hostname. The `Model` is
+`main` reads the starting working directory, user, hostname, and `TZ`/`TZDIR`. The `Model` is
 allocated once on the heap because vxfw widget identity includes the address of
 its `userdata`; moving the model after initialization would invalidate focus and
 event-routing identities. `Model.init` creates the watcher, loads the local time
 zone, initializes the three stable panes and command field, and installs the
-first anchored view. `Model.deinit` releases these resources in reverse.
+first anchored view. Empty `TZ` uses UTC; named zones and absolute zone-file
+paths are adapted to zeit's interfaces. Failed timezone loading falls back to
+UTC, while allocation failures propagate. `Model.deinit` releases its resources.
 
 ## The anchored three-pane model
 
@@ -82,7 +84,8 @@ The model maintains these invariants after every committed operation:
    accepts keyboard and wheel navigation; side-pane row clicks translate into
    anchored HERE navigation.
 2. PARENT is absent at `/`. Otherwise, when readable, it represents
-   `dirname(C)` and its `cwd_index` identifies `basename(C)`.
+   `dirname(C)` and its optional `cwd_index` identifies `basename(C)` when that
+   entry is visible. A hidden current directory can have no parent marker.
 3. CHILDREN is derived from HERE's cursor. A directory — including a
    symbolic link to one — produces a listing or an empty-directory
    placeholder, a text file produces its rendered contents, and any other
@@ -170,24 +173,25 @@ Many path changes can reuse a snapshot that the UI already owns:
 | Operation | Existing listing | New role |
 |---|---|---|
 | Descend or promote CHILDREN | old HERE | PARENT |
-| Descend or promote CHILDREN | matching CHILDREN listing | HERE |
 | Ascend or pick a PARENT row | old HERE | CHILDREN |
 | Watcher refresh | old PARENT | PARENT |
 | Deletion refresh | old PARENT | PARENT |
 
-A descent may perform both transfers in one transaction, avoiding a second
-scan of the directory that was already previewed. Expected path relationships
-are validated before a transfer is accepted. Because CHILDREN is not watched
-recursively, descent performs a cheap, allocation-free emptiness probe before
-trusting that snapshot as the new HERE.
+Expected path relationships are validated before a transfer is accepted. Every
+new HERE snapshot is read after the destination watch has been prepared. CHILDREN
+is unwatched, so its cached entries cannot establish the destination's current
+contents. Descent and mouse promotion use a matching cached listing only to
+restore selection, while transferring old HERE into PARENT.
 
 Listings moving from HERE into a side pane retain their selection bits. When an
-ascend must reread a potentially stale parent snapshot as the new HERE,
-selection is restored by entry name.
+navigation or refresh rereads a snapshot as the new HERE, selection is restored
+by exact entry name using a temporary hash set of selected names. Same-directory
+replacement preserves the viewport when it still contains the cursor; otherwise
+`ListView.jumpToItem` reveals the cursor.
 
 Cursor movement is intentionally smaller than a full view transaction. The
-model owns one `HereCursor` (`up`, `entry`, or `none`); `up` can remember the
-real entry to restore when movement returns to the listing. The model projects
+model owns one `HereCursor` (`entry` or `none`). Upward directory navigation is a
+separate action, with no synthetic cursor row. The model projects
 that state into vxfw's HERE `ListView` through one application boundary.
 Movement updates the logical cursor immediately, leaves the last committed
 CHILDREN content visible, and schedules `syncRight` to replace only CHILDREN
@@ -211,10 +215,12 @@ Snapshot construction opens the directory once and consumes it through batched
 `Io.Dir.Reader` calls backed by a 32 KiB buffer. Zig lowers those batches to
 Linux `getdents64` or Darwin `getdirentries`; starting in the already-reading
 state avoids rewinding the newly opened directory. Ordinary entry kinds come
-from those batches and do not require a separate `stat`. Symbolic links use
-target-selected relative kernel APIs for their displayed target and directory
-classification: Linux uses `readlinkat` plus a type-only `statx`, while macOS
-uses Darwin `readlinkat` plus `fstatat`. A target-resolution failure such as a
+from those batches and do not require a separate `stat`; `.unknown` kinds get a
+relative, non-following `Io.Dir.statFile` lookup. Symbolic links use
+`Io.Dir.readLink` for their displayed target and `Io.Dir.statFile` for directory
+classification on macOS. Linux retains a type-only `statx` wrapper because
+Zig 0.16's `statFile` panics on `ENAMETOOLONG` during symlink resolution, including
+valid short input names. A target-resolution failure such as a
 dangling link leaves the entry visible but non-navigable; failure to read or
 store the target still fails snapshot construction.
 
@@ -245,8 +251,11 @@ and their sanitized bytes share one contiguous allocation rather than one
 allocation per line; empty files preview as a placeholder message. Binary files
 keep the metadata sheet under a dimmed italic notice
 reading "non-text files are not rendered", styled like the empty-directory
-placeholder. The read is bounded and debounced like all children work, so
-oversized or slow files cannot affect cursor movement.
+placeholder. Non-regular files go directly to metadata. A nonblocking open and
+descriptor kind check also handle replacement by a FIFO between stat and open;
+the native open is needed because `Io.Dir.OpenFileOptions` has no general
+nonblocking flag. Bounds and debouncing limit repeated preview work, but a
+regular-file read on a slow filesystem can still delay the UI thread.
 
 Preview rows carry their render meaning directly as `text`, `notice`, `spacer`,
 or `field { label, value }`. Rendering switches on that tag; it never infers a
@@ -414,7 +423,8 @@ nearest surviving ancestor, reporting what vanished. Later filesystem events
 schedule fresh refreshes, so failures never repeat on a timer. Replaced row
 widget arrays are retired until the next draw instead of freed at commit,
 because vxfw hit tests against the previous frame's surface tree and input
-events can share one queue batch with a commit.
+events can share one queue batch with a commit. Retired rows consume presses
+without acting unless their address still belongs to the pane's active row array.
 
 ## libvaxis and vxfw integration
 
@@ -467,13 +477,13 @@ tree to derive their path. Both paths dispatch in three phases:
 root ──capture──▶ focused target ──bubble──▶ root
 ```
 
-Propagation stops when a handler consumes the event. HERE's focused `ListView`
-consumes its built-in movement keys at the target phase, so `Model` handles
-movement in its root capture handler when it must also invalidate CHILDREN.
-Unconsumed browse commands bubble to the model. `input.browseAction` decodes a
-key once and tags the resulting action as capture- or bubble-owned, so the two
-framework phases do not maintain separate key maps. Event adapters own event
-consumption, redraw, and the single action-level error report.
+Propagation stops when a handler consumes the event. `Model` routes all keys in
+root capture using its current mode. Browse actions update the logical cursor
+and invalidate CHILDREN together; remaining browse keys go to HERE's `ListView`.
+Command keys are forwarded to the persistent `TextField` with target-phase
+semantics. Confirmation consumes all input. This routing remains correct when
+several keys arrive before vxfw applies a queued focus request. Event adapters
+own consumption, redraw, and the single action-level error report.
 
 Mouse adapters use shared interaction predicates to accept only actionable
 presses. One `DoubleClickTracker` covers HERE rows; it tags the
@@ -483,8 +493,8 @@ complete an action.
 
 `requestFocus` queues a command rather than changing focus immediately. vxfw
 sends focus-out/focus-in and applies the new target before the next layout.
-This is why the `TextField` remains alive for the entire model lifetime even
-when command mode is not drawn.
+Input batches are drained before those focus commands apply. The `TextField`
+remains alive for the entire model lifetime even when command mode is not drawn.
 
 Keys are Unicode codepoints plus modifier bits; special keys use named
 constants. Mouse coordinates are cell-based. All text widths are measured with
@@ -529,14 +539,16 @@ root Surface
 │  ├─ horizontal Padding → HERE ListView
 │  └─ horizontal Padding → CHILDREN ListView / preview
 └─ bottom row
-   ├─ browse: compact entry metadata + entry/selection counts
+   ├─ browse: message, or compact entry metadata + entry/selection counts
    ├─ command: `:` + TextField + optional completion hint
    └─ confirm: deletion prompt
 ```
 
 At very small terminal sizes, the model preserves the header and bottom row and
-omits or constrains pane content rather than allowing unsigned size arithmetic
-to underflow.
+constrains pane content. An empty HERE surface keeps the focused `ListView` in
+the tree even when no pane rows fit. Command and confirmation take priority over
+messages; help, errors, and operation results take priority over browse metadata.
+Successful cursor movement clears the message.
 
 ## Allocation and lifetime rules
 
@@ -548,7 +560,7 @@ The code uses several allocators with deliberately different lifetimes:
 | Listing arena | Until that directory snapshot is replaced or transferred away | Entry names and link targets |
 | Listing contiguous allocations | Listing lifetime | Entries, selection bits, formatted rows |
 | vxfw frame arena | Until the next redraw | Widgets, surfaces, cells, status strings, segments |
-| Profiling frame arena | One measured draw, capacity retained | Headless surfaces and draw temporaries |
+| Profiling frame arena | One measured draw, reset with `.free_all` | Headless surfaces and draw temporaries |
 | TextField submitted value | Only during the submit callback | Command input |
 
 The central rule is that frame data may borrow durable model data, but durable
@@ -574,8 +586,9 @@ The design separates those costs:
 - rendering performs no filesystem calls.
 
 For `n` ordinary entries, snapshot storage and iteration are linear and sorting
-is `O(n log n)`. Steady-state frame work is proportional to viewport height,
-not directory size.
+is `O(n log n)`. Restoring `s` selected entries uses expected `O(n + s)` work and
+`O(s)` temporary storage, and rewrites only matched display rows. Steady-state
+frame work is proportional to viewport height, not directory size.
 
 ### Filesystem-specific costs
 
@@ -611,13 +624,18 @@ zig build profile-check -- --json
 The suite covers 20,000 ordinary files, 2,000 directory-resolving symbolic
 links, a 1 MiB text-file fixture, complete model initialization, top and bottom
 large-directory frames, cursor movement and pending-preview frames, combined
-input plus draw, and 100 long links with targets up to 4,000 bytes, capped at
-the platform path limit. Frame workloads use production's `.free_all` arena
+input plus draw, a watcher refresh with all 20,000 entries selected, and 100 long
+links with targets up to 4,000 bytes, capped at the platform path limit. Frame
+workloads use production's `.free_all` arena
 reset and compose the completed surface tree into a 120×40 cell grid. They do
 not emulate Vaxis's final screen diff or a real terminal flush. The preview
 itself still obeys the production 128 KiB and 1,024-line bounds. `--samples=N`
 changes the frame sample count; scan sample counts are derived from it. Fixture
 creation and cleanup are outside the measured regions.
+
+The selected-refresh workload creates and removes a temporary entry, drains the
+real watcher, restores the listing and selection, and composes the next frame.
+Selection setup is outside measurement; the triggering mutations are included.
 
 Regression gates use these p95 budgets:
 
@@ -627,6 +645,7 @@ Regression gates use these p95 budgets:
 | Symlink-heavy scan | 50 ms |
 | Text-file preview build | 25 ms |
 | Full large-model initialization | 100 ms |
+| Selected watcher refresh and frame | 100 ms |
 | Cursor movement | 1 ms |
 | Every composed frame workload | 4 ms |
 
@@ -640,7 +659,7 @@ timing snapshot that would quickly become stale.
 ### Remaining latency boundary
 
 Startup, watcher-triggered refresh, hidden-filter changes, deletion refresh,
-navigation to content without a reusable preview, and the eventual idle preview
+navigation to a new HERE directory, and the eventual idle preview
 remain synchronous. A sufficiently large or slow filesystem can still make
 those operations exceed 16 ms.
 
@@ -649,14 +668,12 @@ build snapshots away from the UI thread, discard obsolete cursor generations,
 and deliver completed ownership through a UI event. That would require explicit
 thread allocator, cancellation, watcher-snapshot, and shutdown rules.
 
-Delivery is currently blocked by the dependency, not by this codebase: vaxis
-0.6.0 creates its event loop inside `App.run` as stack-local state and exposes
-no cross-thread event posting (`App.Options` carries only `framerate`). The
-underlying `Loop.postEvent` is queue-based and thread-safe, but the loop handle
-is unreachable. Wiring a worker thread to wake the UI requires an upstream
-change that publishes the loop or an equivalent posting API; until then,
-delivery through polling or shared mutable state would be racy and is
-deliberately not attempted.
+vaxis 0.6.0 creates its event loop inside `App.run` and exposes no cross-thread
+posting API (`App.Options` carries only `framerate`). Immediate worker wake-up
+would require an upstream interface. Safe delivery could instead use an owned,
+synchronized result queue polled by the existing timer, with all widget mutation
+on the UI thread. That design adds timer latency and needs the ownership,
+cancellation, and shutdown rules above; it remains an optional future direction.
 
 ## Verification
 
