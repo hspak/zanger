@@ -1907,11 +1907,22 @@ fn draw(self: *Model, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
     // Each pane keeps one column of horizontal breathing room. Below that
     // minimum, preserve the header and command/status row without panes.
     if (size.height < 4 or size.width < 6) {
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
         children[0] = .{ .origin = .{ .col = 0, .row = 0 }, .surface = header };
         children[1] = .{
             .origin = .{ .col = 0, .row = @intCast(size.height -| 1) },
             .surface = bottom,
+        };
+        // vxfw requires its focused widget to remain in the surface tree.
+        // A zero-sized surface keeps HERE reachable without drawing or hits.
+        children[2] = .{
+            .origin = .{ .col = 0, .row = 0 },
+            .surface = .{
+                .size = .{ .width = 0, .height = 0 },
+                .widget = self.getPane(.here).list_view.widget(),
+                .buffer = &.{},
+                .children = &.{},
+            },
         };
         return .{
             .size = size,
@@ -4654,5 +4665,27 @@ test "hidden current directories need no visible parent marker" {
         try model.changeHiddenVisibility();
         try testing.expect(parent.cwd_index == null);
         model.assertValid();
+    }
+}
+
+test "small layouts retain the focused directory widget" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.writeFile("entry", "text");
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sizes = [_]vxfw.Size{
+        .{ .width = 90, .height = 3 },
+        .{ .width = 5, .height = 24 },
+        .{ .width = 0, .height = 0 },
+        .{ .width = 90, .height = 24 },
+    };
+    for (sizes) |size| {
+        const surface = try model.draw(test_support.drawContext(arena.allocator(), size));
+        try testing.expect(test_support.containsWidget(surface, model.getPane(.here).list_view.widget()));
     }
 }

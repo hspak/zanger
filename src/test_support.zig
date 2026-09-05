@@ -142,6 +142,24 @@ pub fn keyPress(codepoint: u21, mods: vaxis.Key.Modifiers) vaxis.Key {
     return .{ .codepoint = codepoint, .mods = mods };
 }
 
+pub fn containsWidget(surface: vxfw.Surface, target: vxfw.Widget) bool {
+    if (surface.widget.eql(target)) return true;
+    for (surface.children) |child| {
+        if (containsWidget(child.surface, target)) return true;
+    }
+    return false;
+}
+
+pub fn drawContext(arena: Allocator, size: vxfw.Size) vxfw.DrawContext {
+    vxfw.DrawContext.init(.unicode);
+    return .{
+        .arena = arena,
+        .min = size,
+        .max = .{ .width = size.width, .height = size.height },
+        .cell_size = .{ .width = 8, .height = 16 },
+    };
+}
+
 pub fn leftMouse(event_type: vaxis.Mouse.Type) vaxis.Mouse {
     return .{
         .col = 0,
