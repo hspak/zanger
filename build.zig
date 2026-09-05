@@ -60,7 +60,11 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("zeit", zeit.module("zeit"));
     test_module.addOptions("build_options", dev_options);
 
-    const tests = b.addTest(.{ .root_module = test_module });
+    const test_filter = b.option([]const u8, "test-filter", "Run tests matching this name");
+    const tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
     const test_compile_step = b.step("test-compile", "Compile tests without running them");
     test_compile_step.dependOn(&tests.step);
     const run_tests = b.addRunArtifact(tests);
