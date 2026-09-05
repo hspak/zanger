@@ -286,7 +286,7 @@ pub fn readDir(
             var link_target: ?[]const u8 = null;
             var is_dir = kind == .directory;
             if (is_sym) {
-                const link = try symlink.read(string_alloc, dir, de.name);
+                const link = try symlink.read(string_alloc, io, dir, de.name);
                 link_target = link.target;
                 is_dir = link.is_dir;
             }
@@ -704,6 +704,29 @@ test "row formatting" {
     const empty_row = try formatRow(alloc, empty_directory, false);
     defer alloc.free(empty_row);
     try testing.expectEqualStrings("     empty", empty_row);
+}
+
+test "truncated symbolic link targets fail the snapshot" {
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.symLink("missing", "link");
+    const TruncatedLink = struct {
+        fn readLink(_: ?*anyopaque, _: Dir, _: []const u8, buffer: []u8) Dir.ReadLinkError!usize {
+            @memset(buffer, 'x');
+            return buffer.len;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.dirReadLink = TruncatedLink.readLink;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    const result = readDir(testing.allocator, io, tree.path, .{});
+    if (result) |listing| {
+        var unexpected = listing;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try testing.expectEqual(error.NameTooLong, err);
+    }
 }
 
 test "unknown entry kinds preserve directory and symlink behavior" {
