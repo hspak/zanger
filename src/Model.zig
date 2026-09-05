@@ -4777,3 +4777,38 @@ test "leaving command mode routes remaining keys away from the text field" {
     try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
     try testing.expectEqual(@as(usize, 0), model.text_field.byteOffsetToCursor());
 }
+
+test "watcher and deletion refresh keep the cursor visible and viewport stable" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    for (0..40) |index| {
+        var buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buffer, "file-{d:0>3}", .{index});
+        try tree.writeFile(name, "text");
+    }
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var events = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer events.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = test_support.drawContext(arena.allocator(), .{ .width = 120, .height = 12 });
+    try model.jumpCenter(&events.ctx, true);
+    try model.syncRight();
+    const before = try model.draw(ctx);
+    const here = model.getPane(.here);
+    try testing.expect(test_support.containsWidget(before, here.rows[39].widget()));
+    const top = here.list_view.scroll.top;
+    try tree.writeFile("z-new", "text");
+    try testing.expect(try model.reconcileWatcher());
+    const after = try model.draw(ctx);
+    try testing.expectEqual(@as(u32, 39), here.list_view.cursor);
+    try testing.expect(test_support.containsWidget(after, here.rows[39].widget()));
+    try testing.expectEqual(top, here.list_view.scroll.top);
+    try model.executeDelete();
+    const deleted = try model.draw(ctx);
+    try testing.expect(test_support.containsWidget(deleted, here.rows[here.list_view.cursor].widget()));
+    try testing.expectEqual(top, here.list_view.scroll.top);
+}

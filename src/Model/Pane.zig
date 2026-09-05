@@ -193,11 +193,18 @@ pub fn resetListView(self: *Pane, cursor: u32) void {
         .wheel_scroll = 0,
         .item_count = count,
     };
+    self.list_view.jumpToItem(self.list_view.cursor);
 }
 
 /// Replaces the pane payload, moving ownership of every staged field and
 /// releasing the previous content.
 pub fn replace(self: *Pane, replacement: Replacement) void {
+    const previous_top: ?u32 = previous_top: {
+        const previous = self.listing() orelse break :previous_top null;
+        const next = replacement.content.listingConst() orelse break :previous_top null;
+        if (!std.mem.eql(u8, previous.path, next.path)) break :previous_top null;
+        break :previous_top self.list_view.scroll.top;
+    };
     self.content.deinit();
     self.model.retireRows(self.rows);
 
@@ -205,6 +212,15 @@ pub fn replace(self: *Pane, replacement: Replacement) void {
     self.rows = replacement.rows;
     self.cwd_index = replacement.cwd_index;
     self.resetListView(replacement.cursor);
+    if (previous_top) |top| {
+        const cursor = self.list_view.cursor;
+        // Reuse the viewport only while the restored cursor still fits. A
+        // distant cursor starts at its own row without building skipped rows.
+        if (top <= cursor and cursor - top < self.model.cwd_visible_rows) {
+            self.list_view.jumpToItem(top);
+            self.list_view.cursor = cursor;
+        }
+    }
 }
 
 pub fn itemCount(self: *const Pane) usize {
