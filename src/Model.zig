@@ -4822,3 +4822,29 @@ test "descent and children clicks refresh snapshots before making them HERE" {
         try tree.temp.dir.deleteFile(testing.io, "child/c");
     }
 }
+
+test "retired row presses cannot select replacement content" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("child");
+    try tree.writeFile("child/a", "a");
+    try tree.writeFile("child/b", "b");
+    try tree.writeFile("z", "z");
+    var model: Model = undefined;
+    try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+    defer model.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = try model.draw(test_support.drawContext(arena.allocator(), .{ .width = 120, .height = 24 }));
+    const old_row = model.getPane(.here).rows[1].widget();
+    try model.openCenter();
+    var events = test_support.EventHarness.init(testing.allocator, testing.io);
+    defer events.deinit();
+    const press: vxfw.Event = .{ .mouse = test_support.leftMouse(.press) };
+    try old_row.handleEvent(&events.ctx, press);
+    try testing.expectEqual(@as(usize, 0), model.hereEntryIndex().?);
+    try testing.expect(model.clicks.last == null);
+    try model.getPane(.here).rows[1].widget().handleEvent(&events.ctx, press);
+    try testing.expectEqual(@as(usize, 1), model.hereEntryIndex().?);
+}

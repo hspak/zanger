@@ -39,7 +39,12 @@ fn typeErasedEventHandler(
         .mouse => |mouse| {
             if (self.pane.model.mode != .browse) return;
             if (!interaction.isLeftPress(mouse)) return;
-            if (self.index >= self.pane.itemCount()) return;
+            // An earlier event in this batch may have replaced the pane while
+            // vxfw still hit tests its previous frame's retained row widgets.
+            if (self.index >= self.pane.rows.len or &self.pane.rows[self.index] != self) {
+                ctx.consumeEvent();
+                return;
+            }
             defer ctx.consumeAndRedraw();
             const result = switch (self.pane.role) {
                 .here => self.pane.model.handleRowClick(ctx, self.index),
