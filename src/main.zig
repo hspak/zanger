@@ -50,6 +50,10 @@ pub fn main(init: std.process.Init) !void {
         .start_path = cwd,
         .user = user,
         .hostname = hostname,
+        .time_zone = .{
+            .tz = init.environ_map.get("TZ"),
+            .tzdir = init.environ_map.get("TZDIR"),
+        },
     });
     defer model.deinit();
 

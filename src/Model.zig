@@ -145,6 +145,8 @@ pub const InitOptions = struct {
     user: []const u8 = "user",
     /// Host name rendered in the header.
     hostname: []const u8 = "localhost",
+    /// Process TZ and TZDIR settings; absent values use the system timezone.
+    time_zone: zeit.EnvConfig = .{},
 };
 
 /// Errors from creating the watcher or preparing the initial anchored view.
@@ -281,7 +283,7 @@ const ProfileSessionImpl = struct {
 /// Initializes stable storage. `self` must not move before `deinit`, because
 /// panes and vxfw widgets retain its address.
 pub fn init(self: *Model, alloc: Allocator, io: Io, options: InitOptions) InitError!void {
-    var local_time_zone = zeit.local(alloc, io, .{}) catch |err| switch (err) {
+    var local_time_zone = loadTimeZone(alloc, io, options.time_zone) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => zeit.utc,
     };
@@ -309,6 +311,24 @@ pub fn init(self: *Model, alloc: Allocator, io: Io, options: InitOptions) InitEr
 
     errdefer self.deinit();
     try self.replaceAnchoredView(options.start_path, .initial);
+}
+
+fn loadTimeZone(alloc: Allocator, io: Io, env: zeit.EnvConfig) !zeit.TimeZone {
+    const tz = env.tz orelse return zeit.local(alloc, io, env);
+    // Empty TZ means UTC. zeit 0.9.0 asserts on both empty and colon-only TZ.
+    if (tz.len == 0 or std.mem.eql(u8, tz, ":")) return zeit.utc;
+    const name = if (tz[0] == ':') tz[1..] else tz;
+    if (std.meta.stringToEnum(zeit.Location, name)) |location| {
+        return zeit.loadTimeZone(alloc, io, location, env);
+    }
+    if (std.fs.path.isAbsolute(name)) {
+        const file = try Io.Dir.cwd().openFile(io, name, .{});
+        defer file.close(io);
+        var buffer: [2048]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        return .{ .tzinfo = try zeit.timezone.TZInfo.parse(alloc, &reader.interface) };
+    }
+    return zeit.local(alloc, io, env);
 }
 
 /// Frees all model-owned resources and poisons `self`.
@@ -4820,6 +4840,43 @@ test "descent and children clicks refresh snapshots before making them HERE" {
         try testing.expect(file_system.indexOfName(model.centerListing(), "c") != null);
         try tree.temp.dir.deleteFile(testing.io, "child/b");
         try tree.temp.dir.deleteFile(testing.io, "child/c");
+    }
+}
+
+test "model timestamps honor TZ and TZDIR including empty and named zones" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir("America");
+    // A TZif v1 fixture with one transition and a fixed UTC+1 offset. Its
+    // deliberate difference from New York proves TZDIR is used as well as TZ.
+    try tree.writeFile("America/New_York", "TZif" ++ "\x00" ** 16 ++
+        "\x00" ** 12 ++ "\x00\x00\x00\x01" ** 2 ++ "\x00\x00\x00\x04" ++
+        "\x80\x00\x00\x00\x00\x00\x00\x0e\x10\x00\x00TST\x00");
+    const zone_path = try tree.absolutePath("America/New_York");
+    defer testing.allocator.free(zone_path);
+    const prefixed_path = try std.fmt.allocPrint(testing.allocator, ":{s}", .{zone_path});
+    defer testing.allocator.free(prefixed_path);
+    const cases = [_]struct { tz: []const u8, expected: []const u8 }{
+        .{ .tz = "UTC0", .expected = "Jan  1 00:00" },
+        .{ .tz = "EST5", .expected = "Dec 31 19:00" },
+        .{ .tz = "", .expected = "Jan  1 00:00" },
+        .{ .tz = ":", .expected = "Jan  1 00:00" },
+        .{ .tz = "America/New_York", .expected = "Jan  1 01:00" },
+        .{ .tz = ":America/New_York", .expected = "Jan  1 01:00" },
+        .{ .tz = zone_path, .expected = "Jan  1 01:00" },
+        .{ .tz = prefixed_path, .expected = "Jan  1 01:00" },
+    };
+    for (cases) |case| {
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{
+            .start_path = tree.path,
+            .time_zone = .{ .tz = case.tz, .tzdir = tree.path },
+        });
+        defer model.deinit();
+        const rendered = try format.statusTime(testing.allocator, .zero, &model.local_time_zone);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings(case.expected, rendered);
     }
 }
 
