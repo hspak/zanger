@@ -113,6 +113,28 @@ pub const Listing = struct {
         self.selected_count = 0;
     }
 
+    /// Restores selections by exact name from a still-live snapshot. Asserts
+    /// that this listing has no selections; leaves it unchanged on error.
+    pub fn restoreSelection(self: *Listing, previous: *const Listing) Allocator.Error!void {
+        std.debug.assert(self.selected_count == 0);
+        if (previous.selected_count == 0) return;
+
+        // Keys borrow the previous snapshot only until restoration finishes.
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(self.alloc);
+        try names.ensureTotalCapacity(self.alloc, @intCast(previous.selected_count));
+        var selected = previous.selected.iterator(.{ .kind = .set });
+        while (selected.next()) |index| {
+            names.putAssumeCapacityNoClobber(previous.entries[index].name, {});
+        }
+        for (self.entries, 0..) |entry, index| {
+            if (!names.contains(entry.name)) continue;
+            self.selected.set(index);
+            self.selected_count += 1;
+            self.refreshRow(index);
+        }
+    }
+
     /// Updates one directory's known emptiness and its display row.
     /// Asserts that `index` identifies a directory entry.
     pub fn setDirectoryEmpty(

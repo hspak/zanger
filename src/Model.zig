@@ -273,6 +273,22 @@ const ProfileSessionImpl = struct {
         return self.model.centerListing().entries.len;
     }
 
+    /// Selects every HERE entry before measuring selection restoration.
+    pub fn selectAll(self: *ProfileSession) void {
+        const listing = self.model.centerListing();
+        for (0..listing.entries.len) |index| {
+            if (!listing.selected.isSet(index)) listing.toggleSelected(index);
+        }
+    }
+
+    /// Drains actual filesystem events and refreshes the selected listing.
+    /// Asserts that the workload caused a refresh and retained every selection.
+    pub fn refreshSelected(self: *ProfileSession) !void {
+        const refreshed = try self.model.reconcileWatcher();
+        std.debug.assert(refreshed);
+        std.debug.assert(self.model.selectedCount() == self.entryCount());
+    }
+
     /// Returns the widget focused by the production application while
     /// browsing, for headless surface-composition profiling.
     pub fn focusedWidget(self: *ProfileSession) vxfw.Widget {
@@ -1027,15 +1043,7 @@ fn replaceAnchoredView(
     const next_center = next_center_pending.listing().?;
     if (plan.restore_here_from) |previous| {
         std.debug.assert(next_center_pending.listing_source == null);
-        // Rewrite only rows whose selection bit changed; work is proportional
-        // to restored selections, not to the size of the new listing.
-        for (previous.entries, 0..) |entry, index| {
-            if (!previous.selected.isSet(index)) continue;
-            const next_index = file_system.indexOfName(next_center, entry.name) orelse continue;
-            next_center.selected.set(next_index);
-            next_center.selected_count += 1;
-            next_center.refreshRow(next_index);
-        }
+        try next_center.restoreSelection(previous);
     }
 
     var rows: [3][]Row = undefined;
@@ -4841,6 +4849,63 @@ test "descent and children clicks refresh snapshots before making them HERE" {
         try tree.temp.dir.deleteFile(testing.io, "child/b");
         try tree.temp.dir.deleteFile(testing.io, "child/c");
     }
+}
+
+test "selection restoration is exact and failure atomic" {
+    const testing = std.testing;
+    var reached_success = false;
+    var failure_count: usize = 0;
+    for (0..128) |fail_index| {
+        var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+        defer tree.deinit();
+        try tree.writeFile("keep", "lowercase");
+        try tree.writeFile("KEEP", "uppercase");
+        try tree.writeFile("gone", "removed after selection");
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{ .start_path = tree.path });
+        defer model.deinit();
+        const previous = model.centerListing();
+        // Case-insensitive volumes cannot represent this fixture.
+        const keep = file_system.indexOfName(previous, "keep") orelse return error.SkipZigTest;
+        _ = file_system.indexOfName(previous, "KEEP") orelse return error.SkipZigTest;
+        previous.toggleSelected(keep);
+        previous.toggleSelected(file_system.indexOfName(previous, "gone").?);
+        const committed_path = previous.path.ptr;
+        try tree.writeFile("a-first", "new");
+        try tree.temp.dir.deleteFile(testing.io, "gone");
+
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        model.alloc = failing.allocator();
+        const result = model.replaceAnchoredView(tree.path, .{ .watch_refresh = false });
+        model.alloc = testing.allocator;
+        if (result) |_| {
+            reached_success = true;
+            const listing = model.centerListing();
+            try testing.expectEqual(@as(usize, 1), listing.selectedCount());
+            const restored = file_system.indexOfName(listing, "keep").?;
+            try testing.expect(listing.selected.isSet(restored));
+            try testing.expect(std.mem.startsWith(u8, listing.rows[restored], "✓ "));
+            try testing.expect(!listing.selected.isSet(file_system.indexOfName(listing, "KEEP").?));
+            try testing.expect(!listing.selected.isSet(file_system.indexOfName(listing, "a-first").?));
+            try testing.expect(file_system.indexOfName(listing, "gone") == null);
+            model.assertValid();
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failure_count += 1;
+            const listing = model.centerListing();
+            try testing.expectEqual(committed_path, listing.path.ptr);
+            try testing.expectEqual(@as(usize, 2), listing.selectedCount());
+            try testing.expect(listing.selected.isSet(keep));
+            try testing.expect(listing.selected.isSet(file_system.indexOfName(listing, "gone").?));
+            try testing.expect(file_system.indexOfName(listing, "a-first") == null);
+            model.assertValid();
+        }
+    }
+    try testing.expect(reached_success);
+    try testing.expect(failure_count > 0);
 }
 
 test "model timestamps honor TZ and TZDIR including empty and named zones" {

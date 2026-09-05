@@ -15,6 +15,7 @@ const file_system = @import("file_system.zig");
 
 const scan_budget_ns = 50 * std.time.ns_per_ms;
 const model_init_budget_ns = 100 * std.time.ns_per_ms;
+const selected_refresh_budget_ns = 100 * std.time.ns_per_ms;
 const frame_budget_ns = 4 * std.time.ns_per_ms;
 const text_preview_budget_ns = 25 * std.time.ns_per_ms;
 const cursor_budget_ns = 1 * std.time.ns_per_ms;
@@ -203,6 +204,24 @@ const DrawFrame = struct {
         self.screen.clear();
         surface.render(screenWindow(self.screen), self.session.focusedWidget());
         std.mem.doNotOptimizeAway(self.screen.buf.ptr);
+    }
+};
+
+const SelectedRefresh = struct {
+    io: Io,
+    dir: Io.Dir,
+    frame: *DrawFrame,
+    expected_count: usize,
+
+    fn run(self: *SelectedRefresh) !void {
+        // Both native watchers observe the directory mutations. The temporary
+        // entry is gone before refresh, so every remaining entry stays selected.
+        try self.dir.writeFile(self.io, .{ .sub_path = "refresh-trigger", .data = "" });
+        try self.dir.deleteFile(self.io, "refresh-trigger");
+        try self.frame.session.refreshSelected();
+        std.debug.assert(self.frame.session.entryCount() == self.expected_count);
+        // Release retired rows at the same boundary as an interactive refresh.
+        try self.frame.run();
     }
 };
 
@@ -527,6 +546,24 @@ fn runSuite(
         "cursor_input_and_frame",
         try measure(alloc, io, options.frame_samples, &cursor_frame),
         frame_budget_ns,
+    ) and passed;
+
+    try session.syncPreview();
+    session.selectAll();
+    const selected_dir = try Io.Dir.openDirAbsolute(io, fixture.large_path, .{});
+    defer selected_dir.close(io);
+    var selected_refresh: SelectedRefresh = .{
+        .io = io,
+        .dir = selected_dir,
+        .frame = &frame,
+        .expected_count = options.file_count,
+    };
+    passed = try emitMetric(
+        writer,
+        options,
+        "selected_watcher_refresh",
+        try measure(alloc, io, options.scan_samples, &selected_refresh),
+        selected_refresh_budget_ns,
     ) and passed;
 
     var long_session = try Model.ProfileSession.init(alloc, io, fixture.long_symlink_path);
