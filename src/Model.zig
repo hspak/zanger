@@ -509,18 +509,13 @@ pub fn assertValid(self: *const Model) void {
             },
         }
         if (self.panes[PaneRole.parent.toIndex()].listingConst()) |parent| {
-            const cwd_index = self.panes[PaneRole.parent.toIndex()].cwd_index.?;
-            std.debug.assert(cwd_index < parent.entries.len);
             std.debug.assert(std.mem.eql(
                 u8,
                 parent.path,
                 std.fs.path.dirname(center.path) orelse "/",
             ));
-            std.debug.assert(std.mem.eql(
-                u8,
-                parent.entries[cwd_index].name,
-                std.fs.path.basename(center.path),
-            ));
+            const expected = file_system.indexOfName(parent, std.fs.path.basename(center.path));
+            std.debug.assert(self.panes[PaneRole.parent.toIndex()].cwd_index == expected);
         }
 
         const children = &self.panes[PaneRole.children.toIndex()];
@@ -705,11 +700,11 @@ fn prepareView(
             if (!std.mem.eql(u8, candidate.path, parent_path))
                 break :parent_reused false;
             const parent = pending_view.borrowListing(transfer.source, .parent, candidate.*);
-            const parent_cursor = parent.cursorFor(std.fs.path.basename(center.path), null);
+            const cwd_index = file_system.indexOfName(parent, std.fs.path.basename(center.path));
             const parent_pending = pending_view.pane(.parent);
-            parent_pending.cursor = @intCast(parent_cursor);
-            parent_pending.cwd_index = parent_cursor;
-            parent_pending.setDirectoryEmpty(parent_cursor, center.entries.len == 0);
+            parent_pending.cursor = @intCast(cwd_index orelse 0);
+            parent_pending.cwd_index = cwd_index;
+            if (cwd_index) |index| parent_pending.setDirectoryEmpty(index, center.entries.len == 0);
             break :parent_reused true;
         };
         if (!parent_reused) {
@@ -729,13 +724,10 @@ fn prepareView(
                 _ = pending_view.stageOwned(.parent, .{ .listing = listing });
                 const parent_pending = pending_view.pane(.parent);
                 const parent = parent_pending.listing().?;
-                const parent_cursor = parent.cursorFor(
-                    std.fs.path.basename(center.path),
-                    null,
-                );
-                parent.setDirectoryEmpty(parent_cursor, center.entries.len == 0);
-                parent_pending.cursor = @intCast(parent_cursor);
-                parent_pending.cwd_index = parent_cursor;
+                const cwd_index = file_system.indexOfName(parent, std.fs.path.basename(center.path));
+                if (cwd_index) |index| parent.setDirectoryEmpty(index, center.entries.len == 0);
+                parent_pending.cursor = @intCast(cwd_index orelse 0);
+                parent_pending.cwd_index = cwd_index;
             }
         }
     }
@@ -4635,4 +4627,32 @@ test "FIFO previews and their symlinks return metadata without a writer" {
     try test_support.expectCompletes(testing.io, 2000, check.run, .{tree.path});
     try tree.symLink("pipe", "a-link");
     try test_support.expectCompletes(testing.io, 2000, check.run, .{tree.path});
+}
+
+test "hidden current directories need no visible parent marker" {
+    const testing = std.testing;
+    var tree = try test_support.TempTree.init(testing.allocator, testing.io);
+    defer tree.deinit();
+    try tree.createDir(".hidden");
+    try tree.writeFile(".hidden/entry", "text");
+    const path = try tree.absolutePath(".hidden");
+    defer testing.allocator.free(path);
+
+    for (0..3) |scenario| {
+        if (scenario == 1) try tree.writeFile("visible-file", "text");
+        if (scenario == 2) try tree.createDir("visible-dir");
+        var model: Model = undefined;
+        try model.init(testing.allocator, testing.io, .{ .start_path = path });
+        defer model.deinit();
+        try testing.expectEqualStrings(path, model.centerListing().path);
+        try testing.expect(model.getPane(.parent).cwd_index == null);
+        model.assertValid();
+
+        try model.changeHiddenVisibility();
+        const parent = model.getPane(.parent);
+        try testing.expectEqualStrings(".hidden", parent.listing().?.entries[parent.cwd_index.?].name);
+        try model.changeHiddenVisibility();
+        try testing.expect(parent.cwd_index == null);
+        model.assertValid();
+    }
 }
